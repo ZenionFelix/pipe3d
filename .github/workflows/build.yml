@@ -1,0 +1,16 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: |
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++ -shared -fPIC -static-libstdc++ -o libpipe3d.so pipe3d.cpp -llog
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libpipe3d
+          path: libpipe3d.so
