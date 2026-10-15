@@ -1,0 +1,36 @@
+name: disasm
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install capstone
+      - name: Disassemble
+        run: |
+          python3 - <<'PYEOF'
+          from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB
+          d = open('libminecraftpe.so','rb').read()
+          md = Cs(CS_ARCH_ARM, CS_MODE_THUMB)
+          funcs = [
+            ("BG_getRenderLayer_pos", 0x990E0C, 0x10),
+            ("BG_getRenderLayer", 0x990E14, 0x10),
+            ("BG_getExtraRenderLayers", 0x990E1C, 0x10),
+            ("BG_isAlphaTested", 0x990DE8, 0x30),
+            ("Block_getRenderLayer_pos", 0xCC54B4, 0x10),
+            ("Block_getRenderLayer", 0xCC54B8, 0x10),
+            ("Block_isAlphaTested", 0xCC5400, 0x30),
+            ("Leaf_getRenderLayer_pos", 0xCF81F0, 0x60),
+            ("BT_setRenderLayer", 0x993E18, 0x10),
+            ("useAlphaTesting", 0x9380A0, 0x40),
+          ]
+          out = open('out.txt', 'w')
+          for name, a, n in funcs:
+              out.write("\n=== %s @ 0x%X ===\n" % (name, a))
+              for i in md.disasm(d[a:a+n], a):
+                  out.write("%x: %s %s\n" % (i.address, i.mnemonic, i.op_str))
+          PYEOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disasm
+          path: out.txt
