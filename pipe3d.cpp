@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 8: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video: dua atap bersilang, dua lapis, dalam satu blok + log kecil.
+// Versi 9: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis, nyambung saat ditumpuk) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -32,7 +32,7 @@ static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
 // Dua atap disilangkan (searah X dan searah Z) jadi satu lapis; lapis itu disalin dan dinaikkan.
 // Semua di dalam satu blok. Satuan: 1.0 = tinggi satu blok.
 static const float LEAF_ROOF_H = 0.50f;   // tinggi punggung atap dari dasar lapis (kemiringan 45 derajat)
-static const float LEAF_LIFT = 0.30f;     // seberapa tinggi lapis kedua dinaikkan
+static const float LEAF_LIFT = 0.50f;     // lapis kedua dinaikkan 0.5 blok: puncaknya tepat di 1.0 = dasar blok di atasnya (nyambung saat ditumpuk)
 static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTessellator
 // Fungsi game (alamat 0.15.10, bit terakhir 1 = kode Thumb)
 static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
