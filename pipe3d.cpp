@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 6: meja kerja (kotak) + tungku ke lapisan transparan + daun rimbun 8 bidang (gaya video) + log kecil.
+// Versi 7: meja kerja (kotak) + tungku ke lapisan transparan + daun persis bentuk video (4 bidang 45 derajat, poros di sisi atas blok) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -28,6 +28,9 @@ static const int FLAG_OFF = 0x10;      // penanda pendukung alpha test (1 byte)
 static const int LAYER_ALPHATEST = 4;
 static const int ID_LEAVES = 18;       // daun oak, spruce, birch, jungle
 static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
+// Bentuk daun: true = persis model video (4 bidang miring, poros di tengah sisi ATAS blok, jadi
+// separuh bidang menjulang 0,5 blok di atas blok). false = versi rimbun 8 bidang di dalam blok.
+static const bool LEAF_VIDEO_SHAPE = true;
 static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTessellator
 // Fungsi game (alamat 0.15.10, bit terakhir 1 = kode Thumb)
 static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
@@ -127,12 +130,20 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
   const float p2[4][3] = {{0, 0, 1}, {1, 0, 1}, {1, 1, 0}, {0, 1, 0}};
   const float p3[4][3] = {{0, 0, 0}, {0, 0, 1}, {1, 1, 1}, {1, 1, 0}};
   const float p4[4][3] = {{1, 0, 0}, {1, 0, 1}, {0, 1, 1}, {0, 1, 0}};
-  // bidang tegak diagonal (dua) dan bidang datar (dua) untuk mengisi celah dari segala arah
+  if (LEAF_VIDEO_SHAPE) {
+    // poros model video ada di (8,16,8): bidang berpusat di sisi atas blok, naik turun 0,5 blok
+    float yo = by + 0.5f;
+    set_shaded_color(tess, tint, 1.00f); draw_quad(tess, bx, yo, bz, p1, uv);
+    set_shaded_color(tess, tint, 0.82f); draw_quad(tess, bx, yo, bz, p2, uv);
+    set_shaded_color(tess, tint, 0.92f); draw_quad(tess, bx, yo, bz, p3, uv);
+    set_shaded_color(tess, tint, 0.74f); draw_quad(tess, bx, yo, bz, p4, uv);
+    return true;
+  }
+  // versi rimbun: bidang tegak diagonal (dua) dan bidang datar (dua) di dalam blok
   const float p5[4][3] = {{0, 0, 0}, {1, 0, 1}, {1, 1, 1}, {0, 1, 0}};
   const float p6[4][3] = {{1, 0, 0}, {0, 0, 1}, {0, 1, 1}, {1, 1, 0}};
   const float p7[4][3] = {{0, 0.30f, 1}, {1, 0.30f, 1}, {1, 0.30f, 0}, {0, 0.30f, 0}};
   const float p8[4][3] = {{0, 0.70f, 1}, {1, 0.70f, 1}, {1, 0.70f, 0}, {0, 0.70f, 0}};
-  // terang-gelap dibuat lebih dalam supaya rumpun terlihat tebal dan berkedalaman
   set_shaded_color(tess, tint, 0.95f); draw_quad(tess, bx, by, bz, p1, uv);
   set_shaded_color(tess, tint, 0.70f); draw_quad(tess, bx, by, bz, p2, uv);
   set_shaded_color(tess, tint, 0.85f); draw_quad(tess, bx, by, bz, p3, uv);
