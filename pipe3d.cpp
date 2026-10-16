@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 3: meja kerja (kotak) + tungku ke lapisan transparan + daun berlapis + log kecil.
+// Versi 4: meja kerja (kotak) + tungku ke lapisan transparan + daun bidang miring + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -28,8 +28,11 @@ static const int FLAG_OFF = 0x10;      // penanda pendukung alpha test (1 byte)
 static const int LAYER_ALPHATEST = 4;
 static const int ID_LEAVES = 18;       // daun oak, spruce, birch, jungle
 static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
-static const float LEAF_INNER_MIN = 0.12f;   // lapisan dalam daun (0 sampai 1)
-static const float LEAF_INNER_MAX = 0.88f;
+static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTessellator
+// Fungsi game (alamat 0.15.10, bit terakhir 1 = kode Thumb)
+static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
+static const uintptr_t OFF_QUAD = 0xA24235;        // Tessellator::quad(bool)
+static const uintptr_t OFF_GET_TEXTURE = 0x995799; // BlockTessellator::_getTexture(Block&, face, data)
 
 // Catat nilai lapisan tiap id blok sekali saja, untuk bahan pelajaran
 static bool seen_id[256];
@@ -61,6 +64,22 @@ static const int8_t BOXES[][6] = {
 static const int NUM_BOXES = sizeof(BOXES) / sizeof(BOXES[0]);
 
 typedef int (*TessBlockFn)(void* self, void* block, void* pos, int data);
+typedef void (*VertexUVFn)(void* tess, float x, float y, float z, float u, float v);
+typedef void (*QuadFn)(void* tess, bool flip);
+typedef const float* (*GetTexFn)(void* self, void* block, signed char face, int data);
+static VertexUVFn fn_vertex_uv = nullptr;
+static QuadFn fn_quad = nullptr;
+static GetTexFn fn_get_tex = nullptr;
+static bool leaf_logged = false;
+
+// Satu bidang dari 4 titik, digambar dua sisi
+static void draw_quad(void* tess, float bx, float by, float bz,
+                      const float p[4][3], const float uv[4][2]) {
+  for (int i = 0; i < 4; i++)
+    fn_vertex_uv(tess, bx + p[i][0], by + p[i][1], bz + p[i][2], uv[i][0], uv[i][1]);
+  fn_quad(tess, false);
+  fn_quad(tess, true);
+}
 static TessBlockFn orig_tess_block = nullptr;
 
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
@@ -71,17 +90,34 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
     *((uint8_t*)block + FLAG_OFF) = 1;
   }
   if (id == ID_LEAVES || id == ID_LEAVES2) {
-    // kubus luar bawaan game, lalu satu kubus dalam yang lebih kecil
+    // kubus luar bawaan game, lalu tiga bidang miring di dalamnya
     int r0 = orig_tess_block(self, block, pos, data);
-    uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
-    uint8_t lsaved[28];
-    memcpy(lsaved, lb, 28);
-    float* lf = (float*)lb;
-    lf[0] = lf[1] = lf[2] = LEAF_INNER_MIN;
-    lf[3] = lf[4] = lf[5] = LEAF_INNER_MAX;
-    lb[24] = 1;
-    orig_tess_block(self, block, pos, data);
-    memcpy(lb, lsaved, 28);
+    void* tess = *(void**)((uint8_t*)self + TESS_OFF);
+    if (tess && fn_vertex_uv && fn_quad && fn_get_tex) {
+      const float* t = fn_get_tex(self, block, 2, data);
+      if (!leaf_logged) {
+        leaf_logged = true;
+        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+        if (f) {
+          if (t) fprintf(f, "leaf tess=%p uv=%f %f %f %f\n", tess, t[0], t[1], t[2], t[3]);
+          else fprintf(f, "leaf tess=%p uv=null\n", tess);
+          fclose(f);
+        }
+      }
+      if (t && t[0] >= 0.0f && t[1] >= 0.0f && t[2] <= 1.001f && t[3] <= 1.001f &&
+          t[2] > t[0] && t[3] > t[1]) {
+        float u0 = t[0], v0 = t[1], u1 = t[2], v1 = t[3];
+        int* bp = (int*)pos;
+        float bx = (float)bp[0], by = (float)bp[1], bz = (float)bp[2];
+        const float uv[4][2] = {{u0, v1}, {u0, v0}, {u1, v0}, {u1, v1}};
+        const float pa[4][3] = {{0, 0, 0}, {0, 1, 0}, {1, 1, 1}, {1, 0, 1}};
+        const float pb[4][3] = {{1, 0, 0}, {1, 1, 0}, {0, 1, 1}, {0, 0, 1}};
+        const float pc[4][3] = {{0, 0.5f, 0}, {0, 0.5f, 1}, {1, 0.5f, 1}, {1, 0.5f, 0}};
+        draw_quad(tess, bx, by, bz, pa, uv);
+        draw_quad(tess, bx, by, bz, pb, uv);
+        draw_quad(tess, bx, by, bz, pc, uv);
+      }
+    }
     return r0;
   }
   if (id != ID_CRAFTING_TABLE) {
@@ -112,6 +148,7 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
   uint32_t back = (uint32_t)(target + 8) | 1;
   memcpy(tr + 12, &back, 4);
   __builtin___clear_cache((char*)tr, (char*)tr + 16);
+  *orig_out = (void*)((uintptr_t)tr | 1);   // siap sebelum fungsi game ditimpa
 
   uintptr_t page = target & ~(uintptr_t)4095;
   if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
@@ -121,7 +158,6 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
   memcpy(t, patch, 8);
   __builtin___clear_cache((char*)t, (char*)t + 8);
   mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-  *orig_out = (void*)((uintptr_t)tr | 1);
   return true;
 }
 
@@ -145,9 +181,10 @@ static void* worker(void*) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
     return nullptr;
   }
-  void* orig = nullptr;
-  if (install_hook(target, (void*)hook_tess_block, &orig)) {
-    orig_tess_block = (TessBlockFn)orig;
+  fn_vertex_uv = (VertexUVFn)(base + OFF_VERTEX_UV);
+  fn_quad = (QuadFn)(base + OFF_QUAD);
+  fn_get_tex = (GetTexFn)(base + OFF_GET_TEXTURE);
+  if (install_hook(target, (void*)hook_tess_block, (void**)&orig_tess_block)) {
     LOG("hook terpasang, base=0x%lx", (unsigned long)base);
   } else {
     LOG("hook gagal dipasang");
