@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 2: meja kerja (kotak) + tungku dipindah ke lapisan transparan + log kecil.
+// Versi 3: meja kerja (kotak) + tungku ke lapisan transparan + daun berlapis + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -26,6 +26,10 @@ static const int ID_FURNACE_LIT = 62;
 static const int LAYER_OFF = 0x14;     // lapisan gambar blok (int) di dalam Block
 static const int FLAG_OFF = 0x10;      // penanda pendukung alpha test (1 byte)
 static const int LAYER_ALPHATEST = 4;
+static const int ID_LEAVES = 18;       // daun oak, spruce, birch, jungle
+static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
+static const float LEAF_INNER_MIN = 0.12f;   // lapisan dalam daun (0 sampai 1)
+static const float LEAF_INNER_MAX = 0.88f;
 
 // Catat nilai lapisan tiap id blok sekali saja, untuk bahan pelajaran
 static bool seen_id[256];
@@ -65,6 +69,20 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
   if (id == ID_FURNACE || id == ID_FURNACE_LIT) {
     *(int*)((uint8_t*)block + LAYER_OFF) = LAYER_ALPHATEST;
     *((uint8_t*)block + FLAG_OFF) = 1;
+  }
+  if (id == ID_LEAVES || id == ID_LEAVES2) {
+    // kubus luar bawaan game, lalu satu kubus dalam yang lebih kecil
+    int r0 = orig_tess_block(self, block, pos, data);
+    uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
+    uint8_t lsaved[28];
+    memcpy(lsaved, lb, 28);
+    float* lf = (float*)lb;
+    lf[0] = lf[1] = lf[2] = LEAF_INNER_MIN;
+    lf[3] = lf[4] = lf[5] = LEAF_INNER_MAX;
+    lb[24] = 1;
+    orig_tess_block(self, block, pos, data);
+    memcpy(lb, lsaved, 28);
+    return r0;
   }
   if (id != ID_CRAFTING_TABLE) {
     return orig_tess_block(self, block, pos, data);
