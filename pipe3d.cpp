@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 4: meja kerja (kotak) + tungku ke lapisan transparan + daun bidang miring + log kecil.
+// Versi 5: meja kerja (kotak) + tungku ke lapisan transparan + daun 4 bidang miring 45 derajat (gaya video) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -33,6 +33,8 @@ static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTes
 static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
 static const uintptr_t OFF_QUAD = 0xA24235;        // Tessellator::quad(bool)
 static const uintptr_t OFF_GET_TEXTURE = 0x995799; // BlockTessellator::_getTexture(Block&, face, data)
+static const uintptr_t OFF_COLOR = 0xA23B89;       // Tessellator::color(int 0xRRGGBB)
+static const int VT_GET_COLOR = 0x14c;             // Block vtable: getColor(BlockSource&, BlockPos const&)
 
 // Catat nilai lapisan tiap id blok sekali saja, untuk bahan pelajaran
 static bool seen_id[256];
@@ -67,6 +69,9 @@ typedef int (*TessBlockFn)(void* self, void* block, void* pos, int data);
 typedef void (*VertexUVFn)(void* tess, float x, float y, float z, float u, float v);
 typedef void (*QuadFn)(void* tess, bool flip);
 typedef const float* (*GetTexFn)(void* self, void* block, signed char face, int data);
+typedef void (*ColorFn)(void* tess, int rgb);
+typedef int (*GetColorFn)(void* block, void* source, void* pos);
+static ColorFn fn_color = nullptr;
 static VertexUVFn fn_vertex_uv = nullptr;
 static QuadFn fn_quad = nullptr;
 static GetTexFn fn_get_tex = nullptr;
@@ -82,6 +87,53 @@ static void draw_quad(void* tess, float bx, float by, float bz,
 }
 static TessBlockFn orig_tess_block = nullptr;
 
+
+static void set_shaded_color(void* tess, int c, float k) {
+  int r = (int)(((c >> 16) & 255) * k);
+  int g = (int)(((c >> 8) & 255) * k);
+  int b = (int)((c & 255) * k);
+  fn_color(tess, (r << 16) | (g << 8) | b);
+}
+
+// Daun gaya video: 4 bidang miring 45 derajat (dua miring ke arah Z, dua ke arah X), tanpa kubus.
+// Mengembalikan true kalau berhasil digambar.
+static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
+  void* tess = *(void**)((uint8_t*)self + TESS_OFF);
+  if (!tess || !fn_vertex_uv || !fn_quad || !fn_get_tex || !fn_color) return false;
+  const float* t = fn_get_tex(self, block, 2, data);
+  if (!leaf_logged) {
+    leaf_logged = true;
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f) {
+      if (t) fprintf(f, "leaf tess=%p uv=%f %f %f %f\n", tess, t[0], t[1], t[2], t[3]);
+      else fprintf(f, "leaf tess=%p uv=null\n", tess);
+      fclose(f);
+    }
+  }
+  if (!(t && t[0] >= 0.0f && t[1] >= 0.0f && t[2] <= 1.001f && t[3] <= 1.001f &&
+        t[2] > t[0] && t[3] > t[1])) return false;
+  float u0 = t[0], v0 = t[1], u1 = t[2], v1 = t[3];
+
+  int tint = 0x00FFFFFF;
+  void** vt = *(void***)block;
+  GetColorFn get_color = (GetColorFn)vt[VT_GET_COLOR / 4];
+  void* source = *(void**)((uint8_t*)self + 4);
+  if (source) tint = get_color(block, source, pos);
+
+  int* bp = (int*)pos;
+  float bx = (float)bp[0], by = (float)bp[1], bz = (float)bp[2];
+  const float uv[4][2] = {{u0, v1}, {u1, v1}, {u1, v0}, {u0, v0}};
+  const float p1[4][3] = {{0, 0, 0}, {1, 0, 0}, {1, 1, 1}, {0, 1, 1}};
+  const float p2[4][3] = {{0, 0, 1}, {1, 0, 1}, {1, 1, 0}, {0, 1, 0}};
+  const float p3[4][3] = {{0, 0, 0}, {0, 0, 1}, {1, 1, 1}, {1, 1, 0}};
+  const float p4[4][3] = {{1, 0, 0}, {1, 0, 1}, {0, 1, 1}, {0, 1, 0}};
+  set_shaded_color(tess, tint, 1.00f); draw_quad(tess, bx, by, bz, p1, uv);
+  set_shaded_color(tess, tint, 0.82f); draw_quad(tess, bx, by, bz, p2, uv);
+  set_shaded_color(tess, tint, 0.92f); draw_quad(tess, bx, by, bz, p3, uv);
+  set_shaded_color(tess, tint, 0.74f); draw_quad(tess, bx, by, bz, p4, uv);
+  return true;
+}
+
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
   int id = *((uint8_t*)block + BLOCK_ID_OFF);
   log_block(id, block);
@@ -90,35 +142,8 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
     *((uint8_t*)block + FLAG_OFF) = 1;
   }
   if (id == ID_LEAVES || id == ID_LEAVES2) {
-    // kubus luar bawaan game, lalu tiga bidang miring di dalamnya
-    int r0 = orig_tess_block(self, block, pos, data);
-    void* tess = *(void**)((uint8_t*)self + TESS_OFF);
-    if (tess && fn_vertex_uv && fn_quad && fn_get_tex) {
-      const float* t = fn_get_tex(self, block, 2, data);
-      if (!leaf_logged) {
-        leaf_logged = true;
-        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-        if (f) {
-          if (t) fprintf(f, "leaf tess=%p uv=%f %f %f %f\n", tess, t[0], t[1], t[2], t[3]);
-          else fprintf(f, "leaf tess=%p uv=null\n", tess);
-          fclose(f);
-        }
-      }
-      if (t && t[0] >= 0.0f && t[1] >= 0.0f && t[2] <= 1.001f && t[3] <= 1.001f &&
-          t[2] > t[0] && t[3] > t[1]) {
-        float u0 = t[0], v0 = t[1], u1 = t[2], v1 = t[3];
-        int* bp = (int*)pos;
-        float bx = (float)bp[0], by = (float)bp[1], bz = (float)bp[2];
-        const float uv[4][2] = {{u0, v1}, {u0, v0}, {u1, v0}, {u1, v1}};
-        const float pa[4][3] = {{0, 0, 0}, {0, 1, 0}, {1, 1, 1}, {1, 0, 1}};
-        const float pb[4][3] = {{1, 0, 0}, {1, 1, 0}, {0, 1, 1}, {0, 0, 1}};
-        const float pc[4][3] = {{0, 0.5f, 0}, {0, 0.5f, 1}, {1, 0.5f, 1}, {1, 0.5f, 0}};
-        draw_quad(tess, bx, by, bz, pa, uv);
-        draw_quad(tess, bx, by, bz, pb, uv);
-        draw_quad(tess, bx, by, bz, pc, uv);
-      }
-    }
-    return r0;
+    if (draw_leaf_planes(self, block, pos, data)) return 1;
+    return orig_tess_block(self, block, pos, data);   // cadangan kalau gagal
   }
   if (id != ID_CRAFTING_TABLE) {
     return orig_tess_block(self, block, pos, data);
@@ -184,6 +209,7 @@ static void* worker(void*) {
   fn_vertex_uv = (VertexUVFn)(base + OFF_VERTEX_UV);
   fn_quad = (QuadFn)(base + OFF_QUAD);
   fn_get_tex = (GetTexFn)(base + OFF_GET_TEXTURE);
+  fn_color = (ColorFn)(base + OFF_COLOR);
   if (install_hook(target, (void*)hook_tess_block, (void**)&orig_tess_block)) {
     LOG("hook terpasang, base=0x%lx", (unsigned long)base);
   } else {
