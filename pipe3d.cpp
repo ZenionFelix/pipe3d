@@ -1,9 +1,10 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Percobaan pertama: hanya bentuk kotak, tanpa tekstur khusus.
+// Versi 2: meja kerja (kotak) + tungku dipindah ke lapisan transparan + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -20,6 +21,23 @@ static const uint8_t SIG_TESS_BLOCK[8] = {0x2d, 0xe9, 0xf0, 0x4b, 0x03, 0xaf, 0x
 static const int BOUNDS_OFF = 0x2d4;   // AABB (6 float + 1 byte) di dalam BlockTessellator
 static const int BLOCK_ID_OFF = 4;     // id blok (1 byte) di dalam Block
 static const int ID_CRAFTING_TABLE = 58;
+static const int ID_FURNACE = 61;
+static const int ID_FURNACE_LIT = 62;
+static const int LAYER_OFF = 0x14;     // lapisan gambar blok (int) di dalam Block
+static const int FLAG_OFF = 0x10;      // penanda pendukung alpha test (1 byte)
+static const int LAYER_ALPHATEST = 4;
+
+// Catat nilai lapisan tiap id blok sekali saja, untuk bahan pelajaran
+static bool seen_id[256];
+static void log_block(int id, void* block) {
+  if (id < 0 || id > 255 || seen_id[id]) return;
+  seen_id[id] = true;
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+  if (!f) return;
+  fprintf(f, "id=%d layer=%d flag=%d\n", id,
+          *(int*)((uint8_t*)block + LAYER_OFF), *((uint8_t*)block + FLAG_OFF));
+  fclose(f);
+}
 
 // Kotak meja kerja dalam 1/16 blok: x0,y0,z0,x1,y1,z1
 static const int8_t BOXES[][6] = {
@@ -42,7 +60,13 @@ typedef int (*TessBlockFn)(void* self, void* block, void* pos, int data);
 static TessBlockFn orig_tess_block = nullptr;
 
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
-  if (*((uint8_t*)block + BLOCK_ID_OFF) != ID_CRAFTING_TABLE) {
+  int id = *((uint8_t*)block + BLOCK_ID_OFF);
+  log_block(id, block);
+  if (id == ID_FURNACE || id == ID_FURNACE_LIT) {
+    *(int*)((uint8_t*)block + LAYER_OFF) = LAYER_ALPHATEST;
+    *((uint8_t*)block + FLAG_OFF) = 1;
+  }
+  if (id != ID_CRAFTING_TABLE) {
     return orig_tess_block(self, block, pos, data);
   }
   uint8_t* b = (uint8_t*)self + BOUNDS_OFF;
