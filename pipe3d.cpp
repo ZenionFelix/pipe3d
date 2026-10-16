@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 5: meja kerja (kotak) + tungku ke lapisan transparan + daun 4 bidang miring 45 derajat (gaya video) + log kecil.
+// Versi 6: meja kerja (kotak) + tungku ke lapisan transparan + daun rimbun 8 bidang (gaya video) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -127,10 +127,20 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
   const float p2[4][3] = {{0, 0, 1}, {1, 0, 1}, {1, 1, 0}, {0, 1, 0}};
   const float p3[4][3] = {{0, 0, 0}, {0, 0, 1}, {1, 1, 1}, {1, 1, 0}};
   const float p4[4][3] = {{1, 0, 0}, {1, 0, 1}, {0, 1, 1}, {0, 1, 0}};
-  set_shaded_color(tess, tint, 1.00f); draw_quad(tess, bx, by, bz, p1, uv);
-  set_shaded_color(tess, tint, 0.82f); draw_quad(tess, bx, by, bz, p2, uv);
-  set_shaded_color(tess, tint, 0.92f); draw_quad(tess, bx, by, bz, p3, uv);
-  set_shaded_color(tess, tint, 0.74f); draw_quad(tess, bx, by, bz, p4, uv);
+  // bidang tegak diagonal (dua) dan bidang datar (dua) untuk mengisi celah dari segala arah
+  const float p5[4][3] = {{0, 0, 0}, {1, 0, 1}, {1, 1, 1}, {0, 1, 0}};
+  const float p6[4][3] = {{1, 0, 0}, {0, 0, 1}, {0, 1, 1}, {1, 1, 0}};
+  const float p7[4][3] = {{0, 0.30f, 1}, {1, 0.30f, 1}, {1, 0.30f, 0}, {0, 0.30f, 0}};
+  const float p8[4][3] = {{0, 0.70f, 1}, {1, 0.70f, 1}, {1, 0.70f, 0}, {0, 0.70f, 0}};
+  // terang-gelap dibuat lebih dalam supaya rumpun terlihat tebal dan berkedalaman
+  set_shaded_color(tess, tint, 0.95f); draw_quad(tess, bx, by, bz, p1, uv);
+  set_shaded_color(tess, tint, 0.70f); draw_quad(tess, bx, by, bz, p2, uv);
+  set_shaded_color(tess, tint, 0.85f); draw_quad(tess, bx, by, bz, p3, uv);
+  set_shaded_color(tess, tint, 0.62f); draw_quad(tess, bx, by, bz, p4, uv);
+  set_shaded_color(tess, tint, 0.78f); draw_quad(tess, bx, by, bz, p5, uv);
+  set_shaded_color(tess, tint, 0.66f); draw_quad(tess, bx, by, bz, p6, uv);
+  set_shaded_color(tess, tint, 0.58f); draw_quad(tess, bx, by, bz, p7, uv);
+  set_shaded_color(tess, tint, 0.90f); draw_quad(tess, bx, by, bz, p8, uv);
   return true;
 }
 
