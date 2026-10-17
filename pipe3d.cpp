@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 9: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis, nyambung saat ditumpuk) + log kecil.
+// Versi 10: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis, bidang penuh 16px miring 45 derajat sehingga ujung atap menjorok ke samping) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -29,10 +29,11 @@ static const int LAYER_ALPHATEST = 4;
 static const int ID_LEAVES = 18;       // daun oak, spruce, birch, jungle
 static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
 // Bentuk daun (sesuai gambar acuan): satu "atap" = dua bidang miring bertemu di punggung atap.
+// Tiap bidang berukuran penuh 1 blok (16 px) lalu dimiringkan 45 derajat, jadi naik 0.7071 dan
+// menjorok 0.2071 keluar dari tepi blok di kedua sisi (ujung atap berbulu, sisi tidak polos).
 // Dua atap disilangkan (searah X dan searah Z) jadi satu lapis; lapis itu disalin dan dinaikkan.
-// Semua di dalam satu blok. Satuan: 1.0 = tinggi satu blok.
-static const float LEAF_ROOF_H = 0.50f;   // tinggi punggung atap dari dasar lapis (kemiringan 45 derajat)
-static const float LEAF_LIFT = 0.50f;     // lapis kedua dinaikkan 0.5 blok: puncaknya tepat di 1.0 = dasar blok di atasnya (nyambung saat ditumpuk)
+static const float LEAF_RISE = 0.70710678f;      // tinggi atap = jarak mendatar dari tepi ke punggung
+static const float LEAF_LIFT = 1.0f - 0.70710678f; // lapis kedua dinaikkan 0.2929: puncaknya tepat di 1.0
 static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTessellator
 // Fungsi game (alamat 0.15.10, bit terakhir 1 = kode Thumb)
 static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
@@ -128,16 +129,17 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
   int* bp = (int*)pos;
   float bx = (float)bp[0], by = (float)bp[1], bz = (float)bp[2];
   const float uv[4][2] = {{u0, v1}, {u1, v1}, {u1, v0}, {u0, v0}};
-  const float h = LEAF_ROOF_H;
+  const float R = LEAF_RISE;
+  const float ov = R - 0.5f;              // seberapa jauh ujung atap menjorok ke luar blok
   for (int layer = 0; layer < 2; layer++) {
     float y0 = layer ? LEAF_LIFT : 0.0f;
-    float y1 = y0 + h;
+    float y1 = y0 + R;
     // atap searah X: dua bidang, punggung atap di z = 0.5
-    const float a1[4][3] = {{0, y0, 0}, {1, y0, 0}, {1, y1, 0.5f}, {0, y1, 0.5f}};
-    const float a2[4][3] = {{0, y0, 1}, {1, y0, 1}, {1, y1, 0.5f}, {0, y1, 0.5f}};
+    const float a1[4][3] = {{0, y0, -ov}, {1, y0, -ov}, {1, y1, 0.5f}, {0, y1, 0.5f}};
+    const float a2[4][3] = {{0, y0, 1 + ov}, {1, y0, 1 + ov}, {1, y1, 0.5f}, {0, y1, 0.5f}};
     // atap searah Z: dua bidang, punggung atap di x = 0.5
-    const float b1[4][3] = {{0, y0, 0}, {0, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
-    const float b2[4][3] = {{1, y0, 0}, {1, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
+    const float b1[4][3] = {{-ov, y0, 0}, {-ov, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
+    const float b2[4][3] = {{1 + ov, y0, 0}, {1 + ov, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
     set_shaded_color(tess, tint, 1.00f); draw_quad(tess, bx, by, bz, a1, uv);
     set_shaded_color(tess, tint, 0.82f); draw_quad(tess, bx, by, bz, a2, uv);
     set_shaded_color(tess, tint, 0.92f); draw_quad(tess, bx, by, bz, b1, uv);
