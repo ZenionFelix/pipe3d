@@ -213,11 +213,11 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
 //   posisi x,y,z di +0,+4,+8 (y positif = ke bawah), sudut putar x,y,z di +0x18,+0x1C,+0x20 (radian)
 static const uintptr_t OFF_SETUP_ANIM = 0x910B80;   // HumanoidModel::setupAnim(float x6)
 static const uint8_t SIG_SETUP_ANIM[8] = {0x2d, 0xe9, 0xf0, 0x41, 0x2d, 0xed, 0x0a, 0x8b};
-static const uintptr_t OFF_PREPARE_MOB = 0x910B6C;  // HumanoidModel::prepareMobModel(Mob&, float x3)
-static const uint8_t SIG_PREPARE_MOB[8] = {0x10, 0xb5, 0x04, 0x46, 0x08, 0x68, 0xd0, 0xf8};
+static const uintptr_t OFF_RENDER = 0x910940;       // HumanoidModel::render(Entity&, float x6)
+static const uint8_t SIG_RENDER[8] = {0x2d, 0xe9, 0xf0, 0x48, 0x2d, 0xed, 0x08, 0x8b};
 static const int P_HEAD = 0xF0, P_HAT = 0x1A8, P_BODY = 0x260;
 static const int P_RARM = 0x318, P_LARM = 0x3D0, P_RLEG = 0x488, P_LLEG = 0x540;
-static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi prepareMobModel)
+static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi sebelum render)
 static const int M_RIDING = 0x19;    // byte: sedang menunggang
 static const int M_ATTACK = 0x14;    // float: progres ayunan serangan
 
@@ -232,10 +232,10 @@ static const float WALK_TWIST = 0.10f;    // badan memutar tiap langkah (radian)
 static const float RUN_LEAN = 0.12f;      // badan condong ke depan saat lari (radian)
 
 typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
-typedef void (*PrepareMobFn)(void* self, void* mob, float a, float b, float c);
+typedef void (*RenderFn)(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6);
 static SetupAnimFn orig_setup_anim = nullptr;
-static PrepareMobFn orig_prepare_mob = nullptr;
-static void* g_cur_mob = nullptr;     // mob yang sedang disiapkan (dicatat prepareMobModel)
+static RenderFn orig_render = nullptr;
+static void* g_cur_mob = nullptr;     // makhluk yang sedang digambar (dicatat hook render)
 static double g_cur_mob_time = 0;
 static bool anim_logged = false;
 
@@ -285,10 +285,11 @@ static double now_sec() {
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static void hook_prepare_mob(void* self, void* mob, float a, float b, float c) {
-  g_cur_mob = mob;
+static void hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
+  g_cur_mob = ent;
   g_cur_mob_time = now_sec();
-  orig_prepare_mob(self, mob, a, b, c);
+  orig_render(self, ent, a1, a2, a3, a4, a5, a6);
+  g_cur_mob = nullptr;
 }
 
 static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, float a5, float a6) {
@@ -388,14 +389,14 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
 }
 
 static void install_anim_hooks(uintptr_t base) {
-  uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_PREPARE_MOB;
-  if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_PREPARE_MOB, 8) != 0) {
+  uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_RENDER;
+  if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_RENDER, 8) != 0) {
     LOG("anim: tanda fungsi tidak cocok, dibatalkan");
     return;
   }
-  bool ok2 = install_hook(t2, (void*)hook_prepare_mob, (void**)&orig_prepare_mob);
+  bool ok2 = install_hook(t2, (void*)hook_render, (void**)&orig_render);
   bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
-  LOG("anim hook: setupAnim=%d prepareMob=%d", (int)ok1, (int)ok2);
+  LOG("anim hook: setupAnim=%d render=%d", (int)ok1, (int)ok2);
 }
 
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
