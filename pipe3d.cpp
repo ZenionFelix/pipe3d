@@ -1,6 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
-// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim; first person: badan pemain terlihat, kepala disembunyikan. Kode blok dan daun tidak diubah.
+// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim; first person: badan pemain terlihat (kepala disembunyikan, tangan dan item bawaan layar dimatikan, tangan badan memegang item). Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -215,6 +215,12 @@ static const uintptr_t OFF_SETUP_ANIM = 0x910B80;   // HumanoidModel::setupAnim(
 static const uint8_t SIG_SETUP_ANIM[8] = {0x2d, 0xe9, 0xf0, 0x41, 0x2d, 0xed, 0x0a, 0x8b};
 static const uintptr_t OFF_RENDER = 0x910940;       // HumanoidModel::render(Entity&, float x6)
 static const uint8_t SIG_RENDER[8] = {0x2d, 0xe9, 0xf0, 0x48, 0x2d, 0xed, 0x08, 0x8b};
+static const uintptr_t OFF_ERD_RENDER = 0x9C2C48;    // EntityRenderDispatcher::render(Entity&, float)
+static const uint8_t SIG_ERD_RENDER[8] = {0x70, 0xb5, 0x8a, 0xb0, 0x05, 0x46, 0x07, 0xa8};
+static const uintptr_t OFF_CARRIED = 0x9DE924;       // PlayerRenderer::prepareCarriedItem(Model&, Mob&, ItemInstance*)
+static const uint8_t SIG_CARRIED[8] = {0x70, 0xb5, 0x1c, 0x46, 0x0d, 0x46, 0x06, 0x46};
+static const uintptr_t OFF_IIH_RENDER = 0x9FD6A0;    // ItemInHandRenderer::render(bool, float): tangan dan item bawaan layar
+static const uint8_t SIG_IIH_RENDER[10] = {0x2d, 0xe9, 0xf0, 0x4f, 0x81, 0xb0, 0x2d, 0xed, 0x10, 0x8b};
 static const int P_HEAD = 0xF0, P_HAT = 0x1A8, P_BODY = 0x260;
 static const int P_RARM = 0x318, P_LARM = 0x3D0, P_RLEG = 0x488, P_LLEG = 0x540;
 static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi sebelum render)
@@ -237,8 +243,11 @@ static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, 
 // ---- First person: badan pemain ikut digambar ----
 // Game melewati pemain sendiri saat pengaturan kamera = 0 (first person). Tiga titik 'lewati' itu di-NOP.
 static const bool FP_BODY = true;               // false = perilaku asli game
-static const float FP_BACK = 6.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
+static const float FP_BACK = 3.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
 static bool g_fp_now = false;                   // true selama model pemain sendiri digambar saat first person
+static const bool FP_HIDE_VIEWMODEL = true;     // matikan tangan dan item bawaan layar saat first person (badan yang memegang item)
+static const float FP_ARM_X = -1.5f;            // sudut tangan kanan yang memegang item saat first person (negatif = ke depan, -1.57 = lurus ke depan)
+static const float FP_ARM_SWING = 0.4f;         // ayunan tangan saat berjalan dikecilkan segini saat first person
 static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
 static const uintptr_t OFF_ERD_PTR = 0x16B4708;     // EntityRenderer::entityRenderDispatcher (static)
 static const int ERD_CLIENT = 0xC, ERD_CAMERA = 0x1C;   // isi EntityRenderDispatcher: MinecraftClient*, Entity* kamera
@@ -251,15 +260,28 @@ static GetOptFn g_get_opt = nullptr;
 static GetIntFn g_get_int = nullptr;
 static bool fp_logged = false;
 
-// true bila 'ent' adalah pemain sendiri dan kamera sedang first person
-static bool is_first_person_self(void* ent) {
-  if (!g_mc_base || !g_get_opt || !g_get_int || !ent) return false;
+static int g_world_depth = 0;        // > 0 selama LevelRenderer menggambar entitas dunia (bukan avatar HUD/inventori)
+static void* g_hold_mob = nullptr;   // pemain terakhir yang dicek prepareCarriedItem
+static void* g_hold_item = nullptr;  // item yang dipegang pemain itu (null = tangan kosong)
+static bool g_fp_holding = false;
+
+// true bila kamera sedang first person (Options::getPlayerViewPerspective() == 0)
+static bool first_person_view() {
+  if (!g_mc_base || !g_get_opt || !g_get_int) return false;
   void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
   if (!erd) return false;
-  if (*(void**)((uint8_t*)erd + ERD_CAMERA) != ent) return false;
   void* client = *(void**)((uint8_t*)erd + ERD_CLIENT);
   if (!client) return false;
   return g_get_int(g_get_opt(client)) == 0;
+}
+
+// true bila 'ent' adalah pemain sendiri, digambar di dunia (bukan avatar HUD), dan kamera first person
+static bool is_first_person_self(void* ent) {
+  if (g_world_depth <= 0 || !ent || !g_mc_base) return false;
+  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
+  if (!erd) return false;
+  if (*(void**)((uint8_t*)erd + ERD_CAMERA) != ent) return false;
+  return first_person_view();
 }
 
 typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
@@ -317,6 +339,32 @@ static double now_sec() {
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+typedef void (*ErdRenderFn)(void* self, void* ent, float pt);
+typedef void (*CarriedFn)(void* self, void* model, void* mob, void* item);
+typedef void (*IihRenderFn)(void* self, bool a, float b);
+static ErdRenderFn orig_erd_render = nullptr;
+static CarriedFn orig_carried = nullptr;
+static IihRenderFn orig_iih_render = nullptr;
+
+// Penggambaran entitas dunia: tandai supaya avatar HUD/inventori tidak ikut terkena aturan first person
+static void hook_erd_render(void* self, void* ent, float pt) {
+  g_world_depth++;
+  orig_erd_render(self, ent, pt);
+  g_world_depth--;
+}
+
+// Catat apakah pemain memegang item (dipanggil game sebelum menggambar model)
+static void hook_carried(void* self, void* model, void* mob, void* item) {
+  g_hold_mob = mob; g_hold_item = item;
+  orig_carried(self, model, mob, item);
+}
+
+// Tangan dan item bawaan layar: dilewati saat first person (badan yang memegang item)
+static void hook_iih_render(void* self, bool a, float b) {
+  if (FP_BODY && FP_HIDE_VIEWMODEL && first_person_view()) return;
+  orig_iih_render(self, a, b);
+}
+
 // Pegas redam: sudut tangan menyusul target dengan sedikit tertinggal dan memantul lunak
 static void spring_step(float* x, float* v, float target, float dt) {
   if (dt <= 0) return;
@@ -335,6 +383,7 @@ static void hook_render(void* self, void* ent, float a1, float a2, float a3, flo
   bool fps = FP_BODY && is_first_person_self(ent);
   bool fp = fps && FP_HIDE_HEAD;
   g_fp_now = fps;
+  g_fp_holding = fps && g_hold_mob == ent && g_hold_item != nullptr;
   uint8_t* head_vis = (uint8_t*)self + P_HEAD + PART_VISIBLE;
   uint8_t* hat_vis = (uint8_t*)self + P_HAT + PART_VISIBLE;
   uint8_t old_head = *head_vis, old_hat = *hat_vis;
@@ -349,6 +398,7 @@ static void hook_render(void* self, void* ent, float a1, float a2, float a3, flo
   orig_render(self, ent, a1, a2, a3, a4, a5, a6);
   if (fp) { *head_vis = old_head; *hat_vis = old_hat; }   // model dipakai bersama makhluk lain, kembalikan
   g_fp_now = false;
+  g_fp_holding = false;
   g_cur_mob = nullptr;
 }
 
@@ -441,6 +491,12 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
     }
   }
 
+  // First person: tangan kanan memegang item lurus ke depan (terlihat di kanan bawah), ayunan jalan dikecilkan
+  if (g_fp_now && !riding && attack <= 0) {
+    if (g_fp_holding) ra[6] = FP_ARM_X; else ra[6] *= FP_ARM_SWING;
+    la[6] *= FP_ARM_SWING;
+  }
+
   // 5. Tangan berpegas (tidak dipakai saat memukul atau menunggang)
   if (fresh || riding || attack > 0) {
     st->ax[0] = ra[6]; st->av[0] = 0;
@@ -499,6 +555,33 @@ static void install_fp_patches(uintptr_t base) {
   LOG("fp patch: utama=%d daftar1=%d daftar2=%d", (int)a, (int)b, (int)c);
 }
 
+// Seperti install_hook, tetapi menyalin n byte awal fungsi (8 atau 10; harus tepat di batas instruksi)
+static bool install_hook_n(uintptr_t target, void* hook, void** orig_out, int n) {
+  if (n == 8) return install_hook(target, hook, orig_out);
+  if (n != 10) return false;
+  uint8_t* t = (uint8_t*)target;
+  uint8_t* tr = (uint8_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (tr == (uint8_t*)MAP_FAILED) return false;
+  memcpy(tr, t, 10);
+  tr[10] = 0x00; tr[11] = 0xBF;                                  // nop (supaya ldr.w jatuh di batas 4 byte)
+  tr[12] = 0xDF; tr[13] = 0xF8; tr[14] = 0x00; tr[15] = 0xF0;    // ldr.w pc, [pc, #0] -> alamat di tr+16
+  uint32_t back = (uint32_t)(target + 10) | 1;
+  memcpy(tr + 16, &back, 4);
+  __builtin___clear_cache((char*)tr, (char*)tr + 20);
+  *orig_out = (void*)((uintptr_t)tr | 1);
+
+  uintptr_t page = target & ~(uintptr_t)4095;
+  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+  uint8_t patch[8] = {0xDF, 0xF8, 0x00, 0xF0, 0, 0, 0, 0};
+  uint32_t h = (uint32_t)(uintptr_t)hook | 1;
+  memcpy(patch + 4, &h, 4);
+  memcpy(t, patch, 8);
+  __builtin___clear_cache((char*)t, (char*)t + 8);
+  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
+  return true;
+}
+
 static void install_anim_hooks(uintptr_t base) {
   uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_RENDER;
   if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_RENDER, 8) != 0) {
@@ -508,7 +591,16 @@ static void install_anim_hooks(uintptr_t base) {
   bool ok2 = install_hook(t2, (void*)hook_render, (void**)&orig_render);
   bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
   LOG("anim hook: setupAnim=%d render=%d", (int)ok1, (int)ok2);
-  if (FP_BODY) install_fp_patches(base);
+  if (FP_BODY) {
+    install_fp_patches(base);
+    // Hook tambahan untuk first person; masing-masing diperiksa tandanya dulu dan boleh gagal sendiri-sendiri
+    uintptr_t t3 = base + OFF_ERD_RENDER, t4 = base + OFF_CARRIED, t5 = base + OFF_IIH_RENDER;
+    bool ok3 = memcmp((void*)t3, SIG_ERD_RENDER, 8) == 0 && install_hook(t3, (void*)hook_erd_render, (void**)&orig_erd_render);
+    bool ok4 = memcmp((void*)t4, SIG_CARRIED, 8) == 0 && install_hook(t4, (void*)hook_carried, (void**)&orig_carried);
+    bool ok5 = FP_HIDE_VIEWMODEL && memcmp((void*)t5, SIG_IIH_RENDER, 10) == 0 &&
+               install_hook_n(t5, (void*)hook_iih_render, (void**)&orig_iih_render, 10);
+    LOG("fp hook: erdRender=%d carriedItem=%d viewmodel=%d", (int)ok3, (int)ok4, (int)ok5);
+  }
 }
 
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
