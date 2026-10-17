@@ -1,6 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
-// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus) lewat hook HumanoidModel::setupAnim. Kode blok dan daun tidak diubah.
+// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim. Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -230,6 +230,9 @@ static const float BREATH_SWAY = 0.035f;  // goyang tangan saat diam (radian)
 static const float WALK_BOB = 0.70f;      // badan naik tiap langkah (piksel model)
 static const float WALK_TWIST = 0.10f;    // badan memutar tiap langkah (radian); balik tanda kalau arahnya terasa terbalik
 static const float RUN_LEAN = 0.12f;      // badan condong ke depan saat lari (radian)
+static const float LEG_LIFT = 1.6f;       // kaki terangkat saat mengayun ke depan (piksel model)
+static const float ARM_K = 300.0f;        // kekakuan pegas tangan (makin besar, makin cepat menyusul)
+static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, makin banyak memantul)
 
 typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
 typedef void (*RenderFn)(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6);
@@ -257,7 +260,7 @@ static void put_pose(void* self, const float in[7][6]) {
 }
 
 // Keadaan per makhluk (model dipakai bersama oleh banyak mob, jadi tidak boleh disimpan di model)
-struct AnimState { void* key; double last; float hy, hp, sneak; bool used; };
+struct AnimState { void* key; double last; float hy, hp, sneak; float ax[2], av[2]; bool used; };
 static AnimState g_states[32];
 static AnimState* get_state(void* key) {
   AnimState* oldest = &g_states[0];
@@ -267,6 +270,7 @@ static AnimState* get_state(void* key) {
     if (g_states[i].last < oldest->last) oldest = &g_states[i];
   }
   oldest->used = true; oldest->key = key; oldest->last = -1; oldest->hy = oldest->hp = oldest->sneak = 0;
+  oldest->ax[0] = oldest->ax[1] = oldest->av[0] = oldest->av[1] = 0;
   return oldest;
 }
 // setupAnim asli TIDAK mereset posisi-y badan/tangan dan sudut-y badan (kecuali saat memukul),
@@ -283,6 +287,18 @@ static double now_sec() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// Pegas redam: sudut tangan menyusul target dengan sedikit tertinggal dan memantul lunak
+static void spring_step(float* x, float* v, float target, float dt) {
+  if (dt <= 0) return;
+  const int n = 2;
+  float h = dt / n;
+  for (int i = 0; i < n; i++) {
+    float a = ARM_K * (target - *x) - ARM_C * (*v);
+    *v += a * h;
+    *x += *v * h;
+  }
 }
 
 static void hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
@@ -370,7 +386,22 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
       body[7] += twist; ra[7] += twist; la[7] += twist; head[7] -= twist;
       fx->twist += twist;
       body[6] += lean; ra[6] += lean; la[6] += lean; head[6] -= lean;
+      // Kaki terangkat saat mengayun ke depan (kaki kanan maju saat sin(fase) > 0, kiri saat < 0)
+      float sp = sinf(phase);
+      if (sp > 0) part(self, P_RLEG)[1] -= sp * w * LEG_LIFT;
+      else part(self, P_LLEG)[1] += sp * w * LEG_LIFT;
     }
+  }
+
+  // 5. Tangan berpegas (tidak dipakai saat memukul atau menunggang)
+  if (fresh || riding || attack > 0) {
+    st->ax[0] = ra[6]; st->av[0] = 0;
+    st->ax[1] = la[6]; st->av[1] = 0;
+  } else {
+    float dts = dt > 0.05f ? 0.05f : dt;
+    spring_step(&st->ax[0], &st->av[0], ra[6], dts);
+    spring_step(&st->ax[1], &st->av[1], la[6], dts);
+    ra[6] = st->ax[0]; la[6] = st->ax[1];
   }
 
   // Topi selalu sama dengan kepala (seperti yang dilakukan setupAnim asli)
