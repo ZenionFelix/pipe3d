@@ -1,6 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
-// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim. Kode blok dan daun tidak diubah.
+// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim; first person: badan pemain terlihat, kepala disembunyikan. Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -234,6 +234,32 @@ static const float LEG_LIFT = 1.6f;       // kaki terangkat saat mengayun ke dep
 static const float ARM_K = 300.0f;        // kekakuan pegas tangan (makin besar, makin cepat menyusul)
 static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, makin banyak memantul)
 
+// ---- First person: badan pemain ikut digambar ----
+// Game melewati pemain sendiri saat pengaturan kamera = 0 (first person). Tiga titik 'lewati' itu di-NOP.
+static const bool FP_BODY = true;               // false = perilaku asli game
+static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
+static const uintptr_t OFF_ERD_PTR = 0x16B4708;     // EntityRenderer::entityRenderDispatcher (static)
+static const int ERD_CLIENT = 0xC, ERD_CAMERA = 0x1C;   // isi EntityRenderDispatcher: MinecraftClient*, Entity* kamera
+static const int PART_VISIBLE = 0x25;           // byte 'terlihat' di tiap ModelPart (0 = tidak digambar)
+static const uintptr_t OFF_GET_OPT = 0x597D64, OFF_GET_INT = 0x598154;   // dua pemanggilan yang dipakai game untuk membaca pengaturan third person
+typedef void* (*GetOptFn)(void* client);
+typedef int (*GetIntFn)(void* opt);
+static uintptr_t g_mc_base = 0;
+static GetOptFn g_get_opt = nullptr;
+static GetIntFn g_get_int = nullptr;
+static bool fp_logged = false;
+
+// true bila 'ent' adalah pemain sendiri dan kamera sedang first person
+static bool is_first_person_self(void* ent) {
+  if (!g_mc_base || !g_get_opt || !g_get_int || !ent) return false;
+  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
+  if (!erd) return false;
+  if (*(void**)((uint8_t*)erd + ERD_CAMERA) != ent) return false;
+  void* client = *(void**)((uint8_t*)erd + ERD_CLIENT);
+  if (!client) return false;
+  return g_get_int(g_get_opt(client)) == 0;
+}
+
 typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
 typedef void (*RenderFn)(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6);
 static SetupAnimFn orig_setup_anim = nullptr;
@@ -304,7 +330,20 @@ static void spring_step(float* x, float* v, float target, float dt) {
 static void hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
   g_cur_mob = ent;
   g_cur_mob_time = now_sec();
+  bool fp = FP_BODY && FP_HIDE_HEAD && is_first_person_self(ent);
+  uint8_t* head_vis = (uint8_t*)self + P_HEAD + PART_VISIBLE;
+  uint8_t* hat_vis = (uint8_t*)self + P_HAT + PART_VISIBLE;
+  uint8_t old_head = *head_vis, old_hat = *hat_vis;
+  if (fp) {
+    *head_vis = 0; *hat_vis = 0;
+    if (!fp_logged) {
+      fp_logged = true;
+      FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+      if (f) { fprintf(f, "fp: pemain sendiri digambar saat first person, ent=%p\n", ent); fclose(f); }
+    }
+  }
   orig_render(self, ent, a1, a2, a3, a4, a5, a6);
+  if (fp) { *head_vis = old_head; *hat_vis = old_hat; }   // model dipakai bersama makhluk lain, kembalikan
   g_cur_mob = nullptr;
 }
 
@@ -419,6 +458,32 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
   }
 }
 
+// Timpa byte kode game dengan memeriksa dulu isi aslinya (kalau beda, tidak diubah)
+static bool patch_code(uintptr_t addr, const uint8_t* expect, const uint8_t* repl, size_t n) {
+  if (memcmp((void*)addr, expect, n) != 0) return false;
+  uintptr_t page = addr & ~(uintptr_t)4095;
+  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+  memcpy((void*)addr, repl, n);
+  __builtin___clear_cache((char*)addr, (char*)addr + n);
+  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
+  return true;
+}
+
+static void install_fp_patches(uintptr_t base) {
+  static const uint8_t nop2[2] = {0x00, 0xBF};
+  static const uint8_t nop4[4] = {0x00, 0xBF, 0x00, 0xBF};
+  static const uint8_t e1[4] = {0x00, 0xF0, 0x0F, 0x81};   // beq.w -> lewati (pengecekan utama)
+  static const uint8_t e2[2] = {0x62, 0xD0};               // beq   -> lewati (daftar pemain)
+  static const uint8_t e3[2] = {0x78, 0xB3};               // cbz   -> lewati (daftar pemain)
+  g_mc_base = base;
+  g_get_opt = (GetOptFn)(base + OFF_GET_OPT);
+  g_get_int = (GetIntFn)(base + OFF_GET_INT);
+  bool a = patch_code(base + 0xA0C546, e1, nop4, 4);
+  bool b = patch_code(base + 0xA0C17A, e2, nop2, 2);
+  bool c = patch_code(base + 0xA0C1E0, e3, nop2, 2);
+  LOG("fp patch: utama=%d daftar1=%d daftar2=%d", (int)a, (int)b, (int)c);
+}
+
 static void install_anim_hooks(uintptr_t base) {
   uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_RENDER;
   if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_RENDER, 8) != 0) {
@@ -428,6 +493,7 @@ static void install_anim_hooks(uintptr_t base) {
   bool ok2 = install_hook(t2, (void*)hook_render, (void**)&orig_render);
   bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
   LOG("anim hook: setupAnim=%d render=%d", (int)ok1, (int)ok2);
+  if (FP_BODY) install_fp_patches(base);
 }
 
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
