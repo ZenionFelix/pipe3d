@@ -1,5 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
+// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus) lewat hook HumanoidModel::setupAnim. Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -8,6 +9,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <math.h>
+#include <time.h>
 
 #define TAG "pipe3d"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -204,6 +207,197 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
   return true;
 }
 
+// ======================= Animasi karakter (HumanoidModel) =======================
+// Pendekatan: panggil setupAnim asli, lalu tambah gerakan kecil ke sudut/posisi bagian badan.
+// Letak bagian di dalam HumanoidModel (tiap bagian ModelPart besarnya 0xB8 byte):
+//   posisi x,y,z di +0,+4,+8 (y positif = ke bawah), sudut putar x,y,z di +0x18,+0x1C,+0x20 (radian)
+static const uintptr_t OFF_SETUP_ANIM = 0x910B80;   // HumanoidModel::setupAnim(float x6)
+static const uint8_t SIG_SETUP_ANIM[8] = {0x2d, 0xe9, 0xf0, 0x41, 0x2d, 0xed, 0x0a, 0x8b};
+static const uintptr_t OFF_PREPARE_MOB = 0x910B6C;  // HumanoidModel::prepareMobModel(Mob&, float x3)
+static const uint8_t SIG_PREPARE_MOB[8] = {0x10, 0xb5, 0x04, 0x46, 0x08, 0x68, 0xd0, 0xf8};
+static const int P_HEAD = 0xF0, P_HAT = 0x1A8, P_BODY = 0x260;
+static const int P_RARM = 0x318, P_LARM = 0x3D0, P_RLEG = 0x488, P_LLEG = 0x540;
+static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi prepareMobModel)
+static const int M_RIDING = 0x19;    // byte: sedang menunggang
+static const int M_ATTACK = 0x14;    // float: progres ayunan serangan
+
+// Angka yang bisa diatur (kalau gerakan terasa kurang/terlalu)
+static const float SNEAK_TIME = 0.20f;    // detik untuk masuk/keluar sneak
+static const float HEAD_TAU = 0.07f;      // makin besar, kepala makin lambat menyusul
+static const float BREATH_SPEED = 1.9f;   // radian per detik (sekitar 3 detik per tarikan napas)
+static const float BREATH_AMP = 0.30f;    // naik-turun badan (piksel model)
+static const float BREATH_SWAY = 0.035f;  // goyang tangan saat diam (radian)
+static const float WALK_BOB = 0.70f;      // badan naik tiap langkah (piksel model)
+static const float WALK_TWIST = 0.10f;    // badan memutar tiap langkah (radian); balik tanda kalau arahnya terasa terbalik
+static const float RUN_LEAN = 0.12f;      // badan condong ke depan saat lari (radian)
+
+typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
+typedef void (*PrepareMobFn)(void* self, void* mob, float a, float b, float c);
+static SetupAnimFn orig_setup_anim = nullptr;
+static PrepareMobFn orig_prepare_mob = nullptr;
+static void* g_cur_mob = nullptr;     // mob yang sedang disiapkan (dicatat prepareMobModel)
+static double g_cur_mob_time = 0;
+static bool anim_logged = false;
+
+static const int PART_OFFS[7] = {P_HEAD, P_HAT, P_BODY, P_RARM, P_LARM, P_RLEG, P_LLEG};
+static float* part(void* self, int off) { return (float*)((uint8_t*)self + off); }
+static void snap_pose(void* self, float out[7][6]) {
+  for (int i = 0; i < 7; i++) {
+    float* p = part(self, PART_OFFS[i]);
+    out[i][0] = p[0]; out[i][1] = p[1]; out[i][2] = p[2];
+    out[i][3] = p[6]; out[i][4] = p[7]; out[i][5] = p[8];
+  }
+}
+static void put_pose(void* self, const float in[7][6]) {
+  for (int i = 0; i < 7; i++) {
+    float* p = part(self, PART_OFFS[i]);
+    p[0] = in[i][0]; p[1] = in[i][1]; p[2] = in[i][2];
+    p[6] = in[i][3]; p[7] = in[i][4]; p[8] = in[i][5];
+  }
+}
+
+// Keadaan per makhluk (model dipakai bersama oleh banyak mob, jadi tidak boleh disimpan di model)
+struct AnimState { void* key; double last; float hy, hp, sneak; bool used; };
+static AnimState g_states[32];
+static AnimState* get_state(void* key) {
+  AnimState* oldest = &g_states[0];
+  for (int i = 0; i < 32; i++) {
+    if (g_states[i].used && g_states[i].key == key) return &g_states[i];
+    if (!g_states[i].used) { oldest = &g_states[i]; break; }
+    if (g_states[i].last < oldest->last) oldest = &g_states[i];
+  }
+  oldest->used = true; oldest->key = key; oldest->last = -1; oldest->hy = oldest->hp = oldest->sneak = 0;
+  return oldest;
+}
+// setupAnim asli TIDAK mereset posisi-y badan/tangan dan sudut-y badan (kecuali saat memukul),
+// jadi tambahan dari frame sebelumnya dibatalkan dulu sebelum fungsi asli dipanggil.
+struct ModelFx { void* self; float dy, twist; };
+static ModelFx g_fx[16];
+static ModelFx* get_fx(void* self) {
+  for (int i = 0; i < 16; i++) if (g_fx[i].self == self) return &g_fx[i];
+  for (int i = 0; i < 16; i++) if (!g_fx[i].self) { g_fx[i].self = self; g_fx[i].dy = g_fx[i].twist = 0; return &g_fx[i]; }
+  g_fx[0].self = self; g_fx[0].dy = g_fx[0].twist = 0;
+  return &g_fx[0];
+}
+static double now_sec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void hook_prepare_mob(void* self, void* mob, float a, float b, float c) {
+  g_cur_mob = mob;
+  g_cur_mob_time = now_sec();
+  orig_prepare_mob(self, mob, a, b, c);
+}
+
+static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, float a5, float a6) {
+  double now = now_sec();
+  uint8_t* sneak_flag = (uint8_t*)self + M_SNEAK;
+  uint8_t real_sneak = *sneak_flag;
+  void* key = (g_cur_mob && now - g_cur_mob_time < 0.05) ? g_cur_mob : self;
+  AnimState* st = get_state(key);
+  bool fresh = (st->last < 0 || now - st->last > 1.0);
+  float dt = fresh ? 0.0f : (float)(now - st->last);
+  if (dt > 0.1f) dt = 0.1f;
+  st->last = now;
+
+  ModelFx* fx = get_fx(self);
+  part(self, P_BODY)[1] -= fx->dy;
+  part(self, P_RARM)[1] -= fx->dy;
+  part(self, P_LARM)[1] -= fx->dy;
+  part(self, P_BODY)[7] -= fx->twist;
+  fx->dy = 0; fx->twist = 0;
+
+  // 1. Sneak halus: hitung pose tanpa dan dengan sneak, lalu campur sesuai st->sneak
+  float target = real_sneak ? 1.0f : 0.0f;
+  if (fresh) st->sneak = target;
+  else if (st->sneak < target) { st->sneak += dt / SNEAK_TIME; if (st->sneak > target) st->sneak = target; }
+  else if (st->sneak > target) { st->sneak -= dt / SNEAK_TIME; if (st->sneak < target) st->sneak = target; }
+  float s = st->sneak;
+  if (s <= 0.001f || s >= 0.999f) {
+    *sneak_flag = (s >= 0.5f) ? 1 : 0;
+    orig_setup_anim(self, a1, a2, a3, a4, a5, a6);
+  } else {
+    float A[7][6], B[7][6], M[7][6];
+    *sneak_flag = 0; orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, A);
+    *sneak_flag = 1; orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, B);
+    float e = s * s * (3.0f - 2.0f * s);
+    for (int i = 0; i < 7; i++) for (int k = 0; k < 6; k++) M[i][k] = A[i][k] + (B[i][k] - A[i][k]) * e;
+    put_pose(self, M);
+  }
+  *sneak_flag = real_sneak;
+
+  float* head = part(self, P_HEAD);
+  float* hat = part(self, P_HAT);
+  float* body = part(self, P_BODY);
+  float* ra = part(self, P_RARM);
+  float* la = part(self, P_LARM);
+  bool riding = *((uint8_t*)self + M_RIDING) != 0;
+  float attack = *(float*)((uint8_t*)self + M_ATTACK);
+
+  // 2. Kepala menyusul arah pandang dengan halus (x = naik-turun, y = menoleh)
+  if (fresh) { st->hy = head[7]; st->hp = head[6]; }
+  else {
+    float k = 1.0f - expf(-dt / HEAD_TAU);
+    st->hy += (head[7] - st->hy) * k;
+    st->hp += (head[6] - st->hp) * k;
+  }
+  head[7] = st->hy; head[6] = st->hp;
+
+  if (!riding) {
+    float spd = a2 < 0 ? 0 : (a2 > 1 ? 1 : a2);
+    // 3. Napas saat diam: badan, kepala, dan tangan naik-turun pelan; kaki tetap
+    float idle = 1.0f - spd * 10.0f;
+    if (idle < 0 || attack > 0) idle = 0;
+    if (idle > 0) {
+      float dy = (float)sin(now * BREATH_SPEED) * BREATH_AMP * idle;
+      head[1] += dy; body[1] += dy; ra[1] += dy; la[1] += dy;
+      fx->dy += dy;
+      float sway = ((float)cos(now * BREATH_SPEED * 0.9) * 0.5f + 0.5f) * BREATH_SWAY * idle;
+      ra[8] += sway; la[8] -= sway;
+    }
+    // 4. Jalan/lari: badan naik tiap langkah, memutar sedikit, condong saat cepat
+    float w = spd * (1.0f - 0.5f * st->sneak);
+    if (w > 0) {
+      float phase = a1 * 0.6662f;
+      float bob = fabsf(sinf(phase)) * w * WALK_BOB;
+      float twist = (attack > 0) ? 0.0f : sinf(phase) * w * WALK_TWIST;
+      float lean = w * RUN_LEAN;
+      head[1] -= bob; body[1] -= bob; ra[1] -= bob; la[1] -= bob;
+      fx->dy -= bob;
+      body[7] += twist; ra[7] += twist; la[7] += twist; head[7] -= twist;
+      fx->twist += twist;
+      body[6] += lean; ra[6] += lean; la[6] += lean; head[6] -= lean;
+    }
+  }
+
+  // Topi selalu sama dengan kepala (seperti yang dilakukan setupAnim asli)
+  hat[0] = head[0]; hat[1] = head[1]; hat[2] = head[2];
+  hat[6] = head[6]; hat[7] = head[7]; hat[8] = head[8];
+
+  if (!anim_logged) {
+    anim_logged = true;
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f) {
+      fprintf(f, "anim: self=%p sneak=%d riding=%d attack=%f a=%f %f %f %f %f %f head=%f %f body=%f\n",
+              self, (int)real_sneak, (int)riding, attack, a1, a2, a3, a4, a5, a6, head[6], head[7], body[1]);
+      fclose(f);
+    }
+  }
+}
+
+static void install_anim_hooks(uintptr_t base) {
+  uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_PREPARE_MOB;
+  if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_PREPARE_MOB, 8) != 0) {
+    LOG("anim: tanda fungsi tidak cocok, dibatalkan");
+    return;
+  }
+  bool ok2 = install_hook(t2, (void*)hook_prepare_mob, (void**)&orig_prepare_mob);
+  bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
+  LOG("anim hook: setupAnim=%d prepareMob=%d", (int)ok1, (int)ok2);
+}
+
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
   if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
     *(uintptr_t*)data = (uintptr_t)info->dlpi_addr;
@@ -233,6 +427,7 @@ static void* worker(void*) {
   } else {
     LOG("hook gagal dipasang");
   }
+  install_anim_hooks(base);
   return nullptr;
 }
 
