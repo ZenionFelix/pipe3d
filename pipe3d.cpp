@@ -237,6 +237,8 @@ static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, 
 // ---- First person: badan pemain ikut digambar ----
 // Game melewati pemain sendiri saat pengaturan kamera = 0 (first person). Tiga titik 'lewati' itu di-NOP.
 static const bool FP_BODY = true;               // false = perilaku asli game
+static const float FP_BACK = 6.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
+static bool g_fp_now = false;                   // true selama model pemain sendiri digambar saat first person
 static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
 static const uintptr_t OFF_ERD_PTR = 0x16B4708;     // EntityRenderer::entityRenderDispatcher (static)
 static const int ERD_CLIENT = 0xC, ERD_CAMERA = 0x1C;   // isi EntityRenderDispatcher: MinecraftClient*, Entity* kamera
@@ -301,12 +303,12 @@ static AnimState* get_state(void* key) {
 }
 // setupAnim asli TIDAK mereset posisi-y badan/tangan dan sudut-y badan (kecuali saat memukul),
 // jadi tambahan dari frame sebelumnya dibatalkan dulu sebelum fungsi asli dipanggil.
-struct ModelFx { void* self; float dy, twist; };
+struct ModelFx { void* self; float dy, twist, zoff; };
 static ModelFx g_fx[16];
 static ModelFx* get_fx(void* self) {
   for (int i = 0; i < 16; i++) if (g_fx[i].self == self) return &g_fx[i];
-  for (int i = 0; i < 16; i++) if (!g_fx[i].self) { g_fx[i].self = self; g_fx[i].dy = g_fx[i].twist = 0; return &g_fx[i]; }
-  g_fx[0].self = self; g_fx[0].dy = g_fx[0].twist = 0;
+  for (int i = 0; i < 16; i++) if (!g_fx[i].self) { g_fx[i].self = self; g_fx[i].dy = g_fx[i].twist = g_fx[i].zoff = 0; return &g_fx[i]; }
+  g_fx[0].self = self; g_fx[0].dy = g_fx[0].twist = g_fx[0].zoff = 0;
   return &g_fx[0];
 }
 static double now_sec() {
@@ -330,7 +332,9 @@ static void spring_step(float* x, float* v, float target, float dt) {
 static void hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
   g_cur_mob = ent;
   g_cur_mob_time = now_sec();
-  bool fp = FP_BODY && FP_HIDE_HEAD && is_first_person_self(ent);
+  bool fps = FP_BODY && is_first_person_self(ent);
+  bool fp = fps && FP_HIDE_HEAD;
+  g_fp_now = fps;
   uint8_t* head_vis = (uint8_t*)self + P_HEAD + PART_VISIBLE;
   uint8_t* hat_vis = (uint8_t*)self + P_HAT + PART_VISIBLE;
   uint8_t old_head = *head_vis, old_hat = *hat_vis;
@@ -344,6 +348,7 @@ static void hook_render(void* self, void* ent, float a1, float a2, float a3, flo
   }
   orig_render(self, ent, a1, a2, a3, a4, a5, a6);
   if (fp) { *head_vis = old_head; *hat_vis = old_hat; }   // model dipakai bersama makhluk lain, kembalikan
+  g_fp_now = false;
   g_cur_mob = nullptr;
 }
 
@@ -363,6 +368,10 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
   part(self, P_RARM)[1] -= fx->dy;
   part(self, P_LARM)[1] -= fx->dy;
   part(self, P_BODY)[7] -= fx->twist;
+  if (fx->zoff != 0) {
+    for (int i = 0; i < 7; i++) part(self, PART_OFFS[i])[2] -= fx->zoff;
+    fx->zoff = 0;
+  }
   fx->dy = 0; fx->twist = 0;
 
   // 1. Sneak halus: hitung pose tanpa dan dengan sneak, lalu campur sesuai st->sneak
@@ -446,6 +455,12 @@ static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, 
   // Topi selalu sama dengan kepala (seperti yang dilakukan setupAnim asli)
   hat[0] = head[0]; hat[1] = head[1]; hat[2] = head[2];
   hat[6] = head[6]; hat[7] = head[7]; hat[8] = head[8];
+
+  // First person: geser seluruh badan ke belakang supaya kamera (di posisi mata) tidak menempel ke badan
+  if (g_fp_now) {
+    for (int i = 0; i < 7; i++) part(self, PART_OFFS[i])[2] += FP_BACK;
+    fx->zoff = FP_BACK;
+  }
 
   if (!anim_logged) {
     anim_logged = true;
