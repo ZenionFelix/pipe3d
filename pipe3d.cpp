@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 10: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis, bidang penuh 16px miring 45 derajat sehingga ujung atap menjorok ke samping) + log kecil.
+// Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -33,7 +33,8 @@ static const int ID_LEAVES2 = 161;     // daun acacia, dark oak
 // menjorok 0.2071 keluar dari tepi blok di kedua sisi (ujung atap berbulu, sisi tidak polos).
 // Dua atap disilangkan (searah X dan searah Z) jadi satu lapis; lapis itu disalin dan dinaikkan.
 static const float LEAF_RISE = 0.70710678f;      // tinggi atap = jarak mendatar dari tepi ke punggung
-static const float LEAF_LIFT = 1.0f - 0.70710678f; // lapis kedua dinaikkan 0.2929: puncaknya tepat di 1.0
+static const float LEAF_LIFT = 0.50f;   // lapis kedua dinaikkan 0.5: jarak antar lapis merata (0, 0.5, 1.0, 1.5 ...) sehingga rapat dan menyambung saat ditumpuk
+static const float LEAF_BRIGHT = 1.30f; // pengali kecerahan warna daun (supaya bagian gelap tidak terlalu hitam)
 static const int TESS_OFF = 0x2d0;     // penunjuk Tessellator di dalam BlockTessellator
 // Fungsi game (alamat 0.15.10, bit terakhir 1 = kode Thumb)
 static const uintptr_t OFF_VERTEX_UV = 0xA23C19;   // Tessellator::vertexUV(x,y,z,u,v)
@@ -94,10 +95,12 @@ static void draw_quad(void* tess, float bx, float by, float bz,
 static TessBlockFn orig_tess_block = nullptr;
 
 
+static int clamp255(float v) { return v < 0 ? 0 : (v > 255 ? 255 : (int)v); }
 static void set_shaded_color(void* tess, int c, float k) {
-  int r = (int)(((c >> 16) & 255) * k);
-  int g = (int)(((c >> 8) & 255) * k);
-  int b = (int)((c & 255) * k);
+  k *= LEAF_BRIGHT;
+  int r = clamp255(((c >> 16) & 255) * k);
+  int g = clamp255(((c >> 8) & 255) * k);
+  int b = clamp255((c & 255) * k);
   fn_color(tess, (r << 16) | (g << 8) | b);
 }
 
@@ -140,10 +143,11 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
     // atap searah Z: dua bidang, punggung atap di x = 0.5
     const float b1[4][3] = {{-ov, y0, 0}, {-ov, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
     const float b2[4][3] = {{1 + ov, y0, 0}, {1 + ov, y0, 1}, {0.5f, y1, 1}, {0.5f, y1, 0}};
+    // beda terang-gelap antar bidang dibuat tipis supaya tidak ada bidang yang tampak hitam
     set_shaded_color(tess, tint, 1.00f); draw_quad(tess, bx, by, bz, a1, uv);
-    set_shaded_color(tess, tint, 0.82f); draw_quad(tess, bx, by, bz, a2, uv);
-    set_shaded_color(tess, tint, 0.92f); draw_quad(tess, bx, by, bz, b1, uv);
-    set_shaded_color(tess, tint, 0.74f); draw_quad(tess, bx, by, bz, b2, uv);
+    set_shaded_color(tess, tint, 0.94f); draw_quad(tess, bx, by, bz, a2, uv);
+    set_shaded_color(tess, tint, 0.97f); draw_quad(tess, bx, by, bz, b1, uv);
+    set_shaded_color(tess, tint, 0.90f); draw_quad(tess, bx, by, bz, b2, uv);
   }
   return true;
 }
