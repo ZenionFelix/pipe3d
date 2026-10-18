@@ -1,6 +1,8 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
-// Tahap 2: pada frame 500, 1000, 1500 semua draw terrain dicatat rinci (format vertex, buffer, matriks, origin chunk).
+// Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
+// dicatat kotak kecil (matahari/bulan) beserta matriks dan posisi vertexnya, untuk menghitung arah matahari asli.
+// Pencatatan pertama lengkap (urutan semua draw), berikutnya ringkas supaya log tidak membengkak.
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
 #include <android/log.h>
 #include <link.h>
@@ -11,6 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <time.h>
 #include <elf.h>
 
 #define TAG "pipe3d"
@@ -260,6 +263,8 @@ typedef void (*gl_vaptr_t)(unsigned, unsigned, void**);
 typedef unsigned char (*gl_isen_t)(unsigned);
 typedef void (*gl_getb_t)(unsigned, unsigned char*);
 typedef void (*gl_geti_t)(unsigned, int*);
+typedef void* (*gl_maprange_t)(unsigned, intptr_t, intptr_t, unsigned);
+typedef unsigned char (*gl_unmap_t)(unsigned);
 static void* g_glib = nullptr;
 static gl_loc_t f_getuloc = nullptr, f_getaloc = nullptr;
 static gl_unifv_t f_unifv = nullptr;
@@ -269,6 +274,17 @@ static gl_vaptr_t f_vaptr = nullptr;
 static gl_isen_t f_isen = nullptr;
 static gl_getb_t f_getb = nullptr;
 static gl_geti_t f_geti = nullptr;
+static gl_maprange_t f_maprange = nullptr;
+static gl_unmap_t f_unmap = nullptr;
+static unsigned g_seq = 0, g_cap_other = 0;
+static bool g_cap_full = true;
+static unsigned g_cap_count = 0;
+static double g_next_cap = 0;
+static double mono_sec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 static bool g_capturing = false, g_cap_mat = false;
 static unsigned g_cap_draws = 0;
 static FILE* g_cap_f = nullptr;
@@ -286,6 +302,8 @@ static void cap_init() {
   f_isen = (gl_isen_t)dlsym(L, "glIsEnabled");
   f_getb = (gl_getb_t)dlsym(L, "glGetBooleanv");
   f_geti = (gl_geti_t)dlsym(L, "glGetIntegerv");
+  f_maprange = (gl_maprange_t)dlsym(L, "glMapBufferRange");
+  f_unmap = (gl_unmap_t)dlsym(L, "glUnmapBuffer");
 }
 
 static void cap_print_uniform(FILE* f, unsigned prog, const char* name, int n) {
@@ -302,7 +320,7 @@ static void capture_draw(ProgStat* s, unsigned mode, int count, unsigned type, c
   cap_init();
   if (!g_cap_f || !f_geti || !f_isen || !f_getb) return;
   unsigned n = g_cap_draws++;
-  if (n >= 80) return;
+  if (n >= (g_cap_full ? 4u : 1u)) return;
   FILE* f = g_cap_f;
   unsigned id = s->id;
   int vbo = 0, ibo = 0, fbo = 0, vp[4] = {0, 0, 0, 0};
@@ -337,6 +355,67 @@ static void capture_draw(ProgStat* s, unsigned mode, int count, unsigned type, c
   }
 }
 
+
+// Cetak satu atribut vertex beserta (kalau terbaca) beberapa vertex pertama
+static void dump_attr(FILE* f, unsigned prog, const char* name, int nv) {
+  int loc = f_getaloc ? f_getaloc(prog, name) : -1;
+  if (loc < 0 || !f_vaiv || !f_vaptr) { fprintf(f, "  %s: tidak ada\n", name); return; }
+  int en = 0, sz = 0, ty = 0, nm = 0, st = 0, bb = 0; void* po = nullptr;
+  f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+  f_vaiv(loc, 0x886A, &nm); f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb);
+  f_vaptr(loc, 0x8645, &po);
+  fprintf(f, "  %s loc=%d en=%d size=%d type=0x%x norm=%d stride=%d off=%p buf=%d\n", name, loc, en, sz, ty, nm, st, po, bb);
+  if (ty != 0x1406 || sz < 2 || sz > 4 || !en || nv < 1 || nv > 4) return;
+  int stride = st ? st : sz * 4;
+  float v[4][4] = {{0}};
+  bool ok = false;
+  if (bb == 0 && po) {   // array di memori biasa
+    for (int i = 0; i < nv; i++) memcpy(v[i], (const uint8_t*)po + i * stride, sz * 4);
+    ok = true;
+  } else if (bb != 0 && f_maprange && f_unmap) {   // buffer GL: hanya dibaca kalau memang sedang terikat
+    int cur = 0; f_geti(0x8894, &cur);
+    if (cur == bb) {
+      intptr_t off = (intptr_t)po, len = (intptr_t)((nv - 1) * stride + sz * 4);
+      void* m = f_maprange(0x8892, off, len, 1);   // GL_MAP_READ_BIT
+      if (m) {
+        for (int i = 0; i < nv; i++) memcpy(v[i], (const uint8_t*)m + i * stride, sz * 4);
+        f_unmap(0x8892);
+        ok = true;
+      }
+    }
+  }
+  if (!ok) { fprintf(f, "  (data vertex tidak terbaca)\n"); return; }
+  for (int i = 0; i < nv; i++) {
+    fprintf(f, "  v%d=(", i);
+    for (int k = 0; k < sz; k++) fprintf(f, k ? " %g" : "%g", v[i][k]);
+    fprintf(f, ")\n");
+  }
+}
+
+// Catat urutan semua draw; kotak kecil (4 atau 6 vertex/indeks) di luar terrain dicatat rinci
+static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
+  cap_init();
+  if (!g_cap_f || !f_geti || !f_isen || !f_getb) return;
+  unsigned n = g_seq++;
+  if (n >= 300) return;
+  FILE* f = g_cap_f;
+  int fbo = 0, tex = 0, act = 0;
+  unsigned char dm = 0;
+  f_geti(0x8CA6, &fbo); f_geti(0x8069, &tex); f_geti(0x84E0, &act); f_getb(0x0B72, &dm);
+  unsigned cap_limit = g_cap_full ? 20u : 12u;
+  bool want = detail && (count == 6 || count == 4) && fbo == 0 && g_cap_other < cap_limit;
+  if (g_cap_full || want)
+    fprintf(f, "S seq=%u prog=%u mode=0x%x count=%d fbo=%d blend=%d depth=%d dmask=%d cull=%d tex=%d act=0x%x\n",
+            n, s->id, mode, count, fbo, (int)f_isen(0x0BE2), (int)f_isen(0x0B71), (int)dm, (int)f_isen(0x0B44), tex, act);
+  if (want) {
+    g_cap_other++;
+    cap_print_uniform(f, s->id, "WORLDVIEWPROJ", 16);
+    cap_print_uniform(f, s->id, "CURRENT_COLOR", 4);
+    dump_attr(f, s->id, "POSITION", 4);
+    if (g_cap_full) dump_attr(f, s->id, "TEXCOORD_0", 4);
+  }
+}
+
 static void spy_use_program(GLuint_t p) {
   g_cur_prog = p;
   if (p) {
@@ -352,12 +431,16 @@ static void spy_use_program(GLuint_t p) {
 static void spy_draw_elements(unsigned mode, int count, unsigned type, const void* idx) {
   ProgStat* s = prog_stat(g_cur_prog);
   s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = type;
-  if (g_capturing && s->kind == 1) capture_draw(s, mode, count, type, idx);
+  if (g_capturing) {
+    capture_other(s, mode, count, s->kind != 1);
+    if (s->kind == 1) capture_draw(s, mode, count, type, idx);
+  }
   o_drawel(mode, count, type, idx);
 }
 static void spy_draw_arrays(unsigned mode, int first, int count) {
   ProgStat* s = prog_stat(g_cur_prog);
   s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = 0;
+  if (g_capturing) capture_other(s, mode, count, s->kind != 1);
   o_drawar(mode, first, count);
 }
 static void spy_bind_fb(unsigned target, GLuint_t fb) { g_cur_fbo = fb; g_fbo_binds++; o_bindfb(target, fb); }
@@ -404,9 +487,19 @@ static unsigned spy_swap(void* dpy, void* surf) {
     g_capturing = false;
     if (g_cap_f) { fprintf(g_cap_f, "T2 selesai frame=%u, total draw terrain=%u\n", g_frames, g_cap_draws); fclose(g_cap_f); g_cap_f = nullptr; }
   }
-  if (g_frames == 500 || g_frames == 1000 || g_frames == 1500) {
-    g_cap_f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-    if (g_cap_f) { g_capturing = true; g_cap_draws = 0; g_cap_mat = false; fprintf(g_cap_f, "T2 mulai frame=%u\n", g_frames); }
+  {
+    double tnow = mono_sec();
+    if (g_next_cap == 0) g_next_cap = tnow + 60.0;
+    if (tnow >= g_next_cap && g_cap_count < 30) {
+      g_cap_count++;
+      g_next_cap = tnow + 45.0;
+      g_cap_f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+      if (g_cap_f) {
+        g_capturing = true; g_cap_draws = 0; g_cap_mat = false; g_seq = 0; g_cap_other = 0;
+        g_cap_full = (g_cap_count == 1);
+        fprintf(g_cap_f, "T2 mulai frame=%u capture=%u\n", g_frames, g_cap_count);
+      }
+    }
   }
   void* lib = dlopen("libGLESv2.so", RTLD_NOW);
   if (!g_gl_info_done && g_frames >= 60 && lib) {
