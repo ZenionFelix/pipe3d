@@ -1,5 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
+// Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
 // Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
 // dicatat kotak kecil (matahari/bulan) beserta matriks dan posisi vertexnya, untuk menghitung arah matahari asli.
 // Pencatatan pertama lengkap (urutan semua draw), berikutnya ringkas supaya log tidak membengkak.
@@ -15,6 +16,8 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <elf.h>
+#include <math.h>
+#include <stdarg.h>
 
 #define TAG "pipe3d"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -237,7 +240,8 @@ static fn_bindfb_t o_bindfb = nullptr;
 static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
-struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_smap, loc_smat, loc_sparams, loc_sun; unsigned set_frame, set_ver; int set_en; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -416,6 +420,526 @@ static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
   }
 }
 
+// ======================= Tahap 3 + 4: peta bayangan matahari =======================
+// Alur: tiap frame, semua draw terrain direkam. Tepat sebelum eglSwapBuffers, terrain digambar ulang dari arah matahari
+// ke tekstur kedalaman. Frame berikutnya shader terrain (renderchunk.fragment) membaca peta itu lewat uniform SHADOW_*.
+// Arah matahari dibaca dari kotak matahari/bulan yang digambar game (tahap 2b).
+// Pengaturan opsional di /sdcard/games/com.mojang/pipe3d_shadow.txt (baris "kunci=nilai"): on=1 size=1024 radius=56 bias=0.12 capture=0
+#define GLX_LIST(X) \
+  X(void, GenFramebuffers, (int, unsigned*)) \
+  X(void, BindFramebuffer, (unsigned, unsigned)) \
+  X(void, FramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int)) \
+  X(unsigned, CheckFramebufferStatus, (unsigned)) \
+  X(void, GenTextures, (int, unsigned*)) \
+  X(void, BindTexture, (unsigned, unsigned)) \
+  X(void, TexImage2D, (unsigned, int, int, int, int, int, unsigned, unsigned, const void*)) \
+  X(void, TexParameteri, (unsigned, unsigned, int)) \
+  X(void, ActiveTexture, (unsigned)) \
+  X(void, Viewport, (int, int, int, int)) \
+  X(void, Clear, (unsigned)) \
+  X(void, ClearDepthf, (float)) \
+  X(void, DepthMask, (unsigned char)) \
+  X(void, DepthFunc, (unsigned)) \
+  X(void, Enable, (unsigned)) \
+  X(void, Disable, (unsigned)) \
+  X(void, ColorMask, (unsigned char, unsigned char, unsigned char, unsigned char)) \
+  X(void, CullFace, (unsigned)) \
+  X(void, PolygonOffset, (float, float)) \
+  X(void, UseProgram, (unsigned)) \
+  X(void, BindBuffer, (unsigned, unsigned)) \
+  X(void, VertexAttribPointer, (unsigned, int, unsigned, unsigned char, int, const void*)) \
+  X(void, EnableVertexAttribArray, (unsigned)) \
+  X(void, DisableVertexAttribArray, (unsigned)) \
+  X(void, UniformMatrix4fv, (int, int, unsigned char, const float*)) \
+  X(void, Uniform1i, (int, int)) \
+  X(void, Uniform3f, (int, float, float, float)) \
+  X(void, Uniform4f, (int, float, float, float, float)) \
+  X(void, DrawElements, (unsigned, int, unsigned, const void*)) \
+  X(unsigned, CreateShader, (unsigned)) \
+  X(void, ShaderSource, (unsigned, int, const char* const*, const int*)) \
+  X(void, CompileShader, (unsigned)) \
+  X(void, GetShaderiv, (unsigned, unsigned, int*)) \
+  X(void, GetShaderInfoLog, (unsigned, int, int*, char*)) \
+  X(unsigned, CreateProgram, (void)) \
+  X(void, AttachShader, (unsigned, unsigned)) \
+  X(void, BindAttribLocation, (unsigned, unsigned, const char*)) \
+  X(void, LinkProgram, (unsigned)) \
+  X(void, GetProgramiv, (unsigned, unsigned, int*)) \
+  X(void, GetProgramInfoLog, (unsigned, int, int*, char*)) \
+  X(unsigned, GetError, (void)) \
+  X(void, GetFloatv, (unsigned, float*))
+
+struct GLX {
+#define X(ret, name, args) ret (*name) args;
+  GLX_LIST(X)
+#undef X
+};
+static GLX gx;
+static bool g_gx_ok = false;
+typedef void (*gl_drawbuffers_t)(int, const unsigned*);
+typedef void (*gl_readbuffer_t)(unsigned);
+static gl_drawbuffers_t gx_drawbuffers = nullptr;
+static gl_readbuffer_t gx_readbuffer = nullptr;
+
+static void gx_init() {
+  void* L = glib();
+  if (!L) return;
+  bool ok = true;
+#define X(ret, name, args) gx.name = (ret (*) args)dlsym(L, "gl" #name); if (!gx.name) { LOG("shadow: gl%s tidak ada", #name); ok = false; }
+  GLX_LIST(X)
+#undef X
+  gx_drawbuffers = (gl_drawbuffers_t)dlsym(L, "glDrawBuffers");
+  gx_readbuffer = (gl_readbuffer_t)dlsym(L, "glReadBuffer");
+  g_gx_ok = ok;
+}
+
+// ---- pengaturan ----
+static int g_cfg_on = 1, g_cfg_size = 1024, g_cfg_capture = 0;
+static float g_cfg_radius = 56.0f, g_cfg_bias = 0.12f;
+static bool g_cfg_loaded = false;
+static void cfg_load() {
+  if (g_cfg_loaded) return;
+  g_cfg_loaded = true;
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_shadow.txt", "r");
+  if (!f) return;
+  char line[128];
+  while (fgets(line, sizeof(line), f)) {
+    int iv; float fv;
+    if (sscanf(line, "on=%d", &iv) == 1) g_cfg_on = iv;
+    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 1024;
+    else if (sscanf(line, "capture=%d", &iv) == 1) g_cfg_capture = iv;
+    else if (sscanf(line, "radius=%f", &fv) == 1) g_cfg_radius = (fv >= 16.0f && fv <= 200.0f) ? fv : 56.0f;
+    else if (sscanf(line, "bias=%f", &fv) == 1) g_cfg_bias = (fv >= 0.0f && fv <= 2.0f) ? fv : 0.12f;
+  }
+  fclose(f);
+}
+static void sh_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void sh_log(const char* fmt, ...) {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+  if (!f) return;
+  va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+  fclose(f);
+}
+
+// ---- sumber daya peta bayangan ----
+static int g_sh_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
+static unsigned g_sh_tex = 0, g_sh_fbo = 0, g_sh_prog = 0, g_sh_ctex = 0;
+static int g_sh_loc_lvp = -1, g_sh_loc_org = -1, g_sh_loc_tex = -1;
+static int g_sh_size = 1024;
+static const float SH_DEPTH_D = 160.0f;   // jarak mata cahaya dari pusat; kedalaman total = 2 * D
+
+static const char* SH_VS =
+  "attribute vec3 POSITION;\n"
+  "attribute vec2 TEXCOORD_0;\n"
+  "uniform mat4 LVP;\n"
+  "uniform vec3 ORG;\n"
+  "varying vec2 vuv;\n"
+  "void main() {\n"
+  "  vuv = TEXCOORD_0;\n"
+  "  gl_Position = LVP * vec4(POSITION + ORG, 1.0);\n"
+  "}\n";
+static const char* SH_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 vuv;\n"
+  "uniform sampler2D TEX;\n"
+  "void main() {\n"
+  "  if (texture2D(TEX, vuv).a < 0.5) discard;\n"
+  "  gl_FragColor = vec4(1.0);\n"
+  "}\n";
+
+static unsigned sh_compile(unsigned type, const char* src) {
+  unsigned sh = gx.CreateShader(type);
+  gx.ShaderSource(sh, 1, &src, nullptr);
+  gx.CompileShader(sh);
+  int ok = 0; gx.GetShaderiv(sh, 0x8B81, &ok);
+  if (!ok) { char buf[512] = {0}; int n = 0; gx.GetShaderInfoLog(sh, 511, &n, buf); sh_log("shadow: shader gagal dikompilasi: %s\n", buf); return 0; }
+  return sh;
+}
+
+static void shadow_init() {
+  g_sh_state = -1;
+  cfg_load();
+  cap_init();
+  if (!g_cfg_on) { sh_log("shadow: dimatikan lewat pengaturan (on=0)\n"); return; }
+  gx_init();
+  if (!g_gx_ok || !f_geti || !f_isen || !f_getb || !f_unifv || !f_getuloc || !f_vaiv || !f_vaptr) { sh_log("shadow: fungsi GL tidak lengkap\n"); return; }
+  g_sh_size = g_cfg_size;
+  int prev_fbo = 0, prev_tex = 0;
+  f_geti(0x8CA6, &prev_fbo); f_geti(0x8069, &prev_tex);
+  while (gx.GetError() != 0) {}
+  // tekstur kedalaman
+  gx.GenTextures(1, &g_sh_tex);
+  gx.BindTexture(0x0DE1, g_sh_tex);
+  gx.TexImage2D(0x0DE1, 0, 0x81A6, g_sh_size, g_sh_size, 0, 0x1902, 0x1405, nullptr);   // DEPTH_COMPONENT24
+  unsigned err = gx.GetError();
+  if (err != 0) {
+    gx.TexImage2D(0x0DE1, 0, 0x81A5, g_sh_size, g_sh_size, 0, 0x1902, 0x1403, nullptr); // DEPTH_COMPONENT16
+    err = gx.GetError();
+    sh_log("shadow: depth24 gagal, mencoba depth16 (err=0x%x)\n", err);
+  }
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600);   // MIN_FILTER = NEAREST
+  gx.TexParameteri(0x0DE1, 0x2800, 0x2600);   // MAG_FILTER = NEAREST
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F);   // WRAP_S = CLAMP_TO_EDGE
+  gx.TexParameteri(0x0DE1, 0x2803, 0x812F);   // WRAP_T
+  // framebuffer
+  gx.GenFramebuffers(1, &g_sh_fbo);
+  gx.BindFramebuffer(0x8D40, g_sh_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8D00, 0x0DE1, g_sh_tex, 0);   // DEPTH_ATTACHMENT
+  if (gx_drawbuffers) { unsigned none = 0; gx_drawbuffers(1, &none); }
+  if (gx_readbuffer) gx_readbuffer(0);
+  unsigned status = gx.CheckFramebufferStatus(0x8D40);
+  sh_log("shadow: framebuffer hanya-kedalaman status=0x%x (0x8cd5 = lengkap)\n", status);
+  if (status != 0x8CD5) {   // cadangan: tambah lampiran warna
+    gx.GenTextures(1, &g_sh_ctex);
+    gx.BindTexture(0x0DE1, g_sh_ctex);
+    gx.TexImage2D(0x0DE1, 0, 0x1908, g_sh_size, g_sh_size, 0, 0x1908, 0x1401, nullptr);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600);
+    gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_sh_ctex, 0);
+    if (gx_drawbuffers) { unsigned c0 = 0x8CE0; gx_drawbuffers(1, &c0); }
+    status = gx.CheckFramebufferStatus(0x8D40);
+    sh_log("shadow: framebuffer + warna status=0x%x\n", status);
+  }
+  gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
+  gx.BindTexture(0x0DE1, (unsigned)prev_tex);
+  if (status != 0x8CD5) { sh_log("shadow: framebuffer tidak lengkap, bayangan dinonaktifkan\n"); return; }
+  // program bayangan
+  unsigned vs = sh_compile(0x8B31, SH_VS), fs = sh_compile(0x8B30, SH_FS);
+  if (!vs || !fs) return;
+  g_sh_prog = gx.CreateProgram();
+  gx.AttachShader(g_sh_prog, vs); gx.AttachShader(g_sh_prog, fs);
+  gx.BindAttribLocation(g_sh_prog, 0, "POSITION");
+  gx.BindAttribLocation(g_sh_prog, 1, "TEXCOORD_0");
+  gx.LinkProgram(g_sh_prog);
+  int linked = 0; gx.GetProgramiv(g_sh_prog, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(g_sh_prog, 511, &n, buf); sh_log("shadow: link gagal: %s\n", buf); return; }
+  g_sh_loc_lvp = f_getuloc(g_sh_prog, "LVP");
+  g_sh_loc_org = f_getuloc(g_sh_prog, "ORG");
+  g_sh_loc_tex = f_getuloc(g_sh_prog, "TEX");
+  while (gx.GetError() != 0) {}
+  g_sh_state = 1;
+  sh_log("shadow: siap. ukuran=%d radius=%.0f bias=%.2f\n", g_sh_size, g_cfg_radius, g_cfg_bias);
+}
+
+// ---- status per frame ----
+struct DrawRec { int vbo, ibo, count; unsigned type; uintptr_t idx; float o[3]; };
+static DrawRec g_dl[2][2048];
+static int g_dn[2] = {0, 0};
+static int g_dcur = 0;
+static unsigned g_tframe = 0xFFFFFFFFu;   // nomor frame terakhir yang punya draw terrain
+static bool g_delta_ok = false;
+static float g_delta[3] = {0, 0, 0};
+static unsigned g_delta_ver = 0;
+static float g_wv[16], g_proj[16];
+static bool g_view_ok = false;
+static int g_atlas_tex = 0, g_prev_unit4 = 0;
+static bool g_unit4_saved = false;
+static double g_cam_est[3] = {0, 0, 0};
+static float g_lvp[16];
+static bool g_lvp_valid = false;
+static float g_sun[3] = {0, 1, 0};
+static bool g_sun_valid = false;
+static unsigned g_sun_frame = 0, g_sun_seen_frame = 0;
+static int g_sun_prog = 0, g_sun_learn = 0;
+struct TexCls { int tex; int half; };
+static TexCls g_tcls[8];
+static int g_ntc = 0;
+static unsigned g_st_frames = 0, g_st_delta_ok = 0, g_st_pass = 0, g_st_draws = 0, g_st_skipped = 0, g_st_logs = 0;
+static double g_st_ms = 0;
+
+static bool sun_enabled() {
+  return g_sun_valid && g_sun[1] > 0.02f && (g_frames - g_sun_frame) < 3000;
+}
+
+// membaca posisi vertex pertama kotak (untuk mengenali kotak matahari/bulan); hasil: setengah sisi, 0 bila bukan kotak datar
+static int read_quad_half(unsigned prog) {
+  if (!f_getaloc || !f_vaiv || !f_vaptr || !f_geti) return 0;
+  int loc = f_getaloc(prog, "POSITION");
+  if (loc < 0) return 0;
+  int en = 0, sz = 0, ty = 0, st = 0, bb = 0; void* po = nullptr;
+  f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+  f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb); f_vaptr(loc, 0x8645, &po);
+  if (!en || ty != 0x1406 || sz != 3) return 0;
+  int stride = st ? st : 12;
+  float v[4][3] = {{0}};
+  if (bb == 0 && po) {
+    for (int i = 0; i < 4; i++) memcpy(v[i], (const uint8_t*)po + i * stride, 12);
+  } else if (bb != 0 && f_maprange && f_unmap) {
+    int cur = 0; f_geti(0x8894, &cur);
+    if (cur != bb) return 0;
+    void* m = f_maprange(0x8892, (intptr_t)po, (intptr_t)(3 * stride + 12), 1);
+    if (!m) return 0;
+    for (int i = 0; i < 4; i++) memcpy(v[i], (const uint8_t*)m + i * stride, 12);
+    f_unmap(0x8892);
+  } else return 0;
+  float h = v[2][0];
+  if (fabsf(v[0][1]) > 0.01f || fabsf(v[2][1]) > 0.01f) return 0;
+  if (fabsf(v[0][0] + v[2][0]) > 0.01f || fabsf(v[0][0] - v[0][2]) > 0.01f) return 0;
+  if (h < 10.0f || h > 60.0f) return 0;
+  return (int)(h + 0.5f);
+}
+
+// kotak kecil di luar terrain, digambar sesudah terrain: kandidat matahari/bulan
+static void sky_draw(ProgStat* s, unsigned mode, int count) {
+  if (mode != 4 || !g_view_ok || s->loc_wvp < 0 || count != 6) return;
+  if ((int)s->id != g_sun_prog) {
+    if (g_sun_prog != 0 || g_sun_learn > 80) return;
+    unsigned char dm = 1; f_getb(0x0B72, &dm);
+    if (dm || !f_isen(0x0BE2)) return;
+    g_sun_learn++;
+    if (read_quad_half(s->id) == 0) return;
+    g_sun_prog = (int)s->id;
+    sh_log("shadow: program matahari/bulan = %u\n", s->id);
+  }
+  int tex = 0; f_geti(0x8069, &tex);
+  int half = 0;
+  for (int i = 0; i < g_ntc; i++) if (g_tcls[i].tex == tex) half = g_tcls[i].half;
+  if (!half) {
+    half = read_quad_half(s->id);
+    if (!half) return;
+    if (g_ntc < 8) { g_tcls[g_ntc].tex = tex; g_tcls[g_ntc].half = half; g_ntc++; }
+    else { g_tcls[g_frames & 7].tex = tex; g_tcls[g_frames & 7].half = half; }
+  }
+  float w[16];
+  f_unifv(s->id, s->loc_wvp, w);
+  float xv = w[12] / g_proj[0], yv = w[13] / g_proj[5], zv = -w[15];
+  float len = sqrtf(xv * xv + yv * yv + zv * zv);
+  if (len < 1e-6f) return;
+  xv /= len; yv /= len; zv /= len;
+  float d[3] = {g_wv[0] * xv + g_wv[1] * yv + g_wv[2] * zv,
+                g_wv[4] * xv + g_wv[5] * yv + g_wv[6] * zv,
+                g_wv[8] * xv + g_wv[9] * yv + g_wv[10] * zv};
+  bool is_sun = half >= 25;   // matahari 60x60, bulan 40x40
+  if (!is_sun) { d[0] = -d[0]; d[1] = -d[1]; d[2] = -d[2]; }
+  if (is_sun || g_sun_seen_frame != g_frames) {
+    memcpy(g_sun, d, sizeof(d));
+    g_sun_valid = true; g_sun_frame = g_frames;
+    if (is_sun) g_sun_seen_frame = g_frames;
+  }
+}
+
+// dipanggil sebelum tiap draw terrain
+static void terrain_draw(ProgStat* s, int count, unsigned type, const void* idx) {
+  if (g_sh_state == 0) shadow_init();
+  if (g_sh_state != 1 || g_cur_fbo != 0) return;
+  if (g_tframe != g_frames) {   // draw terrain pertama di frame ini
+    g_tframe = g_frames;
+    g_delta_ok = false; g_view_ok = false;
+    int act = 0x84C0; f_geti(0x84E0, &act);
+    gx.ActiveTexture(0x84C0); f_geti(0x8069, &g_atlas_tex);
+    gx.ActiveTexture(0x84C4);
+    if (!g_unit4_saved) { f_geti(0x8069, &g_prev_unit4); g_unit4_saved = true; }
+    gx.BindTexture(0x0DE1, g_sh_tex);
+    gx.ActiveTexture((unsigned)act);
+  }
+  if (!g_view_ok && s->loc_wv >= 0 && s->loc_proj >= 0) {
+    f_unifv(s->id, s->loc_wv, g_wv); f_unifv(s->id, s->loc_proj, g_proj);
+    g_view_ok = true;
+  }
+  int vbo = 0, ibo = 0; f_geti(0x8894, &vbo); f_geti(0x8895, &ibo);
+  float o[4] = {0, 0, 0, 1};
+  if (s->loc_origin >= 0) f_unifv(s->id, s->loc_origin, o);
+  bool blend = f_isen(0x0BE2) != 0;
+  if (!blend) {
+    int prev = 1 - g_dcur;
+    if (!g_delta_ok && g_dn[prev] > 0) {   // chunk yang sama di frame sebelumnya -> selisih posisi kamera
+      for (int i = 0; i < g_dn[prev]; i++) {
+        const DrawRec& r = g_dl[prev][i];
+        if (r.vbo == vbo && r.ibo == ibo && r.count == count && r.idx == (uintptr_t)idx) {
+          g_delta[0] = r.o[0] - o[0]; g_delta[1] = r.o[1] - o[1]; g_delta[2] = r.o[2] - o[2];
+          g_cam_est[0] += g_delta[0]; g_cam_est[1] += g_delta[1]; g_cam_est[2] += g_delta[2];
+          g_delta_ok = true; g_delta_ver++;
+          break;
+        }
+      }
+    }
+    if (g_dn[g_dcur] < 2048) {
+      DrawRec& r = g_dl[g_dcur][g_dn[g_dcur]++];
+      r.vbo = vbo; r.ibo = ibo; r.count = count; r.type = type; r.idx = (uintptr_t)idx;
+      r.o[0] = o[0]; r.o[1] = o[1]; r.o[2] = o[2];
+    }
+  }
+  // uniform bayangan untuk program ini
+  int want = (g_lvp_valid && g_delta_ok && sun_enabled()) ? 1 : 0;
+  if (s->loc_sparams >= 0 && (s->set_frame != g_frames || s->set_ver != g_delta_ver || s->set_en != want)) {
+    s->set_frame = g_frames; s->set_ver = g_delta_ver; s->set_en = want;
+    if (s->loc_smap >= 0) gx.Uniform1i(s->loc_smap, 4);
+    if (want) {
+      float m[16]; memcpy(m, g_lvp, sizeof(m));
+      m[12] += g_lvp[0] * g_delta[0] + g_lvp[4] * g_delta[1] + g_lvp[8] * g_delta[2];
+      m[13] += g_lvp[1] * g_delta[0] + g_lvp[5] * g_delta[1] + g_lvp[9] * g_delta[2];
+      m[14] += g_lvp[2] * g_delta[0] + g_lvp[6] * g_delta[1] + g_lvp[10] * g_delta[2];
+      float y = g_sun[1], k = (y - 0.02f) / 0.16f; k = k < 0 ? 0 : (k > 1 ? 1 : k);
+      float strength = k * k * (3.0f - 2.0f * k);
+      if (s->loc_smat >= 0) gx.UniformMatrix4fv(s->loc_smat, 1, 0, m);
+      if (s->loc_sun >= 0) gx.Uniform3f(s->loc_sun, g_sun[0], g_sun[1], g_sun[2]);
+      gx.Uniform4f(s->loc_sparams, 1.0f, 1.0f / (float)g_sh_size, g_cfg_bias / (2.0f * SH_DEPTH_D), strength);
+    } else {
+      gx.Uniform4f(s->loc_sparams, 0, 0, 0, 0);
+    }
+  }
+}
+
+// ---- simpan / pulihkan status GL ----
+struct SavedState {
+  int fbo, prog, arr, ele, act, tex0, vp[4], dfunc, cullmode;
+  unsigned char dmask, cmask[4], depth, cull, blend, scissor, poff, stencil;
+  float cleard, pofF, pofU;
+  struct VA { int en, size, type, norm, stride, buf; void* ptr; } va[8];
+};
+static void save_state(SavedState* s) {
+  f_geti(0x8CA6, &s->fbo); f_geti(0x8B8D, &s->prog); f_geti(0x8894, &s->arr); f_geti(0x8895, &s->ele);
+  f_geti(0x84E0, &s->act); f_geti(0x0BA2, s->vp); f_geti(0x0B74, &s->dfunc); f_geti(0x0B45, &s->cullmode);
+  f_getb(0x0B72, &s->dmask); f_getb(0x0C23, s->cmask);
+  s->depth = f_isen(0x0B71); s->cull = f_isen(0x0B44); s->blend = f_isen(0x0BE2);
+  s->scissor = f_isen(0x0C11); s->poff = f_isen(0x8037); s->stencil = f_isen(0x0B90);
+  gx.GetFloatv(0x0B73, &s->cleard); gx.GetFloatv(0x8038, &s->pofF); gx.GetFloatv(0x2A00, &s->pofU);
+  gx.ActiveTexture(0x84C0); f_geti(0x8069, &s->tex0); gx.ActiveTexture((unsigned)s->act);
+  for (int i = 0; i < 8; i++) {
+    SavedState::VA& v = s->va[i];
+    v.en = v.size = v.type = v.norm = v.stride = v.buf = 0; v.ptr = nullptr;
+    f_vaiv(i, 0x8622, &v.en); f_vaiv(i, 0x8623, &v.size); f_vaiv(i, 0x8625, &v.type);
+    f_vaiv(i, 0x886A, &v.norm); f_vaiv(i, 0x8624, &v.stride); f_vaiv(i, 0x889F, &v.buf);
+    f_vaptr(i, 0x8645, &v.ptr);
+  }
+}
+static void set_cap(unsigned cap, unsigned char on) { if (on) gx.Enable(cap); else gx.Disable(cap); }
+static void restore_state(const SavedState* s) {
+  gx.BindFramebuffer(0x8D40, (unsigned)s->fbo);
+  gx.Viewport(s->vp[0], s->vp[1], s->vp[2], s->vp[3]);
+  gx.UseProgram((unsigned)s->prog);
+  for (int i = 0; i < 8; i++) {
+    const SavedState::VA& v = s->va[i];
+    if ((v.en || v.buf) && v.size >= 1 && v.size <= 4) {
+      gx.BindBuffer(0x8892, (unsigned)v.buf);
+      gx.VertexAttribPointer((unsigned)i, v.size, (unsigned)v.type, (unsigned char)v.norm, v.stride, v.ptr);
+    }
+    if (v.en) gx.EnableVertexAttribArray((unsigned)i); else gx.DisableVertexAttribArray((unsigned)i);
+  }
+  gx.BindBuffer(0x8892, (unsigned)s->arr);
+  gx.BindBuffer(0x8893, (unsigned)s->ele);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)s->tex0);
+  if (g_unit4_saved) { gx.ActiveTexture(0x84C4); gx.BindTexture(0x0DE1, (unsigned)g_prev_unit4); }
+  gx.ActiveTexture((unsigned)s->act);
+  set_cap(0x0B71, s->depth); set_cap(0x0B44, s->cull); set_cap(0x0BE2, s->blend);
+  set_cap(0x0C11, s->scissor); set_cap(0x8037, s->poff); set_cap(0x0B90, s->stencil);
+  gx.DepthMask(s->dmask); gx.ColorMask(s->cmask[0], s->cmask[1], s->cmask[2], s->cmask[3]);
+  gx.DepthFunc((unsigned)s->dfunc); gx.CullFace((unsigned)s->cullmode);
+  gx.PolygonOffset(s->pofF, s->pofU); gx.ClearDepthf(s->cleard);
+}
+
+// matriks 4x4 kolom-utama: C = A * B
+static void mat_mul(const float* A, const float* B, float* C) {
+  for (int c = 0; c < 4; c++)
+    for (int r = 0; r < 4; r++) {
+      float v = 0;
+      for (int k = 0; k < 4; k++) v += A[k * 4 + r] * B[c * 4 + k];
+      C[c * 4 + r] = v;
+    }
+}
+
+static void build_light_matrix(float* lvp) {
+  const double R = (double)g_cfg_radius;
+  const float D = SH_DEPTH_D;
+  float Lv[3] = {g_sun[0], g_sun[1], g_sun[2]};
+  float ln = sqrtf(Lv[0] * Lv[0] + Lv[1] * Lv[1] + Lv[2] * Lv[2]);
+  Lv[0] /= ln; Lv[1] /= ln; Lv[2] /= ln;
+  float f[3] = {-Lv[0], -Lv[1], -Lv[2]};
+  float up[3] = {1, 0, 0};
+  if (fabsf(Lv[0]) > 0.95f) { up[0] = 0; up[1] = 1; }
+  // s = normalize(cross(f, up)), u = cross(s, f)
+  float s[3] = {f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]};
+  float sn = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+  s[0] /= sn; s[1] /= sn; s[2] /= sn;
+  float u[3] = {s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
+  // pusat peta dikunci ke kisi texel di dunia supaya tepi bayangan tidak bergeser saat pemain bergerak
+  double texel = 2.0 * R / (double)g_sh_size;
+  double a = g_cam_est[0] * s[0] + g_cam_est[1] * s[1] + g_cam_est[2] * s[2];
+  double b = g_cam_est[0] * u[0] + g_cam_est[1] * u[1] + g_cam_est[2] * u[2];
+  double sa = floor(a / texel + 0.5) * texel, sb = floor(b / texel + 0.5) * texel;
+  float c[3];
+  for (int i = 0; i < 3; i++) c[i] = (float)((sa - a) * s[i] + (sb - b) * u[i]);
+  float eye[3] = {c[0] + Lv[0] * D, c[1] + Lv[1] * D, c[2] + Lv[2] * D};
+  float V[16] = {s[0], u[0], -f[0], 0, s[1], u[1], -f[1], 0, s[2], u[2], -f[2], 0,
+                 -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]),
+                 -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]),
+                 (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]), 1};
+  float nr = 1.0f, fr = 2.0f * D, Rf = (float)R;
+  float P[16] = {1.0f / Rf, 0, 0, 0, 0, 1.0f / Rf, 0, 0, 0, 0, -2.0f / (fr - nr), 0,
+                 0, 0, -(fr + nr) / (fr - nr), 1};
+  mat_mul(P, V, lvp);
+}
+
+// dijalankan tepat sebelum eglSwapBuffers; menggambar ulang terrain frame ini dari arah matahari
+static void shadow_pass() {
+  g_lvp_valid = false;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n == 0 || !sun_enabled()) return;
+  float lvp[16];
+  build_light_matrix(lvp);
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  gx.BindFramebuffer(0x8D40, g_sh_fbo);
+  gx.Viewport(0, 0, g_sh_size, g_sh_size);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0201); gx.DepthMask(1); gx.ColorMask(0, 0, 0, 0);
+  gx.Enable(0x8037); gx.PolygonOffset(1.5f, 2.0f);
+  gx.ClearDepthf(1.0f); gx.Clear(0x100);
+  gx.UseProgram(g_sh_prog);
+  gx.UniformMatrix4fv(g_sh_loc_lvp, 1, 0, lvp);
+  gx.Uniform1i(g_sh_loc_tex, 0);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)g_atlas_tex);
+  for (int i = 0; i < 4; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.EnableVertexAttribArray(0); gx.EnableVertexAttribArray(1);
+  float margin = 14.0f / g_cfg_radius;
+  unsigned drawn = 0, skipped = 0;
+  for (int i = 0; i < n && drawn < 1800; i++) {
+    const DrawRec& r = g_dl[cur][i];
+    float cx = r.o[0] + 8.0f, cy = r.o[1] + 8.0f, cz = r.o[2] + 8.0f;
+    float x = lvp[0] * cx + lvp[4] * cy + lvp[8] * cz + lvp[12];
+    float y = lvp[1] * cx + lvp[5] * cy + lvp[9] * cz + lvp[13];
+    if (fabsf(x) > 1.0f + margin || fabsf(y) > 1.0f + margin) { skipped++; continue; }
+    gx.BindBuffer(0x8892, (unsigned)r.vbo);
+    gx.BindBuffer(0x8893, (unsigned)r.ibo);
+    gx.VertexAttribPointer(0, 3, 0x1406, 0, 24, (const void*)0);
+    gx.VertexAttribPointer(1, 2, 0x1403, 1, 24, (const void*)20);
+    gx.Uniform3f(g_sh_loc_org, r.o[0], r.o[1], r.o[2]);
+    gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
+    drawn++;
+  }
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  while (gx.GetError() != 0) {}
+  memcpy(g_lvp, lvp, sizeof(lvp));
+  g_lvp_valid = true;
+  g_st_pass++; g_st_draws += drawn; g_st_skipped += skipped; g_st_ms += (mono_sec() - t0) * 1000.0;
+  if (err != 0 && g_st_logs < 8) { g_st_logs++; sh_log("shadow: kesalahan GL 0x%x setelah pass (frame %u)\n", err, g_frames); }
+}
+
+// akhir frame: gambar peta bayangan lalu tukar daftar draw
+static void shadow_end_frame() {
+  if (g_sh_state != 1) return;
+  g_st_frames++;
+  if (g_tframe + 1 != g_frames) return;   // frame ini tanpa terrain: biarkan daftar lama (g_frames sudah naik di awal spy_swap)
+  if (g_delta_ok) g_st_delta_ok++;
+  shadow_pass();
+  g_dcur = 1 - g_dcur;
+  g_dn[g_dcur] = 0;
+  if (g_frames % 600 == 0 && g_st_logs < 12) {
+    g_st_logs++;
+    sh_log("shadow frame %u: pass=%u draw/pass=%.0f lewati/pass=%.0f ms/pass=%.2f delta_ok=%u/%u matahari=(%.3f %.3f %.3f) valid=%d lvp=%d\n",
+           g_frames, g_st_pass, g_st_pass ? (double)g_st_draws / g_st_pass : 0.0, g_st_pass ? (double)g_st_skipped / g_st_pass : 0.0,
+           g_st_pass ? g_st_ms / g_st_pass : 0.0, g_st_delta_ok, g_st_frames, g_sun[0], g_sun[1], g_sun[2],
+           (int)g_sun_valid, (int)g_lvp_valid);
+    g_st_pass = g_st_draws = g_st_skipped = g_st_delta_ok = g_st_frames = 0; g_st_ms = 0;
+  }
+}
+
 static void spy_use_program(GLuint_t p) {
   g_cur_prog = p;
   if (p) {
@@ -424,6 +948,15 @@ static void spy_use_program(GLuint_t p) {
       cap_init();
       int loc = f_getuloc ? f_getuloc(p, "CHUNK_ORIGIN_AND_SCALE") : -1;
       s->kind = loc >= 0 ? 1 : 2;
+      s->loc_origin = loc;
+      s->loc_wv = f_getuloc ? f_getuloc(p, "WORLDVIEW") : -1;
+      s->loc_proj = f_getuloc ? f_getuloc(p, "PROJ") : -1;
+      s->loc_wvp = f_getuloc ? f_getuloc(p, "WORLDVIEWPROJ") : -1;
+      s->loc_smap = f_getuloc ? f_getuloc(p, "SHADOW_MAP") : -1;
+      s->loc_smat = f_getuloc ? f_getuloc(p, "SHADOW_MATRIX") : -1;
+      s->loc_sparams = f_getuloc ? f_getuloc(p, "SHADOW_PARAMS") : -1;
+      s->loc_sun = f_getuloc ? f_getuloc(p, "SUN_DIR") : -1;
+      s->set_en = -1;
     }
   }
   o_useprog(p);
@@ -435,6 +968,8 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     capture_other(s, mode, count, s->kind != 1);
     if (s->kind == 1) capture_draw(s, mode, count, type, idx);
   }
+  if (s->kind == 1) terrain_draw(s, count, type, idx);
+  else if (s->kind == 2 && count == 6 && g_tframe == g_frames && g_sh_state == 1) sky_draw(s, mode, count);
   o_drawel(mode, count, type, idx);
 }
 static void spy_draw_arrays(unsigned mode, int first, int count) {
@@ -490,7 +1025,8 @@ static unsigned spy_swap(void* dpy, void* surf) {
   {
     double tnow = mono_sec();
     if (g_next_cap == 0) g_next_cap = tnow + 60.0;
-    if (tnow >= g_next_cap && g_cap_count < 30) {
+    if (!g_cfg_loaded) cfg_load();
+    if (g_cfg_capture && tnow >= g_next_cap && g_cap_count < 30) {
       g_cap_count++;
       g_next_cap = tnow + 45.0;
       g_cap_f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
@@ -542,6 +1078,7 @@ static unsigned spy_swap(void* dpy, void* surf) {
     g_fbo_binds = 0; g_vp_calls = 0;
     for (int i = 0; i < g_nvp; i++) g_vp_n[i] = 0;
   }
+  shadow_end_frame();
   return o_swap(dpy, surf);
 }
 
