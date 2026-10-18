@@ -1,6 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
+// Versi 11 + PENGINTAI GL (tahap 1 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
-// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim; first person: badan pemain terlihat (kepala disembunyikan, tangan dan item bawaan layar dimatikan, tangan badan memegang item). Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -9,8 +9,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <math.h>
-#include <time.h>
+#include <dlfcn.h>
+#include <elf.h>
 
 #define TAG "pipe3d"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -207,408 +207,226 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
   return true;
 }
 
-// ======================= Animasi karakter (HumanoidModel) =======================
-// Pendekatan: panggil setupAnim asli, lalu tambah gerakan kecil ke sudut/posisi bagian badan.
-// Letak bagian di dalam HumanoidModel (tiap bagian ModelPart besarnya 0xB8 byte):
-//   posisi x,y,z di +0,+4,+8 (y positif = ke bawah), sudut putar x,y,z di +0x18,+0x1C,+0x20 (radian)
-static const uintptr_t OFF_SETUP_ANIM = 0x910B80;   // HumanoidModel::setupAnim(float x6)
-static const uint8_t SIG_SETUP_ANIM[8] = {0x2d, 0xe9, 0xf0, 0x41, 0x2d, 0xed, 0x0a, 0x8b};
-static const uintptr_t OFF_RENDER = 0x910940;       // HumanoidModel::render(Entity&, float x6)
-static const uint8_t SIG_RENDER[8] = {0x2d, 0xe9, 0xf0, 0x48, 0x2d, 0xed, 0x08, 0x8b};
-static const uintptr_t OFF_ERD_RENDER = 0x9C2C48;    // EntityRenderDispatcher::render(Entity&, float)
-static const uint8_t SIG_ERD_RENDER[8] = {0x70, 0xb5, 0x8a, 0xb0, 0x05, 0x46, 0x07, 0xa8};
-static const uintptr_t OFF_CARRIED = 0x9DE924;       // PlayerRenderer::prepareCarriedItem(Model&, Mob&, ItemInstance*)
-static const uint8_t SIG_CARRIED[8] = {0x70, 0xb5, 0x1c, 0x46, 0x0d, 0x46, 0x06, 0x46};
-static const uintptr_t OFF_IIH_RENDER = 0x9FD6A0;    // ItemInHandRenderer::render(bool, float): tangan dan item bawaan layar
-static const uint8_t SIG_IIH_RENDER[10] = {0x2d, 0xe9, 0xf0, 0x4f, 0x81, 0xb0, 0x2d, 0xed, 0x10, 0x8b};
-static const int P_HEAD = 0xF0, P_HAT = 0x1A8, P_BODY = 0x260;
-static const int P_RARM = 0x318, P_LARM = 0x3D0, P_RLEG = 0x488, P_LLEG = 0x540;
-static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi sebelum render)
-static const int M_RIDING = 0x19;    // byte: sedang menunggang
-static const int M_ATTACK = 0x14;    // float: progres ayunan serangan
-
-// Angka yang bisa diatur (kalau gerakan terasa kurang/terlalu)
-static const float SNEAK_TIME = 0.20f;    // detik untuk masuk/keluar sneak
-static const float HEAD_TAU = 0.07f;      // makin besar, kepala makin lambat menyusul
-static const float BREATH_SPEED = 1.9f;   // radian per detik (sekitar 3 detik per tarikan napas)
-static const float BREATH_AMP = 0.30f;    // naik-turun badan (piksel model)
-static const float BREATH_SWAY = 0.035f;  // goyang tangan saat diam (radian)
-static const float WALK_BOB = 0.70f;      // badan naik tiap langkah (piksel model)
-static const float WALK_TWIST = 0.10f;    // badan memutar tiap langkah (radian); balik tanda kalau arahnya terasa terbalik
-static const float RUN_LEAN = 0.12f;      // badan condong ke depan saat lari (radian)
-static const float LEG_LIFT = 1.6f;       // kaki terangkat saat mengayun ke depan (piksel model)
-static const float ARM_K = 300.0f;        // kekakuan pegas tangan (makin besar, makin cepat menyusul)
-static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, makin banyak memantul)
-
-// ---- First person: badan pemain ikut digambar ----
-// Game melewati pemain sendiri saat pengaturan kamera = 0 (first person). Tiga titik 'lewati' itu di-NOP.
-static const bool FP_BODY = true;               // false = perilaku asli game
-static const float FP_BACK = 3.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
-static bool g_fp_now = false;                   // true selama model pemain sendiri digambar saat first person
-static const bool FP_HIDE_VIEWMODEL = true;     // matikan tangan dan item bawaan layar saat first person (badan yang memegang item)
-static const float FP_ARM_X = -1.5f;            // sudut tangan kanan yang memegang item saat first person (negatif = ke depan, -1.57 = lurus ke depan)
-static const float FP_ARM_SWING = 0.4f;         // ayunan tangan saat berjalan dikecilkan segini saat first person
-static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
-static const uintptr_t OFF_ERD_PTR = 0x16B4708;     // EntityRenderer::entityRenderDispatcher (static)
-static const int ERD_CLIENT = 0xC, ERD_CAMERA = 0x1C;   // isi EntityRenderDispatcher: MinecraftClient*, Entity* kamera
-static const int PART_VISIBLE = 0x25;           // byte 'terlihat' di tiap ModelPart (0 = tidak digambar)
-static const uintptr_t OFF_GET_OPT = 0x597D64, OFF_GET_INT = 0x598154;   // dua pemanggilan yang dipakai game untuk membaca pengaturan third person
-typedef void* (*GetOptFn)(void* client);
-typedef int (*GetIntFn)(void* opt);
-static uintptr_t g_mc_base = 0;
-static GetOptFn g_get_opt = nullptr;
-static GetIntFn g_get_int = nullptr;
-static bool fp_logged = false;
-
-static int g_world_depth = 0;        // > 0 selama LevelRenderer menggambar entitas dunia (bukan avatar HUD/inventori)
-static void* g_hold_mob = nullptr;   // pemain terakhir yang dicek prepareCarriedItem
-static void* g_hold_item = nullptr;  // item yang dipegang pemain itu (null = tangan kosong)
-static bool g_fp_holding = false;
-
-// true bila kamera sedang first person (Options::getPlayerViewPerspective() == 0)
-static bool first_person_view() {
-  if (!g_mc_base || !g_get_opt || !g_get_int) return false;
-  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
-  if (!erd) return false;
-  void* client = *(void**)((uint8_t*)erd + ERD_CLIENT);
-  if (!client) return false;
-  return g_get_int(g_get_opt(client)) == 0;
-}
-
-// true bila 'ent' adalah pemain sendiri, digambar di dunia (bukan avatar HUD), dan kamera first person
-static bool is_first_person_self(void* ent) {
-  if (g_world_depth <= 0 || !ent || !g_mc_base) return false;
-  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
-  if (!erd) return false;
-  if (*(void**)((uint8_t*)erd + ERD_CAMERA) != ent) return false;
-  return first_person_view();
-}
-
-typedef void (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
-typedef void (*RenderFn)(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6);
-static SetupAnimFn orig_setup_anim = nullptr;
-static RenderFn orig_render = nullptr;
-static void* g_cur_mob = nullptr;     // makhluk yang sedang digambar (dicatat hook render)
-static double g_cur_mob_time = 0;
-static bool anim_logged = false;
-
-static const int PART_OFFS[7] = {P_HEAD, P_HAT, P_BODY, P_RARM, P_LARM, P_RLEG, P_LLEG};
-static float* part(void* self, int off) { return (float*)((uint8_t*)self + off); }
-static void snap_pose(void* self, float out[7][6]) {
-  for (int i = 0; i < 7; i++) {
-    float* p = part(self, PART_OFFS[i]);
-    out[i][0] = p[0]; out[i][1] = p[1]; out[i][2] = p[2];
-    out[i][3] = p[6]; out[i][4] = p[7]; out[i][5] = p[8];
-  }
-}
-static void put_pose(void* self, const float in[7][6]) {
-  for (int i = 0; i < 7; i++) {
-    float* p = part(self, PART_OFFS[i]);
-    p[0] = in[i][0]; p[1] = in[i][1]; p[2] = in[i][2];
-    p[6] = in[i][3]; p[7] = in[i][4]; p[8] = in[i][5];
-  }
-}
-
-// Keadaan per makhluk (model dipakai bersama oleh banyak mob, jadi tidak boleh disimpan di model)
-struct AnimState { void* key; double last; float hy, hp, sneak; float ax[2], av[2]; bool used; };
-static AnimState g_states[32];
-static AnimState* get_state(void* key) {
-  AnimState* oldest = &g_states[0];
-  for (int i = 0; i < 32; i++) {
-    if (g_states[i].used && g_states[i].key == key) return &g_states[i];
-    if (!g_states[i].used) { oldest = &g_states[i]; break; }
-    if (g_states[i].last < oldest->last) oldest = &g_states[i];
-  }
-  oldest->used = true; oldest->key = key; oldest->last = -1; oldest->hy = oldest->hp = oldest->sneak = 0;
-  oldest->ax[0] = oldest->ax[1] = oldest->av[0] = oldest->av[1] = 0;
-  return oldest;
-}
-// setupAnim asli TIDAK mereset posisi-y badan/tangan dan sudut-y badan (kecuali saat memukul),
-// jadi tambahan dari frame sebelumnya dibatalkan dulu sebelum fungsi asli dipanggil.
-struct ModelFx { void* self; float dy, twist, zoff; };
-static ModelFx g_fx[16];
-static ModelFx* get_fx(void* self) {
-  for (int i = 0; i < 16; i++) if (g_fx[i].self == self) return &g_fx[i];
-  for (int i = 0; i < 16; i++) if (!g_fx[i].self) { g_fx[i].self = self; g_fx[i].dy = g_fx[i].twist = g_fx[i].zoff = 0; return &g_fx[i]; }
-  g_fx[0].self = self; g_fx[0].dy = g_fx[0].twist = g_fx[0].zoff = 0;
-  return &g_fx[0];
-}
-static double now_sec() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-typedef void (*ErdRenderFn)(void* self, void* ent, float pt);
-typedef void (*CarriedFn)(void* self, void* model, void* mob, void* item);
-typedef void (*IihRenderFn)(void* self, bool a, float b);
-static ErdRenderFn orig_erd_render = nullptr;
-static CarriedFn orig_carried = nullptr;
-static IihRenderFn orig_iih_render = nullptr;
-
-// Penggambaran entitas dunia: tandai supaya avatar HUD/inventori tidak ikut terkena aturan first person
-static void hook_erd_render(void* self, void* ent, float pt) {
-  g_world_depth++;
-  orig_erd_render(self, ent, pt);
-  g_world_depth--;
-}
-
-// Catat apakah pemain memegang item (dipanggil game sebelum menggambar model)
-static void hook_carried(void* self, void* model, void* mob, void* item) {
-  g_hold_mob = mob; g_hold_item = item;
-  orig_carried(self, model, mob, item);
-}
-
-// Tangan dan item bawaan layar: dilewati saat first person (badan yang memegang item)
-static void hook_iih_render(void* self, bool a, float b) {
-  if (FP_BODY && FP_HIDE_VIEWMODEL && first_person_view()) return;
-  orig_iih_render(self, a, b);
-}
-
-// Pegas redam: sudut tangan menyusul target dengan sedikit tertinggal dan memantul lunak
-static void spring_step(float* x, float* v, float target, float dt) {
-  if (dt <= 0) return;
-  const int n = 2;
-  float h = dt / n;
-  for (int i = 0; i < n; i++) {
-    float a = ARM_K * (target - *x) - ARM_C * (*v);
-    *v += a * h;
-    *x += *v * h;
-  }
-}
-
-static void hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
-  g_cur_mob = ent;
-  g_cur_mob_time = now_sec();
-  bool fps = FP_BODY && is_first_person_self(ent);
-  bool fp = fps && FP_HIDE_HEAD;
-  g_fp_now = fps;
-  g_fp_holding = fps && g_hold_mob == ent && g_hold_item != nullptr;
-  uint8_t* head_vis = (uint8_t*)self + P_HEAD + PART_VISIBLE;
-  uint8_t* hat_vis = (uint8_t*)self + P_HAT + PART_VISIBLE;
-  uint8_t old_head = *head_vis, old_hat = *hat_vis;
-  if (fp) {
-    *head_vis = 0; *hat_vis = 0;
-    if (!fp_logged) {
-      fp_logged = true;
-      FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-      if (f) { fprintf(f, "fp: pemain sendiri digambar saat first person, ent=%p\n", ent); fclose(f); }
-    }
-  }
-  orig_render(self, ent, a1, a2, a3, a4, a5, a6);
-  if (fp) { *head_vis = old_head; *hat_vis = old_hat; }   // model dipakai bersama makhluk lain, kembalikan
-  g_fp_now = false;
-  g_fp_holding = false;
-  g_cur_mob = nullptr;
-}
-
-static void hook_setup_anim(void* self, float a1, float a2, float a3, float a4, float a5, float a6) {
-  double now = now_sec();
-  uint8_t* sneak_flag = (uint8_t*)self + M_SNEAK;
-  uint8_t real_sneak = *sneak_flag;
-  void* key = (g_cur_mob && now - g_cur_mob_time < 0.05) ? g_cur_mob : self;
-  AnimState* st = get_state(key);
-  bool fresh = (st->last < 0 || now - st->last > 1.0);
-  float dt = fresh ? 0.0f : (float)(now - st->last);
-  if (dt > 0.1f) dt = 0.1f;
-  st->last = now;
-
-  ModelFx* fx = get_fx(self);
-  part(self, P_BODY)[1] -= fx->dy;
-  part(self, P_RARM)[1] -= fx->dy;
-  part(self, P_LARM)[1] -= fx->dy;
-  part(self, P_BODY)[7] -= fx->twist;
-  if (fx->zoff != 0) {
-    for (int i = 0; i < 7; i++) part(self, PART_OFFS[i])[2] -= fx->zoff;
-    fx->zoff = 0;
-  }
-  fx->dy = 0; fx->twist = 0;
-
-  // 1. Sneak halus: hitung pose tanpa dan dengan sneak, lalu campur sesuai st->sneak
-  float target = real_sneak ? 1.0f : 0.0f;
-  if (fresh) st->sneak = target;
-  else if (st->sneak < target) { st->sneak += dt / SNEAK_TIME; if (st->sneak > target) st->sneak = target; }
-  else if (st->sneak > target) { st->sneak -= dt / SNEAK_TIME; if (st->sneak < target) st->sneak = target; }
-  float s = st->sneak;
-  if (s <= 0.001f || s >= 0.999f) {
-    *sneak_flag = (s >= 0.5f) ? 1 : 0;
-    orig_setup_anim(self, a1, a2, a3, a4, a5, a6);
-  } else {
-    float A[7][6], B[7][6], M[7][6];
-    *sneak_flag = 0; orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, A);
-    *sneak_flag = 1; orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, B);
-    float e = s * s * (3.0f - 2.0f * s);
-    for (int i = 0; i < 7; i++) for (int k = 0; k < 6; k++) M[i][k] = A[i][k] + (B[i][k] - A[i][k]) * e;
-    put_pose(self, M);
-  }
-  *sneak_flag = real_sneak;
-
-  float* head = part(self, P_HEAD);
-  float* hat = part(self, P_HAT);
-  float* body = part(self, P_BODY);
-  float* ra = part(self, P_RARM);
-  float* la = part(self, P_LARM);
-  bool riding = *((uint8_t*)self + M_RIDING) != 0;
-  float attack = *(float*)((uint8_t*)self + M_ATTACK);
-
-  // 2. Kepala menyusul arah pandang dengan halus (x = naik-turun, y = menoleh)
-  if (fresh) { st->hy = head[7]; st->hp = head[6]; }
-  else {
-    float k = 1.0f - expf(-dt / HEAD_TAU);
-    st->hy += (head[7] - st->hy) * k;
-    st->hp += (head[6] - st->hp) * k;
-  }
-  head[7] = st->hy; head[6] = st->hp;
-
-  if (!riding) {
-    float spd = a2 < 0 ? 0 : (a2 > 1 ? 1 : a2);
-    // 3. Napas saat diam: badan, kepala, dan tangan naik-turun pelan; kaki tetap
-    float idle = 1.0f - spd * 10.0f;
-    if (idle < 0 || attack > 0) idle = 0;
-    if (idle > 0) {
-      float dy = (float)sin(now * BREATH_SPEED) * BREATH_AMP * idle;
-      head[1] += dy; body[1] += dy; ra[1] += dy; la[1] += dy;
-      fx->dy += dy;
-      float sway = ((float)cos(now * BREATH_SPEED * 0.9) * 0.5f + 0.5f) * BREATH_SWAY * idle;
-      ra[8] += sway; la[8] -= sway;
-    }
-    // 4. Jalan/lari: badan naik tiap langkah, memutar sedikit, condong saat cepat
-    float w = spd * (1.0f - 0.5f * st->sneak);
-    if (w > 0) {
-      float phase = a1 * 0.6662f;
-      float bob = fabsf(sinf(phase)) * w * WALK_BOB;
-      float twist = (attack > 0) ? 0.0f : sinf(phase) * w * WALK_TWIST;
-      float lean = w * RUN_LEAN;
-      head[1] -= bob; body[1] -= bob; ra[1] -= bob; la[1] -= bob;
-      fx->dy -= bob;
-      body[7] += twist; ra[7] += twist; la[7] += twist; head[7] -= twist;
-      fx->twist += twist;
-      body[6] += lean; ra[6] += lean; la[6] += lean; head[6] -= lean;
-      // Kaki terangkat saat mengayun ke depan (kaki kanan maju saat sin(fase) > 0, kiri saat < 0)
-      float sp = sinf(phase);
-      if (sp > 0) part(self, P_RLEG)[1] -= sp * w * LEG_LIFT;
-      else part(self, P_LLEG)[1] += sp * w * LEG_LIFT;
-    }
-  }
-
-  // First person: tangan kanan memegang item lurus ke depan (terlihat di kanan bawah), ayunan jalan dikecilkan
-  if (g_fp_now && !riding && attack <= 0) {
-    if (g_fp_holding) ra[6] = FP_ARM_X; else ra[6] *= FP_ARM_SWING;
-    la[6] *= FP_ARM_SWING;
-  }
-
-  // 5. Tangan berpegas (tidak dipakai saat memukul atau menunggang)
-  if (fresh || riding || attack > 0) {
-    st->ax[0] = ra[6]; st->av[0] = 0;
-    st->ax[1] = la[6]; st->av[1] = 0;
-  } else {
-    float dts = dt > 0.05f ? 0.05f : dt;
-    spring_step(&st->ax[0], &st->av[0], ra[6], dts);
-    spring_step(&st->ax[1], &st->av[1], la[6], dts);
-    ra[6] = st->ax[0]; la[6] = st->ax[1];
-  }
-
-  // Topi selalu sama dengan kepala (seperti yang dilakukan setupAnim asli)
-  hat[0] = head[0]; hat[1] = head[1]; hat[2] = head[2];
-  hat[6] = head[6]; hat[7] = head[7]; hat[8] = head[8];
-
-  // First person: geser seluruh badan ke belakang supaya kamera (di posisi mata) tidak menempel ke badan
-  if (g_fp_now) {
-    for (int i = 0; i < 7; i++) part(self, PART_OFFS[i])[2] += FP_BACK;
-    fx->zoff = FP_BACK;
-  }
-
-  if (!anim_logged) {
-    anim_logged = true;
-    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-    if (f) {
-      fprintf(f, "anim: self=%p sneak=%d riding=%d attack=%f a=%f %f %f %f %f %f head=%f %f body=%f\n",
-              self, (int)real_sneak, (int)riding, attack, a1, a2, a3, a4, a5, a6, head[6], head[7], body[1]);
-      fclose(f);
-    }
-  }
-}
-
-// Timpa byte kode game dengan memeriksa dulu isi aslinya (kalau beda, tidak diubah)
-static bool patch_code(uintptr_t addr, const uint8_t* expect, const uint8_t* repl, size_t n) {
-  if (memcmp((void*)addr, expect, n) != 0) return false;
-  uintptr_t page = addr & ~(uintptr_t)4095;
-  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-  memcpy((void*)addr, repl, n);
-  __builtin___clear_cache((char*)addr, (char*)addr + n);
-  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-  return true;
-}
-
-static void install_fp_patches(uintptr_t base) {
-  static const uint8_t nop2[2] = {0x00, 0xBF};
-  static const uint8_t nop4[4] = {0x00, 0xBF, 0x00, 0xBF};
-  static const uint8_t e1[4] = {0x00, 0xF0, 0x0F, 0x81};   // beq.w -> lewati (pengecekan utama)
-  static const uint8_t e2[2] = {0x62, 0xD0};               // beq   -> lewati (daftar pemain)
-  static const uint8_t e3[2] = {0x78, 0xB3};               // cbz   -> lewati (daftar pemain)
-  g_mc_base = base;
-  g_get_opt = (GetOptFn)(base + OFF_GET_OPT);
-  g_get_int = (GetIntFn)(base + OFF_GET_INT);
-  bool a = patch_code(base + 0xA0C546, e1, nop4, 4);
-  bool b = patch_code(base + 0xA0C17A, e2, nop2, 2);
-  bool c = patch_code(base + 0xA0C1E0, e3, nop2, 2);
-  LOG("fp patch: utama=%d daftar1=%d daftar2=%d", (int)a, (int)b, (int)c);
-}
-
-// Seperti install_hook, tetapi menyalin n byte awal fungsi (8 atau 10; harus tepat di batas instruksi)
-static bool install_hook_n(uintptr_t target, void* hook, void** orig_out, int n) {
-  if (n == 8) return install_hook(target, hook, orig_out);
-  if (n != 10) return false;
-  uint8_t* t = (uint8_t*)target;
-  uint8_t* tr = (uint8_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (tr == (uint8_t*)MAP_FAILED) return false;
-  memcpy(tr, t, 10);
-  tr[10] = 0x00; tr[11] = 0xBF;                                  // nop (supaya ldr.w jatuh di batas 4 byte)
-  tr[12] = 0xDF; tr[13] = 0xF8; tr[14] = 0x00; tr[15] = 0xF0;    // ldr.w pc, [pc, #0] -> alamat di tr+16
-  uint32_t back = (uint32_t)(target + 10) | 1;
-  memcpy(tr + 16, &back, 4);
-  __builtin___clear_cache((char*)tr, (char*)tr + 20);
-  *orig_out = (void*)((uintptr_t)tr | 1);
-
-  uintptr_t page = target & ~(uintptr_t)4095;
-  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-  uint8_t patch[8] = {0xDF, 0xF8, 0x00, 0xF0, 0, 0, 0, 0};
-  uint32_t h = (uint32_t)(uintptr_t)hook | 1;
-  memcpy(patch + 4, &h, 4);
-  memcpy(t, patch, 8);
-  __builtin___clear_cache((char*)t, (char*)t + 8);
-  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-  return true;
-}
-
-static void install_anim_hooks(uintptr_t base) {
-  uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_RENDER;
-  if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_RENDER, 8) != 0) {
-    LOG("anim: tanda fungsi tidak cocok, dibatalkan");
-    return;
-  }
-  bool ok2 = install_hook(t2, (void*)hook_render, (void**)&orig_render);
-  bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
-  LOG("anim hook: setupAnim=%d render=%d", (int)ok1, (int)ok2);
-  if (FP_BODY) {
-    install_fp_patches(base);
-    // Hook tambahan untuk first person; masing-masing diperiksa tandanya dulu dan boleh gagal sendiri-sendiri
-    uintptr_t t3 = base + OFF_ERD_RENDER, t4 = base + OFF_CARRIED, t5 = base + OFF_IIH_RENDER;
-    bool ok3 = memcmp((void*)t3, SIG_ERD_RENDER, 8) == 0 && install_hook(t3, (void*)hook_erd_render, (void**)&orig_erd_render);
-    bool ok4 = memcmp((void*)t4, SIG_CARRIED, 8) == 0 && install_hook(t4, (void*)hook_carried, (void**)&orig_carried);
-    bool ok5 = FP_HIDE_VIEWMODEL && memcmp((void*)t5, SIG_IIH_RENDER, 10) == 0 &&
-               install_hook_n(t5, (void*)hook_iih_render, (void**)&orig_iih_render, 10);
-    LOG("fp hook: erdRender=%d carriedItem=%d viewmodel=%d", (int)ok3, (int)ok4, (int)ok5);
-  }
-}
-
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
   if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
     *(uintptr_t*)data = (uintptr_t)info->dlpi_addr;
     return 1;
   }
   return 0;
+}
+
+
+// ======================= Pengintai OpenGL (tahap 1 shadow map) =======================
+// Mengganti isi tabel impor (GOT) milik libminecraftpe.so untuk beberapa fungsi GL/EGL, hanya untuk MENCATAT.
+// Hasil ada di /sdcard/games/com.mojang/pipe3d_log.txt (ringkasan tiap 300 frame, 4 kali).
+typedef unsigned int GLuint_t;
+typedef void (*fn_useprog_t)(GLuint_t);
+typedef void (*fn_drawel_t)(unsigned, int, unsigned, const void*);
+typedef void (*fn_drawar_t)(unsigned, int, int);
+typedef void (*fn_bindfb_t)(unsigned, GLuint_t);
+typedef void (*fn_viewport_t)(int, int, int, int);
+typedef unsigned (*fn_swap_t)(void*, void*);
+static fn_useprog_t o_useprog = nullptr;
+static fn_drawel_t o_drawel = nullptr;
+static fn_drawar_t o_drawar = nullptr;
+static fn_bindfb_t o_bindfb = nullptr;
+static fn_viewport_t o_viewport = nullptr;
+static fn_swap_t o_swap = nullptr;
+
+struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; };
+static ProgStat g_prog[48];
+static int g_np = 0;
+static unsigned g_cur_prog = 0, g_cur_fbo = 0;
+static unsigned g_fbo_binds = 0, g_vp_calls = 0;
+static int g_vp_w[8], g_vp_h[8]; static unsigned g_vp_n[8]; static int g_nvp = 0;
+static unsigned g_frames = 0, g_summaries = 0;
+static bool g_gl_info_done = false;
+
+static ProgStat* prog_stat(unsigned id) {
+  for (int i = 0; i < g_np; i++) if (g_prog[i].id == id) return &g_prog[i];
+  if (g_np >= 48) return &g_prog[47];
+  ProgStat* p = &g_prog[g_np++];
+  memset(p, 0, sizeof(*p)); p->id = id;
+  return p;
+}
+static void spy_use_program(GLuint_t p) { g_cur_prog = p; o_useprog(p); }
+static void spy_draw_elements(unsigned mode, int count, unsigned type, const void* idx) {
+  ProgStat* s = prog_stat(g_cur_prog);
+  s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = type;
+  o_drawel(mode, count, type, idx);
+}
+static void spy_draw_arrays(unsigned mode, int first, int count) {
+  ProgStat* s = prog_stat(g_cur_prog);
+  s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = 0;
+  o_drawar(mode, first, count);
+}
+static void spy_bind_fb(unsigned target, GLuint_t fb) { g_cur_fbo = fb; g_fbo_binds++; o_bindfb(target, fb); }
+static void spy_viewport(int x, int y, int w, int h) {
+  g_vp_calls++;
+  int i = 0;
+  for (; i < g_nvp; i++) if (g_vp_w[i] == w && g_vp_h[i] == h) break;
+  if (i == g_nvp && g_nvp < 8) { g_vp_w[i] = w; g_vp_h[i] = h; g_vp_n[i] = 0; g_nvp++; }
+  if (i < g_nvp) g_vp_n[i]++;
+  o_viewport(x, y, w, h);
+}
+
+typedef const unsigned char* (*gl_getstring_t)(unsigned);
+typedef void (*gl_getprogramiv_t)(unsigned, unsigned, int*);
+typedef void (*gl_getactive_t)(unsigned, unsigned, int, int*, int*, unsigned*, char*);
+typedef void (*gl_getintegerv_t)(unsigned, int*);
+
+static void describe_program(FILE* f, void* lib, unsigned id) {
+  gl_getprogramiv_t giv = (gl_getprogramiv_t)dlsym(lib, "glGetProgramiv");
+  gl_getactive_t gau = (gl_getactive_t)dlsym(lib, "glGetActiveUniform");
+  gl_getactive_t gaa = (gl_getactive_t)dlsym(lib, "glGetActiveAttrib");
+  if (!giv || !gau || !gaa) { fprintf(f, "  (fungsi query GL tidak ada)\n"); return; }
+  int nu = 0, na = 0;
+  giv(id, 0x8B86, &nu);   // GL_ACTIVE_UNIFORMS
+  giv(id, 0x8B89, &na);   // GL_ACTIVE_ATTRIBUTES
+  fprintf(f, "  attrib:");
+  for (int i = 0; i < na && i < 16; i++) {
+    char name[64] = {0}; int len = 0, size = 0; unsigned type = 0;
+    gaa(id, i, 63, &len, &size, &type, name);
+    fprintf(f, " %s(0x%x)", name, type);
+  }
+  fprintf(f, "\n  uniform:");
+  for (int i = 0; i < nu && i < 40; i++) {
+    char name[64] = {0}; int len = 0, size = 0; unsigned type = 0;
+    gau(id, i, 63, &len, &size, &type, name);
+    fprintf(f, " %s(0x%x)", name, type);
+  }
+  fprintf(f, "\n");
+}
+
+static unsigned spy_swap(void* dpy, void* surf) {
+  g_frames++;
+  void* lib = dlopen("libGLESv2.so", RTLD_NOW);
+  if (!g_gl_info_done && g_frames >= 60 && lib) {
+    g_gl_info_done = true;
+    gl_getstring_t gs = (gl_getstring_t)dlsym(lib, "glGetString");
+    gl_getintegerv_t gi = (gl_getintegerv_t)dlsym(lib, "glGetIntegerv");
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f && gs) {
+      const char* ver = (const char*)gs(0x1F02);
+      const char* ren = (const char*)gs(0x1F01);
+      const char* ext = (const char*)gs(0x1F03);
+      fprintf(f, "GL version=%s renderer=%s\n", ver ? ver : "?", ren ? ren : "?");
+      if (ext) {
+        fprintf(f, "GL ext: depth_texture=%d depth24=%d shadow_samplers=%d standard_derivatives=%d texture_half_float=%d\n",
+                strstr(ext, "OES_depth_texture") != nullptr, strstr(ext, "OES_depth24") != nullptr,
+                strstr(ext, "EXT_shadow_samplers") != nullptr, strstr(ext, "OES_standard_derivatives") != nullptr,
+                strstr(ext, "OES_texture_half_float") != nullptr);
+      }
+      int units = 0; if (gi) gi(0x8872, &units);   // GL_MAX_TEXTURE_IMAGE_UNITS
+      fprintf(f, "GL max texture units=%d\n", units);
+    }
+    if (f) fclose(f);
+  }
+  if (g_frames % 300 == 0 && g_summaries < 4) {
+    g_summaries++;
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f) {
+      fprintf(f, "== GL ringkasan %u (frame %u): bindFramebuffer=%u, viewport=%u, fbo terakhir=%u\n",
+              g_summaries, g_frames, g_fbo_binds, g_vp_calls, g_cur_fbo);
+      for (int i = 0; i < g_nvp; i++) fprintf(f, " viewport %dx%d: %u kali\n", g_vp_w[i], g_vp_h[i], g_vp_n[i]);
+      for (int i = 0; i < g_np; i++) {
+        ProgStat* s = &g_prog[i];
+        if (!s->draws) continue;
+        fprintf(f, " program %u: draw=%u verts=%u mode=0x%x type=0x%x\n", s->id, s->draws, s->verts, s->mode, s->type);
+        if (!s->described && lib) { s->described = true; describe_program(f, lib, s->id); }
+        s->draws = 0; s->verts = 0;
+      }
+      fclose(f);
+    }
+    g_fbo_binds = 0; g_vp_calls = 0;
+    for (int i = 0; i < g_nvp; i++) g_vp_n[i] = 0;
+  }
+  return o_swap(dpy, surf);
+}
+
+struct GotHook { const char* name; void* hook; void** orig; bool found; };
+static GotHook g_got_hooks[] = {
+  {"glUseProgram", (void*)spy_use_program, (void**)&o_useprog, false},
+  {"glDrawElements", (void*)spy_draw_elements, (void**)&o_drawel, false},
+  {"glDrawArrays", (void*)spy_draw_arrays, (void**)&o_drawar, false},
+  {"glBindFramebuffer", (void*)spy_bind_fb, (void**)&o_bindfb, false},
+  {"glViewport", (void*)spy_viewport, (void**)&o_viewport, false},
+  {"eglSwapBuffers", (void*)spy_swap, (void**)&o_swap, false},
+};
+
+struct LibInfo { uintptr_t base; const Elf32_Phdr* ph; int n; };
+static int find_lib_cb(struct dl_phdr_info* info, size_t, void* data) {
+  if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
+    LibInfo* li = (LibInfo*)data;
+    li->base = (uintptr_t)info->dlpi_addr;
+    li->ph = (const Elf32_Phdr*)info->dlpi_phdr;
+    li->n = info->dlpi_phnum;
+    return 1;
+  }
+  return 0;
+}
+
+static void patch_got_entry(uint32_t* got, void* hook, void** orig) {
+  if (*orig == nullptr) *orig = (void*)(uintptr_t)(*got);
+  uintptr_t page = (uintptr_t)got & ~(uintptr_t)4095;
+  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE) != 0) return;
+  *got = (uint32_t)(uintptr_t)hook;
+  mprotect((void*)page, 4096, PROT_READ);
+}
+
+static void install_gl_spy() {
+  LibInfo li = {0, nullptr, 0};
+  dl_iterate_phdr(find_lib_cb, &li);
+  if (!li.base || !li.ph) { LOG("spy: lib tidak ditemukan"); return; }
+  const Elf32_Dyn* dyn = nullptr;
+  for (int i = 0; i < li.n; i++) if (li.ph[i].p_type == PT_DYNAMIC) { dyn = (const Elf32_Dyn*)(li.base + li.ph[i].p_vaddr); break; }
+  if (!dyn) { LOG("spy: PT_DYNAMIC tidak ada"); return; }
+  uintptr_t symtab = 0, strtab = 0, jmprel = 0, rel = 0; uint32_t pltrelsz = 0, relsz = 0;
+  for (const Elf32_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
+    uintptr_t v = d->d_un.d_ptr;
+    if (d->d_tag == DT_SYMTAB) symtab = v;
+    else if (d->d_tag == DT_STRTAB) strtab = v;
+    else if (d->d_tag == DT_JMPREL) jmprel = v;
+    else if (d->d_tag == DT_PLTRELSZ) pltrelsz = d->d_un.d_val;
+    else if (d->d_tag == DT_REL) rel = v;
+    else if (d->d_tag == DT_RELSZ) relsz = d->d_un.d_val;
+  }
+  // Pada beberapa versi Android, alamat di tabel dinamis sudah mutlak; pada yang lain masih relatif
+  if (symtab && symtab < li.base) symtab += li.base;
+  if (strtab && strtab < li.base) strtab += li.base;
+  if (jmprel && jmprel < li.base) jmprel += li.base;
+  if (rel && rel < li.base) rel += li.base;
+  if (!symtab || !strtab) { LOG("spy: symtab/strtab kosong"); return; }
+  struct Sect { uintptr_t a; uint32_t sz; } sects[2] = {{jmprel, pltrelsz}, {rel, relsz}};
+  int patched = 0;
+  for (int s = 0; s < 2; s++) {
+    if (!sects[s].a) continue;
+    const Elf32_Rel* r = (const Elf32_Rel*)sects[s].a;
+    int n = sects[s].sz / sizeof(Elf32_Rel);
+    for (int i = 0; i < n; i++) {
+      unsigned type = ELF32_R_TYPE(r[i].r_info), sym = ELF32_R_SYM(r[i].r_info);
+      if (type != 21 && type != 22) continue;   // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT
+      if (!sym) continue;
+      const Elf32_Sym* sy = (const Elf32_Sym*)symtab + sym;
+      const char* name = (const char*)strtab + sy->st_name;
+      for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++) {
+        if (strcmp(name, g_got_hooks[k].name) == 0) {
+          patch_got_entry((uint32_t*)(li.base + r[i].r_offset), g_got_hooks[k].hook, g_got_hooks[k].orig);
+          g_got_hooks[k].found = true; patched++;
+        }
+      }
+    }
+  }
+  for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++)
+    LOG("spy: %s %s", g_got_hooks[k].name, g_got_hooks[k].found ? "dipasang" : "TIDAK ditemukan");
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+  if (f) {
+    fprintf(f, "spy GL: dipasang %d entri GOT;", patched);
+    for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++)
+      fprintf(f, " %s=%d", g_got_hooks[k].name, (int)g_got_hooks[k].found);
+    fprintf(f, "\n");
+    fclose(f);
+  }
 }
 
 static void* worker(void*) {
@@ -618,6 +436,7 @@ static void* worker(void*) {
     if (!base) usleep(100000);
   }
   if (!base) { LOG("libminecraftpe.so tidak ditemukan"); return nullptr; }
+  install_gl_spy();   // tahap 1: hanya mencatat, tidak mengubah tampilan
   uintptr_t target = base + OFF_TESS_BLOCK;
   if (memcmp((void*)target, SIG_TESS_BLOCK, 8) != 0) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
@@ -632,7 +451,6 @@ static void* worker(void*) {
   } else {
     LOG("hook gagal dipasang");
   }
-  install_anim_hooks(base);
   return nullptr;
 }
 
