@@ -1,5 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// Versi 11 + PENGINTAI GL (tahap 1 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
+// Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
+// Tahap 2: pada frame 500, 1000, 1500 semua draw terrain dicatat rinci (format vertex, buffer, matriks, origin chunk).
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
 #include <android/log.h>
 #include <link.h>
@@ -233,7 +234,7 @@ static fn_bindfb_t o_bindfb = nullptr;
 static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
-struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; };
+struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -249,10 +250,109 @@ static ProgStat* prog_stat(unsigned id) {
   memset(p, 0, sizeof(*p)); p->id = id;
   return p;
 }
-static void spy_use_program(GLuint_t p) { g_cur_prog = p; o_useprog(p); }
+
+// ---- Tahap 2: pencatatan rinci draw terrain (hanya membaca status GL, tidak mengubah apa pun) ----
+typedef int (*gl_loc_t)(unsigned, const char*);
+typedef void (*gl_unifv_t)(unsigned, int, float*);
+typedef void (*gl_unifiv_t)(unsigned, int, int*);
+typedef void (*gl_vaiv_t)(unsigned, unsigned, int*);
+typedef void (*gl_vaptr_t)(unsigned, unsigned, void**);
+typedef unsigned char (*gl_isen_t)(unsigned);
+typedef void (*gl_getb_t)(unsigned, unsigned char*);
+typedef void (*gl_geti_t)(unsigned, int*);
+static void* g_glib = nullptr;
+static gl_loc_t f_getuloc = nullptr, f_getaloc = nullptr;
+static gl_unifv_t f_unifv = nullptr;
+static gl_unifiv_t f_unifiv = nullptr;
+static gl_vaiv_t f_vaiv = nullptr;
+static gl_vaptr_t f_vaptr = nullptr;
+static gl_isen_t f_isen = nullptr;
+static gl_getb_t f_getb = nullptr;
+static gl_geti_t f_geti = nullptr;
+static bool g_capturing = false, g_cap_mat = false;
+static unsigned g_cap_draws = 0;
+static FILE* g_cap_f = nullptr;
+
+static void* glib() { if (!g_glib) g_glib = dlopen("libGLESv2.so", RTLD_NOW); return g_glib; }
+static void cap_init() {
+  void* L = glib();
+  if (!L || f_geti) return;
+  f_getuloc = (gl_loc_t)dlsym(L, "glGetUniformLocation");
+  f_getaloc = (gl_loc_t)dlsym(L, "glGetAttribLocation");
+  f_unifv = (gl_unifv_t)dlsym(L, "glGetUniformfv");
+  f_unifiv = (gl_unifiv_t)dlsym(L, "glGetUniformiv");
+  f_vaiv = (gl_vaiv_t)dlsym(L, "glGetVertexAttribiv");
+  f_vaptr = (gl_vaptr_t)dlsym(L, "glGetVertexAttribPointerv");
+  f_isen = (gl_isen_t)dlsym(L, "glIsEnabled");
+  f_getb = (gl_getb_t)dlsym(L, "glGetBooleanv");
+  f_geti = (gl_geti_t)dlsym(L, "glGetIntegerv");
+}
+
+static void cap_print_uniform(FILE* f, unsigned prog, const char* name, int n) {
+  int loc = f_getuloc ? f_getuloc(prog, name) : -1;
+  if (loc < 0 || !f_unifv) { fprintf(f, "  %s: tidak ada\n", name); return; }
+  float v[16] = {0};
+  f_unifv(prog, loc, v);
+  fprintf(f, "  %s:", name);
+  for (int i = 0; i < n; i++) fprintf(f, " %g", v[i]);
+  fprintf(f, "\n");
+}
+
+static void capture_draw(ProgStat* s, unsigned mode, int count, unsigned type, const void* idx) {
+  cap_init();
+  if (!g_cap_f || !f_geti || !f_isen || !f_getb) return;
+  unsigned n = g_cap_draws++;
+  if (n >= 80) return;
+  FILE* f = g_cap_f;
+  unsigned id = s->id;
+  int vbo = 0, ibo = 0, fbo = 0, vp[4] = {0, 0, 0, 0};
+  unsigned char dm = 0;
+  f_geti(0x8894, &vbo); f_geti(0x8895, &ibo); f_geti(0x8CA6, &fbo); f_geti(0x0BA2, vp); f_getb(0x0B72, &dm);
+  fprintf(f, "T2 draw#%u prog=%u mode=0x%x count=%d type=0x%x idx=%p vbo=%d ibo=%d fbo=%d vp=%d,%d,%d,%d blend=%d cull=%d depth=%d dmask=%d\n",
+          n, id, mode, count, type, idx, vbo, ibo, fbo, vp[0], vp[1], vp[2], vp[3],
+          (int)f_isen(0x0BE2), (int)f_isen(0x0B44), (int)f_isen(0x0B71), (int)dm);
+  static const char* an[4] = {"POSITION", "COLOR", "TEXCOORD_0", "TEXCOORD_1"};
+  for (int i = 0; i < 4; i++) {
+    int loc = f_getaloc ? f_getaloc(id, an[i]) : -1;
+    if (loc < 0 || !f_vaiv || !f_vaptr) { fprintf(f, "  attr %s: tidak ada\n", an[i]); continue; }
+    int en = 0, sz = 0, ty = 0, nm = 0, st = 0, bb = 0; void* po = nullptr;
+    f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+    f_vaiv(loc, 0x886A, &nm); f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb);
+    f_vaptr(loc, 0x8645, &po);
+    fprintf(f, "  attr %s loc=%d en=%d size=%d type=0x%x norm=%d stride=%d off=%p buf=%d\n", an[i], loc, en, sz, ty, nm, st, po, bb);
+  }
+  cap_print_uniform(f, id, "CHUNK_ORIGIN_AND_SCALE", 4);
+  cap_print_uniform(f, id, "VIEW_POS", 3);
+  cap_print_uniform(f, id, "FOG_CONTROL", 2);
+  if (f_getuloc && f_unifiv) {
+    int t0 = -1, t1 = -1, l0 = f_getuloc(id, "TEXTURE_0"), l1 = f_getuloc(id, "TEXTURE_1");
+    if (l0 >= 0) f_unifiv(id, l0, &t0);
+    if (l1 >= 0) f_unifiv(id, l1, &t1);
+    fprintf(f, "  TEXTURE_0 unit=%d, TEXTURE_1 unit=%d\n", t0, t1);
+  }
+  if (!g_cap_mat) {   // matriks cukup sekali per frame
+    g_cap_mat = true;
+    cap_print_uniform(f, id, "WORLDVIEW", 16);
+    cap_print_uniform(f, id, "PROJ", 16);
+  }
+}
+
+static void spy_use_program(GLuint_t p) {
+  g_cur_prog = p;
+  if (p) {
+    ProgStat* s = prog_stat(p);
+    if (s->kind == 0) {   // program terrain = yang punya uniform CHUNK_ORIGIN_AND_SCALE
+      cap_init();
+      int loc = f_getuloc ? f_getuloc(p, "CHUNK_ORIGIN_AND_SCALE") : -1;
+      s->kind = loc >= 0 ? 1 : 2;
+    }
+  }
+  o_useprog(p);
+}
 static void spy_draw_elements(unsigned mode, int count, unsigned type, const void* idx) {
   ProgStat* s = prog_stat(g_cur_prog);
   s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = type;
+  if (g_capturing && s->kind == 1) capture_draw(s, mode, count, type, idx);
   o_drawel(mode, count, type, idx);
 }
 static void spy_draw_arrays(unsigned mode, int first, int count) {
@@ -300,6 +400,14 @@ static void describe_program(FILE* f, void* lib, unsigned id) {
 
 static unsigned spy_swap(void* dpy, void* surf) {
   g_frames++;
+  if (g_capturing) {
+    g_capturing = false;
+    if (g_cap_f) { fprintf(g_cap_f, "T2 selesai frame=%u, total draw terrain=%u\n", g_frames, g_cap_draws); fclose(g_cap_f); g_cap_f = nullptr; }
+  }
+  if (g_frames == 500 || g_frames == 1000 || g_frames == 1500) {
+    g_cap_f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (g_cap_f) { g_capturing = true; g_cap_draws = 0; g_cap_mat = false; fprintf(g_cap_f, "T2 mulai frame=%u\n", g_frames); }
+  }
   void* lib = dlopen("libGLESv2.so", RTLD_NOW);
   if (!g_gl_info_done && g_frames >= 60 && lib) {
     g_gl_info_done = true;
@@ -322,7 +430,7 @@ static unsigned spy_swap(void* dpy, void* surf) {
     }
     if (f) fclose(f);
   }
-  if (g_frames % 300 == 0 && g_summaries < 4) {
+  if (g_frames % 300 == 0 && g_summaries < 1) {
     g_summaries++;
     FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
     if (f) {
