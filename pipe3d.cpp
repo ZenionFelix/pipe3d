@@ -241,7 +241,7 @@ static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
 struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
-  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[2]; int vp_state; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -453,8 +453,7 @@ static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
   X(void, DisableVertexAttribArray, (unsigned)) \
   X(void, UniformMatrix4fv, (int, int, unsigned char, const float*)) \
   X(void, Uniform1i, (int, int)) \
-  X(void, Uniform2f, (int, float, float)) \
-  X(void, Uniform3f, (int, float, float, float)) \
+    X(void, Uniform3f, (int, float, float, float)) \
   X(void, Uniform4f, (int, float, float, float, float)) \
   X(void, DrawElements, (unsigned, int, unsigned, const void*)) \
   X(unsigned, CreateShader, (unsigned)) \
@@ -825,12 +824,12 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
   if (g_level < 3) return false;
   bool want = g_lvp_valid && g_delta_ok && sun_enabled();
   if (!want) {
-    if (s->vp_state == 1 && s->loc_vp >= 0) { gx.Uniform2f(s->loc_vp, s->vp_orig[0], s->vp_orig[1]); s->vp_state = 0; }
+    if (s->vp_state == 1 && s->loc_vp >= 0) { gx.Uniform3f(s->loc_vp, s->vp_orig[0], s->vp_orig[1], s->vp_orig[2]); s->vp_state = 0; }
     return false;
   }
   if (s->loc_vp < 0 || s->loc_cc < 0 || s->loc_t2 < 0) return false;   // shader belum memuat jalur bayangan
   static bool first_set = true;
-  if (first_set) { first_set = false; bc("parameter bayangan pertama diisi lewat uniform bawaan"); }
+  if (first_set) { first_set = false; bc("parameter bayangan pertama diisi lewat VIEW_DIRECTION dan CURRENT_COLOR"); }
   if (s->vp_state == 0) f_unifv(s->id, s->loc_vp, s->vp_orig);   // simpan nilai asli supaya bisa dipulihkan
   // pergeseran kisi: peta dibuat di koordinat kamera frame sebelumnya, jadi tambahkan selisih kamera (g_delta)
   float ox = g_ox0 + g_bs[0] * g_delta[0] + g_bs[1] * g_delta[1] + g_bs[2] * g_delta[2];
@@ -838,8 +837,8 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
   float oz = g_bf[0] * g_delta[0] + g_bf[1] * g_delta[1] + g_bf[2] * g_delta[2];
   float cc[4] = {0, 0, 0, 1};
   f_unifv(s->id, s->loc_cc, cc);                       // .r milik game (efek fade chunk) tetap dipertahankan
-  gx.Uniform4f(s->loc_cc, cc[0], ox, oy, oz);
-  gx.Uniform2f(s->loc_vp, -(g_gen_Ly + 2.0f), g_gen_Lz);
+  gx.Uniform4f(s->loc_cc, cc[0], ox, oy, cc[3]);
+  gx.Uniform3f(s->loc_vp, -(g_gen_Ly + 2.0f), g_gen_Lz, oz);   // VIEW_DIRECTION = (-(Ly+2), Lz, oz)
   s->vp_state = 1;
   gx.Uniform1i(s->loc_t2, 2);
   f_geti(0x84E0, &g_act_prev);
@@ -1045,7 +1044,7 @@ static void spy_use_program(GLuint_t p) {
       s->loc_proj = f_getuloc ? f_getuloc(p, "PROJ") : -1;
       s->loc_wvp = f_getuloc ? f_getuloc(p, "WORLDVIEWPROJ") : -1;
       s->loc_cc = f_getuloc ? f_getuloc(p, "CURRENT_COLOR") : -1;
-      s->loc_vp = f_getuloc ? f_getuloc(p, "VIEWPORT_DIMENSION") : -1;
+      s->loc_vp = f_getuloc ? f_getuloc(p, "VIEW_DIRECTION") : -1;   // uniform bawaan engine yang dipinjam untuk arah matahari
       s->loc_t2 = f_getuloc ? f_getuloc(p, "TEXTURE_2") : -1;
       s->vp_state = 0;
     }
