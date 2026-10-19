@@ -246,6 +246,7 @@ static const bool FP_BODY = true;               // false = perilaku asli game
 static const float FP_BACK = 3.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
 static bool g_fp_now = false;                   // true selama model pemain sendiri digambar saat first person
 static const bool FP_HIDE_VIEWMODEL = true;     // matikan tangan dan item bawaan layar saat first person (badan yang memegang item)
+static const bool FP_ARM_POSE = false;          // true = tangan kanan diangkat ke depan saat memegang item (item jadi tidak menyatu dengan tangan, jadi dimatikan: posisi tangan seperti semula)
 static const float FP_ARM_X = -1.5f;            // sudut tangan kanan yang memegang item saat first person (negatif = ke depan, -1.57 = lurus ke depan)
 static const float FP_ARM_SWING = 0.4f;         // ayunan tangan saat berjalan dikecilkan segini saat first person
 static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
@@ -500,7 +501,7 @@ static void* hook_setup_anim(void* self, float a1, float a2, float a3, float a4,
   }
 
   // First person: tangan kanan memegang item lurus ke depan (terlihat di kanan bawah), ayunan jalan dikecilkan
-  if (g_fp_now && !riding && attack <= 0) {
+  if (FP_ARM_POSE && g_fp_now && !riding && attack <= 0) {
     if (g_fp_holding) ra[6] = FP_ARM_X; else ra[6] *= FP_ARM_SWING;
     la[6] *= FP_ARM_SWING;
   }
