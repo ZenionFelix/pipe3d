@@ -1,4 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
+// + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
 // Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
 // Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
@@ -499,7 +500,7 @@ static void gx_init() {
 }
 
 // ---- pengaturan ----
-static int g_cfg_on = 1, g_cfg_size = 4096, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
+static int g_cfg_on = 1, g_cfg_size = 1024, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
 static float g_cfg_radius = 56.0f, g_cfg_bias = 0.12f;
 static bool g_cfg_loaded = false;
 static void cfg_load() {
@@ -511,7 +512,7 @@ static void cfg_load() {
   while (fgets(line, sizeof(line), f)) {
     int iv; float fv;
     if (sscanf(line, "on=%d", &iv) == 1) g_cfg_on = iv;
-    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 4096;
+    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 1024;
     else if (sscanf(line, "capture=%d", &iv) == 1) g_cfg_capture = iv;
     else if (sscanf(line, "level=%d", &iv) == 1) g_cfg_level = (iv < 0) ? 0 : (iv > 4 ? 4 : iv);
     else if (sscanf(line, "playerbox=%d", &iv) == 1) g_cfg_playerbox = iv;
@@ -575,7 +576,7 @@ static void guard_arm() {
 static int g_sh_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
 static unsigned g_sh_tex = 0, g_sh_fbo = 0, g_sh_prog = 0, g_sh_ctex = 0;
 static int g_sh_loc_lvp = -1, g_sh_loc_org = -1, g_sh_loc_tex = -1;
-static int g_sh_size = 4096;
+static int g_sh_size = 1024;
 static unsigned g_eh_prog = 0, g_cube_vbo = 0, g_cube_ibo = 0;
 static int g_eh_loc = -1;
 static const float SH_DEPTH_D = 160.0f;   // jarak mata cahaya dari pusat; kedalaman total = 2 * D
@@ -1396,6 +1397,112 @@ static void install_gl_spy() {
   }
 }
 
+// ===================== GUNUNG TINGGI (patch biome) =====================
+// Biome::setDepthAndScale(BiomeHeight const&) hanya 5 instruksi Thumb:
+//   ldr r2,[r1]; str r2,[r0,#0x64]; ldr r1,[r1,#4]; str r1,[r0,#0x68]; bx lr
+// 8 byte pertama (4 instruksi) tidak bergantung posisi, jadi aman dipindah ke trampolin install_hook.
+// depth di Biome+0x64, scale di Biome+0x68. Tinggi dunia tetap maksimal 127, jadi puncak dibatasi.
+static const uintptr_t OFF_SET_DEPTH_SCALE = 0xCA5FB5;   // Biome::setDepthAndScale
+static const uint8_t SIG_SET_DEPTH_SCALE[8] = {0x0a, 0x68, 0x42, 0x66, 0x49, 0x68, 0x81, 0x66};
+static const uintptr_t OFF_HEIGHTS_MOUNTAINS = 0x1704C08; // Biome::HEIGHTS_MOUNTAINS {depth, scale}
+static const uintptr_t OFF_HEIGHTS_HIGHLANDS = 0x1704C10; // Biome::HEIGHTS_HIGHLANDS
+static const uintptr_t OFF_HEIGHTS_EXTREME   = 0x1704C18; // Biome::HEIGHTS_EXTREME
+static const uintptr_t OFF_BIOMES = 0x1704D58;            // Biome::mBiomes[256] (penunjuk Biome*)
+static const int BIOME_DEPTH_OFF = 0x64;
+static const int BIOME_SCALE_OFF = 0x68;
+
+typedef void (*SetDepthScaleFn)(void* self, const float* h);
+static SetDepthScaleFn orig_set_depth_scale = nullptr;
+static uintptr_t g_base = 0;
+static float g_depth_mul = 1.0f, g_depth_add = 0.4f, g_scale_mul = 1.6f;
+static float g_depth_max = 2.5f, g_scale_max = 2.0f;
+static int g_biome_enabled = 1;
+
+static void load_biome_config() {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome.txt", "r");
+  if (!f) return;
+  char line[128];
+  while (fgets(line, sizeof(line), f)) {
+    char key[40]; float v;
+    if (sscanf(line, " %39[^=]=%f", key, &v) != 2) continue;
+    if (!strcmp(key, "enabled")) g_biome_enabled = (int)v;
+    else if (!strcmp(key, "depth_mul")) g_depth_mul = v;
+    else if (!strcmp(key, "depth_add")) g_depth_add = v;
+    else if (!strcmp(key, "scale_mul")) g_scale_mul = v;
+    else if (!strcmp(key, "depth_max")) g_depth_max = v;
+    else if (!strcmp(key, "scale_max")) g_scale_max = v;
+  }
+  fclose(f);
+}
+
+// Apakah (d,s) sama dengan salah satu tinggi gunung bawaan?
+static bool is_mountain_height(float d, float s) {
+  const uintptr_t offs[3] = {OFF_HEIGHTS_MOUNTAINS, OFF_HEIGHTS_HIGHLANDS, OFF_HEIGHTS_EXTREME};
+  for (int i = 0; i < 3; i++) {
+    const float* h = (const float*)(g_base + offs[i]);
+    if (h[0] == d && h[1] == s) return true;
+  }
+  return false;
+}
+
+static void boost_biome(uint8_t* biome) {
+  float* pd = (float*)(biome + BIOME_DEPTH_OFF);
+  float* ps = (float*)(biome + BIOME_SCALE_OFF);
+  float d = *pd * g_depth_mul + g_depth_add;
+  float s = *ps * g_scale_mul;
+  if (d > g_depth_max) d = g_depth_max;
+  if (s > g_scale_max) s = g_scale_max;
+  *pd = d; *ps = s;
+}
+
+static void hook_set_depth_scale(void* self, const float* h) {
+  orig_set_depth_scale(self, h);
+  if (g_biome_enabled && is_mountain_height(h[0], h[1])) boost_biome((uint8_t*)self);
+}
+
+// Cadangan kalau initBiomes sudah jalan sebelum hook terpasang: periksa biome yang sudah ada.
+// Aman dijalankan berulang: biome yang sudah dinaikkan nilainya tidak lagi sama dengan nilai bawaan.
+static void* biome_sweep(void*) {
+  bool logged = false;
+  for (int round = 0; round < 40; round++) {
+    sleep(3);
+    for (int i = 0; i < 256; i++) {
+      uint8_t* b = *(uint8_t**)(g_base + OFF_BIOMES + i * 4);
+      if (!b) continue;
+      float d = *(float*)(b + BIOME_DEPTH_OFF), s = *(float*)(b + BIOME_SCALE_OFF);
+      if (!logged) {
+        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome_log.txt", "a");
+        if (f) { fprintf(f, "biome id=%d depth=%f scale=%f gunung=%d\n", i, d, s, (int)is_mountain_height(d, s)); fclose(f); }
+      }
+      if (g_biome_enabled && is_mountain_height(d, s)) {
+        boost_biome(b);
+        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome_log.txt", "a");
+        if (f) { fprintf(f, "sweep: biome id=%d dinaikkan\n", i); fclose(f); }
+      }
+    }
+    logged = true;
+  }
+  return nullptr;
+}
+
+static void install_biome_patch(uintptr_t base) {
+  g_base = base;
+  load_biome_config();
+  uintptr_t target = base + OFF_SET_DEPTH_SCALE;
+  if (memcmp((void*)(target & ~(uintptr_t)1), SIG_SET_DEPTH_SCALE, 8) != 0) {
+    LOG("biome: tanda fungsi tidak cocok, patch gunung dibatalkan");
+    return;
+  }
+  if (install_hook(target & ~(uintptr_t)1, (void*)hook_set_depth_scale, (void**)&orig_set_depth_scale))
+    LOG("biome: hook setDepthAndScale terpasang (enabled=%d depth_add=%.2f scale_mul=%.2f)", g_biome_enabled, g_depth_add, g_scale_mul);
+  else
+    LOG("biome: hook gagal dipasang");
+  pthread_t th;
+  pthread_create(&th, nullptr, biome_sweep, nullptr);
+  pthread_detach(th);
+}
+// =======================================================================
+
 static void* worker(void*) {
   uintptr_t base = 0;
   for (int i = 0; i < 600 && !base; i++) {   // tunggu sampai 60 detik
@@ -1404,6 +1511,7 @@ static void* worker(void*) {
   }
   if (!base) { LOG("libminecraftpe.so tidak ditemukan"); return nullptr; }
   install_gl_spy();   // tahap 1: hanya mencatat, tidak mengubah tampilan
+  install_biome_patch(base);   // gunung tinggi (lihat bagian GUNUNG TINGGI)
   uintptr_t target = base + OFF_TESS_BLOCK;
   if (memcmp((void*)target, SIG_TESS_BLOCK, 8) != 0) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
