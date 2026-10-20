@@ -1,6 +1,10 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
+// Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
+// Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
+// Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
+// dicatat kotak kecil (matahari/bulan) beserta matriks dan posisi vertexnya, untuk menghitung arah matahari asli.
+// Pencatatan pertama lengkap (urutan semua draw), berikutnya ringkas supaya log tidak membengkak.
 // Versi 11: meja kerja (kotak) + tungku ke lapisan transparan + daun bentuk video (dua atap bersilang, dua lapis rapat, bidang penuh 16px miring 45 derajat, warna lebih terang) + log kecil.
-// Versi 12: + animasi karakter (napas, jalan/lari halus, kepala halus, sneak halus, tangan berpegas, kaki terangkat saat melangkah) lewat hook HumanoidModel::render + setupAnim; first person: badan pemain terlihat (kepala disembunyikan, tangan dan item bawaan layar dimatikan, tangan badan memegang item). Kode blok dan daun tidak diubah.
 #include <android/log.h>
 #include <link.h>
 #include <pthread.h>
@@ -9,8 +13,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <math.h>
+#include <dlfcn.h>
 #include <time.h>
+#include <elf.h>
+#include <math.h>
+#include <stdarg.h>
 
 #define TAG "pipe3d"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -207,417 +214,1186 @@ static bool install_hook(uintptr_t target, void* hook, void** orig_out) {
   return true;
 }
 
-// ======================= Animasi karakter (HumanoidModel) =======================
-// Pendekatan: panggil setupAnim asli, lalu tambah gerakan kecil ke sudut/posisi bagian badan.
-// Letak bagian di dalam HumanoidModel (tiap bagian ModelPart besarnya 0xB8 byte):
-//   posisi x,y,z di +0,+4,+8 (y positif = ke bawah), sudut putar x,y,z di +0x18,+0x1C,+0x20 (radian)
-static const uintptr_t OFF_SETUP_ANIM = 0x910B80;   // HumanoidModel::setupAnim(float x6)
-static const uint8_t SIG_SETUP_ANIM[8] = {0x2d, 0xe9, 0xf0, 0x41, 0x2d, 0xed, 0x0a, 0x8b};
-static const uintptr_t OFF_RENDER = 0x910940;       // HumanoidModel::render(Entity&, float x6)
-static const uint8_t SIG_RENDER[8] = {0x2d, 0xe9, 0xf0, 0x48, 0x2d, 0xed, 0x08, 0x8b};
-static const uintptr_t OFF_ERD_RENDER = 0x9C2C48;    // EntityRenderDispatcher::render(Entity&, float)
-static const uint8_t SIG_ERD_RENDER[8] = {0x70, 0xb5, 0x8a, 0xb0, 0x05, 0x46, 0x07, 0xa8};
-static const uintptr_t OFF_CARRIED = 0x9DE924;       // PlayerRenderer::prepareCarriedItem(Model&, Mob&, ItemInstance*)
-static const uint8_t SIG_CARRIED[8] = {0x70, 0xb5, 0x1c, 0x46, 0x0d, 0x46, 0x06, 0x46};
-static const uintptr_t OFF_IIH_RENDER = 0x9FD6A0;    // ItemInHandRenderer::render(bool, float): tangan dan item bawaan layar
-static const uint8_t SIG_IIH_RENDER[10] = {0x2d, 0xe9, 0xf0, 0x4f, 0x81, 0xb0, 0x2d, 0xed, 0x10, 0x8b};
-static const int P_HEAD = 0xF0, P_HAT = 0x1A8, P_BODY = 0x260;
-static const int P_RARM = 0x318, P_LARM = 0x3D0, P_RLEG = 0x488, P_LLEG = 0x540;
-static const int M_SNEAK = 0x5F8;    // byte: sedang sneak (diisi sebelum render)
-static const int M_RIDING = 0x19;    // byte: sedang menunggang
-static const int M_ATTACK = 0x14;    // float: progres ayunan serangan
-
-// Angka yang bisa diatur (kalau gerakan terasa kurang/terlalu)
-static const float SNEAK_TIME = 0.20f;    // detik untuk masuk/keluar sneak
-static const float HEAD_TAU = 0.07f;      // makin besar, kepala makin lambat menyusul
-static const float BREATH_SPEED = 1.9f;   // radian per detik (sekitar 3 detik per tarikan napas)
-static const float BREATH_AMP = 0.30f;    // naik-turun badan (piksel model)
-static const float BREATH_SWAY = 0.035f;  // goyang tangan saat diam (radian)
-static const float WALK_BOB = 0.70f;      // badan naik tiap langkah (piksel model)
-static const float WALK_TWIST = 0.10f;    // badan memutar tiap langkah (radian); balik tanda kalau arahnya terasa terbalik
-static const float RUN_LEAN = 0.12f;      // badan condong ke depan saat lari (radian)
-static const float LEG_LIFT = 1.6f;       // kaki terangkat saat mengayun ke depan (piksel model)
-static const float ARM_K = 300.0f;        // kekakuan pegas tangan (makin besar, makin cepat menyusul)
-static const float ARM_C = 22.0f;         // redaman pegas tangan (makin kecil, makin banyak memantul)
-
-// ---- First person: badan pemain ikut digambar ----
-// Game melewati pemain sendiri saat pengaturan kamera = 0 (first person). Tiga titik 'lewati' itu di-NOP.
-static const bool FP_BODY = true;               // false = perilaku asli game
-static const float FP_BACK = 3.0f;              // geser badan ke belakang saat first person (piksel model, 16 piksel = 1 blok); kalau masih terlalu dekat, naikkan
-static bool g_fp_now = false;                   // true selama model pemain sendiri digambar saat first person
-static const bool FP_HIDE_VIEWMODEL = true;     // matikan tangan dan item bawaan layar saat first person (badan yang memegang item)
-static const bool FP_ARM_POSE = false;          // true = tangan kanan diangkat ke depan saat memegang item (item jadi tidak menyatu dengan tangan, jadi dimatikan: posisi tangan seperti semula)
-static const float FP_ARM_X = -1.5f;            // sudut tangan kanan yang memegang item saat first person (negatif = ke depan, -1.57 = lurus ke depan)
-static const float FP_ARM_SWING = 0.4f;         // ayunan tangan saat berjalan dikecilkan segini saat first person
-static const bool FP_HIDE_HEAD = true;          // sembunyikan kepala dan topi saat first person (kalau tidak, menutupi layar)
-static const uintptr_t OFF_ERD_PTR = 0x16B4708;     // EntityRenderer::entityRenderDispatcher (static)
-static const int ERD_CLIENT = 0xC, ERD_CAMERA = 0x1C;   // isi EntityRenderDispatcher: MinecraftClient*, Entity* kamera
-static const int PART_VISIBLE = 0x25;           // byte 'terlihat' di tiap ModelPart (0 = tidak digambar)
-static const uintptr_t OFF_GET_OPT = 0x597D64, OFF_GET_INT = 0x598154;   // dua pemanggilan yang dipakai game untuk membaca pengaturan third person
-typedef void* (*GetOptFn)(void* client);
-typedef int (*GetIntFn)(void* opt);
-static uintptr_t g_mc_base = 0;
-static GetOptFn g_get_opt = nullptr;
-static GetIntFn g_get_int = nullptr;
-static bool fp_logged = false;
-
-static int g_world_depth = 0;        // > 0 selama LevelRenderer menggambar entitas dunia (bukan avatar HUD/inventori)
-static void* g_hold_mob = nullptr;   // pemain terakhir yang dicek prepareCarriedItem
-static void* g_hold_item = nullptr;  // item yang dipegang pemain itu (null = tangan kosong)
-static bool g_fp_holding = false;
-
-// true bila kamera sedang first person (Options::getPlayerViewPerspective() == 0)
-static bool first_person_view() {
-  if (!g_mc_base || !g_get_opt || !g_get_int) return false;
-  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
-  if (!erd) return false;
-  void* client = *(void**)((uint8_t*)erd + ERD_CLIENT);
-  if (!client) return false;
-  return g_get_int(g_get_opt(client)) == 0;
-}
-
-// true bila 'ent' adalah pemain sendiri, digambar di dunia (bukan avatar HUD), dan kamera first person
-static bool is_first_person_self(void* ent) {
-  if (g_world_depth <= 0 || !ent || !g_mc_base) return false;
-  void* erd = *(void**)(g_mc_base + OFF_ERD_PTR);
-  if (!erd) return false;
-  if (*(void**)((uint8_t*)erd + ERD_CAMERA) != ent) return false;
-  return first_person_view();
-}
-
-// Semua fungsi asli dipanggil lewat tipe yang mengembalikan void*: game kadang memakai r0 sesudah pemanggilan
-// (mis. ERD::render mengembalikan EntityRenderer* yang langsung dipakai pemanggilnya), jadi hook harus meneruskannya.
-typedef void* (*SetupAnimFn)(void* self, float a1, float a2, float a3, float a4, float a5, float a6);
-typedef void* (*RenderFn)(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6);
-static SetupAnimFn orig_setup_anim = nullptr;
-static RenderFn orig_render = nullptr;
-static void* g_cur_mob = nullptr;     // makhluk yang sedang digambar (dicatat hook render)
-static double g_cur_mob_time = 0;
-static bool anim_logged = false;
-
-static const int PART_OFFS[7] = {P_HEAD, P_HAT, P_BODY, P_RARM, P_LARM, P_RLEG, P_LLEG};
-static float* part(void* self, int off) { return (float*)((uint8_t*)self + off); }
-static void snap_pose(void* self, float out[7][6]) {
-  for (int i = 0; i < 7; i++) {
-    float* p = part(self, PART_OFFS[i]);
-    out[i][0] = p[0]; out[i][1] = p[1]; out[i][2] = p[2];
-    out[i][3] = p[6]; out[i][4] = p[7]; out[i][5] = p[8];
-  }
-}
-static void put_pose(void* self, const float in[7][6]) {
-  for (int i = 0; i < 7; i++) {
-    float* p = part(self, PART_OFFS[i]);
-    p[0] = in[i][0]; p[1] = in[i][1]; p[2] = in[i][2];
-    p[6] = in[i][3]; p[7] = in[i][4]; p[8] = in[i][5];
-  }
-}
-
-// Keadaan per makhluk (model dipakai bersama oleh banyak mob, jadi tidak boleh disimpan di model)
-struct AnimState { void* key; double last; float hy, hp, sneak; float ax[2], av[2]; bool used; };
-static AnimState g_states[32];
-static AnimState* get_state(void* key) {
-  AnimState* oldest = &g_states[0];
-  for (int i = 0; i < 32; i++) {
-    if (g_states[i].used && g_states[i].key == key) return &g_states[i];
-    if (!g_states[i].used) { oldest = &g_states[i]; break; }
-    if (g_states[i].last < oldest->last) oldest = &g_states[i];
-  }
-  oldest->used = true; oldest->key = key; oldest->last = -1; oldest->hy = oldest->hp = oldest->sneak = 0;
-  oldest->ax[0] = oldest->ax[1] = oldest->av[0] = oldest->av[1] = 0;
-  return oldest;
-}
-// Foto kondisi model sebelum digambar. Semua tambahan gerak hanya berlaku selama satu penggambaran entitas di dunia,
-// lalu model dikembalikan persis ke foto ini. Jadi tidak ada yang bisa menumpuk dari frame ke frame
-// (setupAnim asli tidak mereset posisi-y badan/tangan, dan model dipakai bersama banyak makhluk).
-struct Touched { void* self; float e[7][6]; };
-static Touched g_touched[24];
-static int g_ntouched = 0;
-static bool g_effects_ok = false;     // true selama model yang sedang digambar punya foto
-static Touched* find_touched(void* self) {
-  for (int i = 0; i < g_ntouched; i++) if (g_touched[i].self == self) return &g_touched[i];
-  return nullptr;
-}
-static double now_sec() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-typedef void* (*ErdRenderFn)(void* self, void* ent, float pt);
-typedef void* (*CarriedFn)(void* self, void* model, void* mob, void* item);
-typedef void* (*IihRenderFn)(void* self, bool a, float b);
-static ErdRenderFn orig_erd_render = nullptr;
-static CarriedFn orig_carried = nullptr;
-static IihRenderFn orig_iih_render = nullptr;
-
-// Penggambaran entitas dunia: tandai supaya avatar HUD/inventori tidak ikut terkena aturan first person
-static void* hook_erd_render(void* self, void* ent, float pt) {
-  int start = g_ntouched;
-  g_world_depth++;
-  void* ret = orig_erd_render(self, ent, pt);   // EntityRenderer* : dipakai langsung oleh pemanggil (hasWaterHole), wajib diteruskan
-  g_world_depth--;
-  // Kembalikan semua model yang disentuh selama penggambaran entitas ini ke kondisi semula
-  for (int i = g_ntouched - 1; i >= start; i--) put_pose(g_touched[i].self, g_touched[i].e);
-  g_ntouched = start;
-  return ret;
-}
-
-// Catat apakah pemain memegang item (dipanggil game sebelum menggambar model)
-static void* hook_carried(void* self, void* model, void* mob, void* item) {
-  g_hold_mob = mob; g_hold_item = item;
-  return orig_carried(self, model, mob, item);
-}
-
-// Tangan dan item bawaan layar: dilewati saat first person (badan yang memegang item)
-static void* hook_iih_render(void* self, bool a, float b) {
-  if (FP_BODY && FP_HIDE_VIEWMODEL && first_person_view()) return nullptr;
-  return orig_iih_render(self, a, b);
-}
-
-// Pegas redam: sudut tangan menyusul target dengan sedikit tertinggal dan memantul lunak
-static void spring_step(float* x, float* v, float target, float dt) {
-  if (dt <= 0) return;
-  const int n = 2;
-  float h = dt / n;
-  for (int i = 0; i < n; i++) {
-    float a = ARM_K * (target - *x) - ARM_C * (*v);
-    *v += a * h;
-    *x += *v * h;
-  }
-}
-
-static void* hook_render(void* self, void* ent, float a1, float a2, float a3, float a4, float a5, float a6) {
-  g_cur_mob = ent;
-  g_cur_mob_time = now_sec();
-  Touched* tch = nullptr;
-  if (g_world_depth > 0) {
-    tch = find_touched(self);
-    if (!tch && g_ntouched < 24) { tch = &g_touched[g_ntouched++]; tch->self = self; snap_pose(self, tch->e); }
-  }
-  g_effects_ok = tch != nullptr;
-  bool fps = FP_BODY && is_first_person_self(ent);
-  bool fp = fps && FP_HIDE_HEAD;
-  g_fp_now = fps;
-  g_fp_holding = fps && g_hold_mob == ent && g_hold_item != nullptr;
-  uint8_t* head_vis = (uint8_t*)self + P_HEAD + PART_VISIBLE;
-  uint8_t* hat_vis = (uint8_t*)self + P_HAT + PART_VISIBLE;
-  uint8_t old_head = *head_vis, old_hat = *hat_vis;
-  if (fp) {
-    *head_vis = 0; *hat_vis = 0;
-    if (!fp_logged) {
-      fp_logged = true;
-      FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-      if (f) { fprintf(f, "fp: pemain sendiri digambar saat first person, ent=%p\n", ent); fclose(f); }
-    }
-  }
-  void* ret = orig_render(self, ent, a1, a2, a3, a4, a5, a6);
-  if (fp) { *head_vis = old_head; *hat_vis = old_hat; }   // model dipakai bersama makhluk lain, kembalikan
-  g_fp_now = false;
-  g_fp_holding = false;
-  g_effects_ok = false;
-  g_cur_mob = nullptr;
-  return ret;
-}
-
-static void* hook_setup_anim(void* self, float a1, float a2, float a3, float a4, float a5, float a6) {
-  // Di luar penggambaran entitas dunia (avatar HUD, inventori, dsb.) tidak ada efek sama sekali
-  Touched* tch = g_effects_ok ? find_touched(self) : nullptr;
-  if (!tch) return orig_setup_anim(self, a1, a2, a3, a4, a5, a6);
-  void* ret = nullptr;
-  double now = now_sec();
-  uint8_t* sneak_flag = (uint8_t*)self + M_SNEAK;
-  uint8_t real_sneak = *sneak_flag;
-  void* key = (g_cur_mob && now - g_cur_mob_time < 0.05) ? g_cur_mob : self;
-  AnimState* st = get_state(key);
-  bool fresh = (st->last < 0 || now - st->last > 1.0);
-  float dt = fresh ? 0.0f : (float)(now - st->last);
-  if (dt > 0.1f) dt = 0.1f;
-  st->last = now;
-
-  put_pose(self, tch->e);   // mulai dari kondisi bersih (foto), bukan dari sisa frame sebelumnya
-
-  // 1. Sneak halus: hitung pose tanpa dan dengan sneak, lalu campur sesuai st->sneak
-  float target = real_sneak ? 1.0f : 0.0f;
-  if (fresh) st->sneak = target;
-  else if (st->sneak < target) { st->sneak += dt / SNEAK_TIME; if (st->sneak > target) st->sneak = target; }
-  else if (st->sneak > target) { st->sneak -= dt / SNEAK_TIME; if (st->sneak < target) st->sneak = target; }
-  float s = st->sneak;
-  if (s <= 0.001f || s >= 0.999f) {
-    *sneak_flag = (s >= 0.5f) ? 1 : 0;
-    ret = orig_setup_anim(self, a1, a2, a3, a4, a5, a6);
-  } else {
-    float A[7][6], B[7][6], M[7][6];
-    *sneak_flag = 0; ret = orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, A);
-    *sneak_flag = 1; ret = orig_setup_anim(self, a1, a2, a3, a4, a5, a6); snap_pose(self, B);
-    float e = s * s * (3.0f - 2.0f * s);
-    for (int i = 0; i < 7; i++) for (int k = 0; k < 6; k++) M[i][k] = A[i][k] + (B[i][k] - A[i][k]) * e;
-    put_pose(self, M);
-  }
-  *sneak_flag = real_sneak;
-
-  float* head = part(self, P_HEAD);
-  float* hat = part(self, P_HAT);
-  float* body = part(self, P_BODY);
-  float* ra = part(self, P_RARM);
-  float* la = part(self, P_LARM);
-  bool riding = *((uint8_t*)self + M_RIDING) != 0;
-  float attack = *(float*)((uint8_t*)self + M_ATTACK);
-
-  // 2. Kepala menyusul arah pandang dengan halus (x = naik-turun, y = menoleh)
-  if (fresh) { st->hy = head[7]; st->hp = head[6]; }
-  else {
-    float k = 1.0f - expf(-dt / HEAD_TAU);
-    st->hy += (head[7] - st->hy) * k;
-    st->hp += (head[6] - st->hp) * k;
-  }
-  head[7] = st->hy; head[6] = st->hp;
-
-  if (!riding) {
-    float spd = a2 < 0 ? 0 : (a2 > 1 ? 1 : a2);
-    // 3. Napas saat diam: badan, kepala, dan tangan naik-turun pelan; kaki tetap
-    float idle = 1.0f - spd * 10.0f;
-    if (idle < 0 || attack > 0) idle = 0;
-    if (idle > 0) {
-      float dy = (float)sin(now * BREATH_SPEED) * BREATH_AMP * idle;
-      head[1] += dy; body[1] += dy; ra[1] += dy; la[1] += dy;
-      float sway = ((float)cos(now * BREATH_SPEED * 0.9) * 0.5f + 0.5f) * BREATH_SWAY * idle;
-      ra[8] += sway; la[8] -= sway;
-    }
-    // 4. Jalan/lari: badan naik tiap langkah, memutar sedikit, condong saat cepat
-    float w = spd * (1.0f - 0.5f * st->sneak);
-    if (w > 0) {
-      float phase = a1 * 0.6662f;
-      float bob = fabsf(sinf(phase)) * w * WALK_BOB;
-      float twist = (attack > 0) ? 0.0f : sinf(phase) * w * WALK_TWIST;
-      float lean = w * RUN_LEAN;
-      head[1] -= bob; body[1] -= bob; ra[1] -= bob; la[1] -= bob;
-      body[7] += twist; ra[7] += twist; la[7] += twist; head[7] -= twist;
-      body[6] += lean; ra[6] += lean; la[6] += lean; head[6] -= lean;
-      // Kaki terangkat saat mengayun ke depan (kaki kanan maju saat sin(fase) > 0, kiri saat < 0)
-      float sp = sinf(phase);
-      if (sp > 0) part(self, P_RLEG)[1] -= sp * w * LEG_LIFT;
-      else part(self, P_LLEG)[1] += sp * w * LEG_LIFT;
-    }
-  }
-
-  // First person: tangan kanan memegang item lurus ke depan (terlihat di kanan bawah), ayunan jalan dikecilkan
-  if (FP_ARM_POSE && g_fp_now && !riding && attack <= 0) {
-    if (g_fp_holding) ra[6] = FP_ARM_X; else ra[6] *= FP_ARM_SWING;
-    la[6] *= FP_ARM_SWING;
-  }
-
-  // 5. Tangan berpegas (tidak dipakai saat memukul atau menunggang)
-  if (fresh || riding || attack > 0) {
-    st->ax[0] = ra[6]; st->av[0] = 0;
-    st->ax[1] = la[6]; st->av[1] = 0;
-  } else {
-    float dts = dt > 0.05f ? 0.05f : dt;
-    spring_step(&st->ax[0], &st->av[0], ra[6], dts);
-    spring_step(&st->ax[1], &st->av[1], la[6], dts);
-    ra[6] = st->ax[0]; la[6] = st->ax[1];
-  }
-
-  // Topi selalu sama dengan kepala (seperti yang dilakukan setupAnim asli)
-  hat[0] = head[0]; hat[1] = head[1]; hat[2] = head[2];
-  hat[6] = head[6]; hat[7] = head[7]; hat[8] = head[8];
-
-  // First person: geser seluruh badan ke belakang supaya kamera (di posisi mata) tidak menempel ke badan
-  if (g_fp_now) {
-    for (int i = 0; i < 7; i++) part(self, PART_OFFS[i])[2] += FP_BACK;
-  }
-
-  if (!anim_logged) {
-    anim_logged = true;
-    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
-    if (f) {
-      fprintf(f, "anim: self=%p sneak=%d riding=%d attack=%f a=%f %f %f %f %f %f head=%f %f body=%f\n",
-              self, (int)real_sneak, (int)riding, attack, a1, a2, a3, a4, a5, a6, head[6], head[7], body[1]);
-      fclose(f);
-    }
-  }
-  return ret;
-}
-
-// Timpa byte kode game dengan memeriksa dulu isi aslinya (kalau beda, tidak diubah)
-static bool patch_code(uintptr_t addr, const uint8_t* expect, const uint8_t* repl, size_t n) {
-  if (memcmp((void*)addr, expect, n) != 0) return false;
-  uintptr_t page = addr & ~(uintptr_t)4095;
-  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-  memcpy((void*)addr, repl, n);
-  __builtin___clear_cache((char*)addr, (char*)addr + n);
-  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-  return true;
-}
-
-static void install_fp_patches(uintptr_t base) {
-  static const uint8_t nop2[2] = {0x00, 0xBF};
-  static const uint8_t nop4[4] = {0x00, 0xBF, 0x00, 0xBF};
-  static const uint8_t e1[4] = {0x00, 0xF0, 0x0F, 0x81};   // beq.w -> lewati (pengecekan utama)
-  static const uint8_t e2[2] = {0x62, 0xD0};               // beq   -> lewati (daftar pemain)
-  static const uint8_t e3[2] = {0x78, 0xB3};               // cbz   -> lewati (daftar pemain)
-  g_mc_base = base;
-  g_get_opt = (GetOptFn)(base + OFF_GET_OPT);
-  g_get_int = (GetIntFn)(base + OFF_GET_INT);
-  bool a = patch_code(base + 0xA0C546, e1, nop4, 4);
-  bool b = patch_code(base + 0xA0C17A, e2, nop2, 2);
-  bool c = patch_code(base + 0xA0C1E0, e3, nop2, 2);
-  LOG("fp patch: utama=%d daftar1=%d daftar2=%d", (int)a, (int)b, (int)c);
-}
-
-// Seperti install_hook, tetapi menyalin n byte awal fungsi (8 atau 10; harus tepat di batas instruksi)
-static bool install_hook_n(uintptr_t target, void* hook, void** orig_out, int n) {
-  if (n == 8) return install_hook(target, hook, orig_out);
-  if (n != 10) return false;
-  uint8_t* t = (uint8_t*)target;
-  uint8_t* tr = (uint8_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (tr == (uint8_t*)MAP_FAILED) return false;
-  memcpy(tr, t, 10);
-  tr[10] = 0x00; tr[11] = 0xBF;                                  // nop (supaya ldr.w jatuh di batas 4 byte)
-  tr[12] = 0xDF; tr[13] = 0xF8; tr[14] = 0x00; tr[15] = 0xF0;    // ldr.w pc, [pc, #0] -> alamat di tr+16
-  uint32_t back = (uint32_t)(target + 10) | 1;
-  memcpy(tr + 16, &back, 4);
-  __builtin___clear_cache((char*)tr, (char*)tr + 20);
-  *orig_out = (void*)((uintptr_t)tr | 1);
-
-  uintptr_t page = target & ~(uintptr_t)4095;
-  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-  uint8_t patch[8] = {0xDF, 0xF8, 0x00, 0xF0, 0, 0, 0, 0};
-  uint32_t h = (uint32_t)(uintptr_t)hook | 1;
-  memcpy(patch + 4, &h, 4);
-  memcpy(t, patch, 8);
-  __builtin___clear_cache((char*)t, (char*)t + 8);
-  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
-  return true;
-}
-
-static void install_anim_hooks(uintptr_t base) {
-  uintptr_t t1 = base + OFF_SETUP_ANIM, t2 = base + OFF_RENDER;
-  if (memcmp((void*)t1, SIG_SETUP_ANIM, 8) != 0 || memcmp((void*)t2, SIG_RENDER, 8) != 0) {
-    LOG("anim: tanda fungsi tidak cocok, dibatalkan");
-    return;
-  }
-  bool ok2 = install_hook(t2, (void*)hook_render, (void**)&orig_render);
-  bool ok1 = install_hook(t1, (void*)hook_setup_anim, (void**)&orig_setup_anim);
-  LOG("anim hook: setupAnim=%d render=%d", (int)ok1, (int)ok2);
-  if (FP_BODY) {
-    install_fp_patches(base);
-    // Hook tambahan untuk first person; masing-masing diperiksa tandanya dulu dan boleh gagal sendiri-sendiri
-    uintptr_t t3 = base + OFF_ERD_RENDER, t4 = base + OFF_CARRIED, t5 = base + OFF_IIH_RENDER;
-    bool ok3 = memcmp((void*)t3, SIG_ERD_RENDER, 8) == 0 && install_hook(t3, (void*)hook_erd_render, (void**)&orig_erd_render);
-    bool ok4 = memcmp((void*)t4, SIG_CARRIED, 8) == 0 && install_hook(t4, (void*)hook_carried, (void**)&orig_carried);
-    bool ok5 = FP_HIDE_VIEWMODEL && memcmp((void*)t5, SIG_IIH_RENDER, 10) == 0 &&
-               install_hook_n(t5, (void*)hook_iih_render, (void**)&orig_iih_render, 10);
-    LOG("fp hook: erdRender=%d carriedItem=%d viewmodel=%d", (int)ok3, (int)ok4, (int)ok5);
-  }
-}
-
 static int find_cb(struct dl_phdr_info* info, size_t, void* data) {
   if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
     *(uintptr_t*)data = (uintptr_t)info->dlpi_addr;
     return 1;
   }
   return 0;
+}
+
+
+// ======================= Pengintai OpenGL (tahap 1 shadow map) =======================
+// Mengganti isi tabel impor (GOT) milik libminecraftpe.so untuk beberapa fungsi GL/EGL, hanya untuk MENCATAT.
+// Hasil ada di /sdcard/games/com.mojang/pipe3d_log.txt (ringkasan tiap 300 frame, 4 kali).
+typedef unsigned int GLuint_t;
+typedef void (*fn_useprog_t)(GLuint_t);
+typedef void (*fn_drawel_t)(unsigned, int, unsigned, const void*);
+typedef void (*fn_drawar_t)(unsigned, int, int);
+typedef void (*fn_bindfb_t)(unsigned, GLuint_t);
+typedef void (*fn_viewport_t)(int, int, int, int);
+typedef unsigned (*fn_swap_t)(void*, void*);
+static fn_useprog_t o_useprog = nullptr;
+static fn_drawel_t o_drawel = nullptr;
+static fn_drawar_t o_drawar = nullptr;
+static fn_bindfb_t o_bindfb = nullptr;
+static fn_viewport_t o_viewport = nullptr;
+static fn_swap_t o_swap = nullptr;
+
+struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+static ProgStat g_prog[48];
+static int g_np = 0;
+static unsigned g_cur_prog = 0, g_cur_fbo = 0;
+static unsigned g_fbo_binds = 0, g_vp_calls = 0;
+static int g_vp_w[8], g_vp_h[8]; static unsigned g_vp_n[8]; static int g_nvp = 0;
+static unsigned g_frames = 0, g_summaries = 0;
+static bool g_gl_info_done = false;
+
+static ProgStat* prog_stat(unsigned id) {
+  for (int i = 0; i < g_np; i++) if (g_prog[i].id == id) return &g_prog[i];
+  if (g_np >= 48) return &g_prog[47];
+  ProgStat* p = &g_prog[g_np++];
+  memset(p, 0, sizeof(*p)); p->id = id;
+  return p;
+}
+
+// ---- Tahap 2: pencatatan rinci draw terrain (hanya membaca status GL, tidak mengubah apa pun) ----
+typedef int (*gl_loc_t)(unsigned, const char*);
+typedef void (*gl_unifv_t)(unsigned, int, float*);
+typedef void (*gl_unifiv_t)(unsigned, int, int*);
+typedef void (*gl_vaiv_t)(unsigned, unsigned, int*);
+typedef void (*gl_vaptr_t)(unsigned, unsigned, void**);
+typedef unsigned char (*gl_isen_t)(unsigned);
+typedef void (*gl_getb_t)(unsigned, unsigned char*);
+typedef void (*gl_geti_t)(unsigned, int*);
+typedef void* (*gl_maprange_t)(unsigned, intptr_t, intptr_t, unsigned);
+typedef unsigned char (*gl_unmap_t)(unsigned);
+static void* g_glib = nullptr;
+static gl_loc_t f_getuloc = nullptr, f_getaloc = nullptr;
+static gl_unifv_t f_unifv = nullptr;
+static gl_unifiv_t f_unifiv = nullptr;
+static gl_vaiv_t f_vaiv = nullptr;
+static gl_vaptr_t f_vaptr = nullptr;
+static gl_isen_t f_isen = nullptr;
+static gl_getb_t f_getb = nullptr;
+static gl_geti_t f_geti = nullptr;
+static gl_maprange_t f_maprange = nullptr;
+static gl_unmap_t f_unmap = nullptr;
+static unsigned g_seq = 0, g_cap_other = 0;
+static bool g_cap_full = true;
+static unsigned g_cap_count = 0;
+static double g_next_cap = 0;
+static double mono_sec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static bool g_capturing = false, g_cap_mat = false;
+static unsigned g_cap_draws = 0;
+static FILE* g_cap_f = nullptr;
+
+static void* glib() { if (!g_glib) g_glib = dlopen("libGLESv2.so", RTLD_NOW); return g_glib; }
+static void cap_init() {
+  void* L = glib();
+  if (!L || f_geti) return;
+  f_getuloc = (gl_loc_t)dlsym(L, "glGetUniformLocation");
+  f_getaloc = (gl_loc_t)dlsym(L, "glGetAttribLocation");
+  f_unifv = (gl_unifv_t)dlsym(L, "glGetUniformfv");
+  f_unifiv = (gl_unifiv_t)dlsym(L, "glGetUniformiv");
+  f_vaiv = (gl_vaiv_t)dlsym(L, "glGetVertexAttribiv");
+  f_vaptr = (gl_vaptr_t)dlsym(L, "glGetVertexAttribPointerv");
+  f_isen = (gl_isen_t)dlsym(L, "glIsEnabled");
+  f_getb = (gl_getb_t)dlsym(L, "glGetBooleanv");
+  f_geti = (gl_geti_t)dlsym(L, "glGetIntegerv");
+  f_maprange = (gl_maprange_t)dlsym(L, "glMapBufferRange");
+  f_unmap = (gl_unmap_t)dlsym(L, "glUnmapBuffer");
+}
+
+static void cap_print_uniform(FILE* f, unsigned prog, const char* name, int n) {
+  int loc = f_getuloc ? f_getuloc(prog, name) : -1;
+  if (loc < 0 || !f_unifv) { fprintf(f, "  %s: tidak ada\n", name); return; }
+  float v[16] = {0};
+  f_unifv(prog, loc, v);
+  fprintf(f, "  %s:", name);
+  for (int i = 0; i < n; i++) fprintf(f, " %g", v[i]);
+  fprintf(f, "\n");
+}
+
+static void capture_draw(ProgStat* s, unsigned mode, int count, unsigned type, const void* idx) {
+  cap_init();
+  if (!g_cap_f || !f_geti || !f_isen || !f_getb) return;
+  unsigned n = g_cap_draws++;
+  if (n >= (g_cap_full ? 4u : 1u)) return;
+  FILE* f = g_cap_f;
+  unsigned id = s->id;
+  int vbo = 0, ibo = 0, fbo = 0, vp[4] = {0, 0, 0, 0};
+  unsigned char dm = 0;
+  f_geti(0x8894, &vbo); f_geti(0x8895, &ibo); f_geti(0x8CA6, &fbo); f_geti(0x0BA2, vp); f_getb(0x0B72, &dm);
+  fprintf(f, "T2 draw#%u prog=%u mode=0x%x count=%d type=0x%x idx=%p vbo=%d ibo=%d fbo=%d vp=%d,%d,%d,%d blend=%d cull=%d depth=%d dmask=%d\n",
+          n, id, mode, count, type, idx, vbo, ibo, fbo, vp[0], vp[1], vp[2], vp[3],
+          (int)f_isen(0x0BE2), (int)f_isen(0x0B44), (int)f_isen(0x0B71), (int)dm);
+  static const char* an[4] = {"POSITION", "COLOR", "TEXCOORD_0", "TEXCOORD_1"};
+  for (int i = 0; i < 4; i++) {
+    int loc = f_getaloc ? f_getaloc(id, an[i]) : -1;
+    if (loc < 0 || !f_vaiv || !f_vaptr) { fprintf(f, "  attr %s: tidak ada\n", an[i]); continue; }
+    int en = 0, sz = 0, ty = 0, nm = 0, st = 0, bb = 0; void* po = nullptr;
+    f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+    f_vaiv(loc, 0x886A, &nm); f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb);
+    f_vaptr(loc, 0x8645, &po);
+    fprintf(f, "  attr %s loc=%d en=%d size=%d type=0x%x norm=%d stride=%d off=%p buf=%d\n", an[i], loc, en, sz, ty, nm, st, po, bb);
+  }
+  cap_print_uniform(f, id, "CHUNK_ORIGIN_AND_SCALE", 4);
+  cap_print_uniform(f, id, "VIEW_POS", 3);
+  cap_print_uniform(f, id, "FOG_CONTROL", 2);
+  if (f_getuloc && f_unifiv) {
+    int t0 = -1, t1 = -1, l0 = f_getuloc(id, "TEXTURE_0"), l1 = f_getuloc(id, "TEXTURE_1");
+    if (l0 >= 0) f_unifiv(id, l0, &t0);
+    if (l1 >= 0) f_unifiv(id, l1, &t1);
+    fprintf(f, "  TEXTURE_0 unit=%d, TEXTURE_1 unit=%d\n", t0, t1);
+  }
+  if (!g_cap_mat) {   // matriks cukup sekali per frame
+    g_cap_mat = true;
+    cap_print_uniform(f, id, "WORLDVIEW", 16);
+    cap_print_uniform(f, id, "PROJ", 16);
+  }
+}
+
+
+// Cetak satu atribut vertex beserta (kalau terbaca) beberapa vertex pertama
+static void dump_attr(FILE* f, unsigned prog, const char* name, int nv) {
+  int loc = f_getaloc ? f_getaloc(prog, name) : -1;
+  if (loc < 0 || !f_vaiv || !f_vaptr) { fprintf(f, "  %s: tidak ada\n", name); return; }
+  int en = 0, sz = 0, ty = 0, nm = 0, st = 0, bb = 0; void* po = nullptr;
+  f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+  f_vaiv(loc, 0x886A, &nm); f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb);
+  f_vaptr(loc, 0x8645, &po);
+  fprintf(f, "  %s loc=%d en=%d size=%d type=0x%x norm=%d stride=%d off=%p buf=%d\n", name, loc, en, sz, ty, nm, st, po, bb);
+  if (ty != 0x1406 || sz < 2 || sz > 4 || !en || nv < 1 || nv > 4) return;
+  int stride = st ? st : sz * 4;
+  float v[4][4] = {{0}};
+  bool ok = false;
+  if (bb == 0 && po) {   // array di memori biasa
+    for (int i = 0; i < nv; i++) memcpy(v[i], (const uint8_t*)po + i * stride, sz * 4);
+    ok = true;
+  } else if (bb != 0 && f_maprange && f_unmap) {   // buffer GL: hanya dibaca kalau memang sedang terikat
+    int cur = 0; f_geti(0x8894, &cur);
+    if (cur == bb) {
+      intptr_t off = (intptr_t)po, len = (intptr_t)((nv - 1) * stride + sz * 4);
+      void* m = f_maprange(0x8892, off, len, 1);   // GL_MAP_READ_BIT
+      if (m) {
+        for (int i = 0; i < nv; i++) memcpy(v[i], (const uint8_t*)m + i * stride, sz * 4);
+        f_unmap(0x8892);
+        ok = true;
+      }
+    }
+  }
+  if (!ok) { fprintf(f, "  (data vertex tidak terbaca)\n"); return; }
+  for (int i = 0; i < nv; i++) {
+    fprintf(f, "  v%d=(", i);
+    for (int k = 0; k < sz; k++) fprintf(f, k ? " %g" : "%g", v[i][k]);
+    fprintf(f, ")\n");
+  }
+}
+
+// Catat urutan semua draw; kotak kecil (4 atau 6 vertex/indeks) di luar terrain dicatat rinci
+static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
+  cap_init();
+  if (!g_cap_f || !f_geti || !f_isen || !f_getb) return;
+  unsigned n = g_seq++;
+  if (n >= 300) return;
+  FILE* f = g_cap_f;
+  int fbo = 0, tex = 0, act = 0;
+  unsigned char dm = 0;
+  f_geti(0x8CA6, &fbo); f_geti(0x8069, &tex); f_geti(0x84E0, &act); f_getb(0x0B72, &dm);
+  unsigned cap_limit = g_cap_full ? 20u : 12u;
+  bool want = detail && (count == 6 || count == 4) && fbo == 0 && g_cap_other < cap_limit;
+  if (g_cap_full || want)
+    fprintf(f, "S seq=%u prog=%u mode=0x%x count=%d fbo=%d blend=%d depth=%d dmask=%d cull=%d tex=%d act=0x%x\n",
+            n, s->id, mode, count, fbo, (int)f_isen(0x0BE2), (int)f_isen(0x0B71), (int)dm, (int)f_isen(0x0B44), tex, act);
+  if (want) {
+    g_cap_other++;
+    cap_print_uniform(f, s->id, "WORLDVIEWPROJ", 16);
+    cap_print_uniform(f, s->id, "CURRENT_COLOR", 4);
+    dump_attr(f, s->id, "POSITION", 4);
+    if (g_cap_full) dump_attr(f, s->id, "TEXCOORD_0", 4);
+  }
+}
+
+// ======================= Tahap 3 + 4: peta bayangan matahari =======================
+// Alur: tiap frame, semua draw terrain direkam. Tepat sebelum eglSwapBuffers, terrain digambar ulang dari arah matahari
+// ke tekstur kedalaman. Frame berikutnya shader terrain (renderchunk.fragment) membaca peta itu lewat uniform SHADOW_*.
+// Arah matahari dibaca dari kotak matahari/bulan yang digambar game (tahap 2b).
+// Pengaturan opsional di /sdcard/games/com.mojang/pipe3d_shadow.txt (baris "kunci=nilai"): on=1 level=3 size=1024 capture=0
+// (radius 56 dan bias dikunci di shader renderchunk.vertex/.fragment)
+#define GLX_LIST(X) \
+  X(void, GenFramebuffers, (int, unsigned*)) \
+  X(void, BindFramebuffer, (unsigned, unsigned)) \
+  X(void, FramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int)) \
+  X(unsigned, CheckFramebufferStatus, (unsigned)) \
+  X(void, GenTextures, (int, unsigned*)) \
+  X(void, BindTexture, (unsigned, unsigned)) \
+  X(void, TexImage2D, (unsigned, int, int, int, int, int, unsigned, unsigned, const void*)) \
+  X(void, TexParameteri, (unsigned, unsigned, int)) \
+  X(void, ActiveTexture, (unsigned)) \
+  X(void, Viewport, (int, int, int, int)) \
+  X(void, Clear, (unsigned)) \
+  X(void, ClearDepthf, (float)) \
+  X(void, DepthMask, (unsigned char)) \
+  X(void, DepthFunc, (unsigned)) \
+  X(void, Enable, (unsigned)) \
+  X(void, Disable, (unsigned)) \
+  X(void, ColorMask, (unsigned char, unsigned char, unsigned char, unsigned char)) \
+  X(void, CullFace, (unsigned)) \
+  X(void, PolygonOffset, (float, float)) \
+  X(void, UseProgram, (unsigned)) \
+  X(void, BindBuffer, (unsigned, unsigned)) \
+  X(void, VertexAttribPointer, (unsigned, int, unsigned, unsigned char, int, const void*)) \
+  X(void, EnableVertexAttribArray, (unsigned)) \
+  X(void, DisableVertexAttribArray, (unsigned)) \
+  X(void, UniformMatrix4fv, (int, int, unsigned char, const float*)) \
+  X(void, Uniform1i, (int, int)) \
+    X(void, Uniform3f, (int, float, float, float)) \
+  X(void, Uniform4f, (int, float, float, float, float)) \
+  X(void, DrawElements, (unsigned, int, unsigned, const void*)) \
+  X(unsigned, CreateShader, (unsigned)) \
+  X(void, ShaderSource, (unsigned, int, const char* const*, const int*)) \
+  X(void, CompileShader, (unsigned)) \
+  X(void, GetShaderiv, (unsigned, unsigned, int*)) \
+  X(void, GetShaderInfoLog, (unsigned, int, int*, char*)) \
+  X(unsigned, CreateProgram, (void)) \
+  X(void, AttachShader, (unsigned, unsigned)) \
+  X(void, BindAttribLocation, (unsigned, unsigned, const char*)) \
+  X(void, LinkProgram, (unsigned)) \
+  X(void, GetProgramiv, (unsigned, unsigned, int*)) \
+  X(void, GetProgramInfoLog, (unsigned, int, int*, char*)) \
+  X(unsigned, GetError, (void)) \
+  X(void, GetFloatv, (unsigned, float*)) \
+  X(void, GetBufferParameteriv, (unsigned, unsigned, int*)) \
+  X(void, GenBuffers, (int, unsigned*)) \
+  X(void, BufferData, (unsigned, intptr_t, const void*, unsigned)) \
+  X(void, DrawArrays, (unsigned, int, int))
+
+struct GLX {
+#define X(ret, name, args) ret (*name) args;
+  GLX_LIST(X)
+#undef X
+};
+static GLX gx;
+static bool g_gx_ok = false;
+typedef void (*gl_drawbuffers_t)(int, const unsigned*);
+typedef void (*gl_readbuffer_t)(unsigned);
+static gl_drawbuffers_t gx_drawbuffers = nullptr;
+static gl_readbuffer_t gx_readbuffer = nullptr;
+
+static void gx_init() {
+  void* L = glib();
+  if (!L) return;
+  bool ok = true;
+#define X(ret, name, args) gx.name = (ret (*) args)dlsym(L, "gl" #name); if (!gx.name) { LOG("shadow: gl%s tidak ada", #name); ok = false; }
+  GLX_LIST(X)
+#undef X
+  gx_drawbuffers = (gl_drawbuffers_t)dlsym(L, "glDrawBuffers");
+  gx_readbuffer = (gl_readbuffer_t)dlsym(L, "glReadBuffer");
+  g_gx_ok = ok;
+}
+
+// ---- pengaturan ----
+static int g_cfg_on = 1, g_cfg_size = 1024, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
+static float g_cfg_radius = 56.0f, g_cfg_bias = 0.12f;
+static bool g_cfg_loaded = false;
+static void cfg_load() {
+  if (g_cfg_loaded) return;
+  g_cfg_loaded = true;
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_shadow.txt", "r");
+  if (!f) return;
+  char line[128];
+  while (fgets(line, sizeof(line), f)) {
+    int iv; float fv;
+    if (sscanf(line, "on=%d", &iv) == 1) g_cfg_on = iv;
+    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 1024;
+    else if (sscanf(line, "capture=%d", &iv) == 1) g_cfg_capture = iv;
+    else if (sscanf(line, "level=%d", &iv) == 1) g_cfg_level = (iv < 0) ? 0 : (iv > 4 ? 4 : iv);
+    else if (sscanf(line, "playerbox=%d", &iv) == 1) g_cfg_playerbox = iv;
+    else if (sscanf(line, "radius=%f", &fv) == 1) { (void)fv; }   // radius dikunci 56 (sama dengan konstanta di shader)
+    else if (sscanf(line, "bias=%f", &fv) == 1) { (void)fv; }     // bias dikunci di shader
+  }
+  fclose(f);
+}
+static void sh_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void sh_log(const char* fmt, ...) {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+  if (!f) return;
+  va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+  fclose(f);
+}
+
+
+// ---- pengaman crash ----
+// level 0: mati; 1: hanya mengenali arah matahari; 2: + menggambar peta bayangan (belum dipakai shader); 3: bayangan terrain; 4: + bayangan mob dan pemain.
+// Pada frame terrain pertama, file status ditandai "armed=1". Kalau game crash atau macet sebelum 90 frame terrain berlalu,
+// peluncuran berikutnya otomatis turun satu level. Untuk memaksa level tertentu: tulis "level=N" di pipe3d_shadow.txt.
+static const char* GUARD_FILE = "/sdcard/games/com.mojang/pipe3d_state2.txt";
+static int g_level = 0;
+static bool g_level_inited = false, g_guard_done = false, g_guard_armed = false;
+static unsigned g_guard_frames = 0;
+static int g_bc = 0;
+static void bc(const char* m) { if (g_bc < 40) { g_bc++; sh_log("langkah: %s (frame %u)\n", m, g_frames); } }
+static void guard_write(int lvl, int armed) {
+  FILE* f = fopen(GUARD_FILE, "w");
+  if (f) { fprintf(f, "lvl=%d\narmed=%d\n", lvl, armed); fclose(f); }
+}
+static void level_init() {
+  g_level_inited = true;
+  cfg_load();
+  int lvl = 4, armed = 0; bool have = false;
+  FILE* f = fopen(GUARD_FILE, "r");
+  if (f) {
+    char line[64]; int v;
+    while (fgets(line, sizeof(line), f)) {
+      if (sscanf(line, "lvl=%d", &v) == 1) { lvl = v; have = true; }
+      else if (sscanf(line, "armed=%d", &v) == 1) armed = v;
+    }
+    fclose(f);
+  }
+  if (g_cfg_level >= 0) { lvl = g_cfg_level; armed = 0; sh_log("pipe3d: level dipaksa lewat pengaturan = %d\n", lvl); }
+  else if (have && armed) { sh_log("pipe3d: peluncuran sebelumnya tidak lolos 90 frame terrain pada level %d, turun ke level %d\n", lvl, lvl > 0 ? lvl - 1 : 0); lvl = lvl > 0 ? lvl - 1 : 0; }
+  if (lvl < 0) lvl = 0;
+  if (lvl > 4) lvl = 4;
+  if (!g_cfg_on) lvl = 0;
+  g_level = lvl;
+  guard_write(g_level, 0);
+  sh_log("pipe3d: bayangan level=%d\n", g_level);
+}
+static void guard_arm() {
+  g_guard_done = true;
+  if (g_level >= 1) { guard_write(g_level, 1); g_guard_armed = true; }
+  bc("frame terrain pertama, pengaman aktif");
+}
+
+// ---- sumber daya peta bayangan ----
+static int g_sh_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
+static unsigned g_sh_tex = 0, g_sh_fbo = 0, g_sh_prog = 0, g_sh_ctex = 0;
+static int g_sh_loc_lvp = -1, g_sh_loc_org = -1, g_sh_loc_tex = -1;
+static int g_sh_size = 1024;
+static unsigned g_eh_prog = 0, g_cube_vbo = 0, g_cube_ibo = 0;
+static int g_eh_loc = -1;
+static const float SH_DEPTH_D = 160.0f;   // jarak mata cahaya dari pusat; kedalaman total = 2 * D
+
+static const char* SH_VS =
+  "attribute vec3 POSITION;\n"
+  "attribute vec2 TEXCOORD_0;\n"
+  "uniform mat4 LVP;\n"
+  "uniform vec3 ORG;\n"
+  "varying vec2 vuv;\n"
+  "void main() {\n"
+  "  vuv = TEXCOORD_0;\n"
+  "  gl_Position = LVP * vec4(POSITION + ORG, 1.0);\n"
+  "}\n";
+static const char* SH_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 vuv;\n"
+  "uniform sampler2D TEX;\n"
+  "void main() {\n"
+  "  if (texture2D(TEX, vuv).a < 0.5) discard;\n"
+  "  gl_FragColor = vec4(1.0);\n"
+  "}\n";
+
+static void clear_gl_errors() { for (int i = 0; i < 16; i++) if (gx.GetError() == 0) break; }
+
+static const char* EH_VS =
+  "attribute vec4 POSITION;\n"
+  "uniform mat4 LVPM;\n"
+  "void main() { gl_Position = LVPM * vec4(POSITION.xyz, 1.0); }\n";
+static const char* EH_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "void main() { gl_FragColor = vec4(1.0); }\n";
+
+static unsigned sh_compile(unsigned type, const char* src) {
+  unsigned sh = gx.CreateShader(type);
+  gx.ShaderSource(sh, 1, &src, nullptr);
+  gx.CompileShader(sh);
+  int ok = 0; gx.GetShaderiv(sh, 0x8B81, &ok);
+  if (!ok) { char buf[512] = {0}; int n = 0; gx.GetShaderInfoLog(sh, 511, &n, buf); sh_log("shadow: shader gagal dikompilasi: %s\n", buf); return 0; }
+  return sh;
+}
+
+static void shadow_init() {
+  g_sh_state = -1;
+  cfg_load();
+  cap_init();
+  if (!g_cfg_on) { sh_log("shadow: dimatikan lewat pengaturan (on=0)\n"); return; }
+  gx_init();
+  if (!g_gx_ok || !f_geti || !f_isen || !f_getb || !f_unifv || !f_getuloc || !f_vaiv || !f_vaptr) { sh_log("shadow: fungsi GL tidak lengkap\n"); return; }
+  g_sh_size = g_cfg_size;
+  int prev_fbo = 0, prev_tex = 0;
+  f_geti(0x8CA6, &prev_fbo); f_geti(0x8069, &prev_tex);
+  clear_gl_errors();
+  // tekstur kedalaman
+  gx.GenTextures(1, &g_sh_tex);
+  gx.BindTexture(0x0DE1, g_sh_tex);
+  gx.TexImage2D(0x0DE1, 0, 0x81A6, g_sh_size, g_sh_size, 0, 0x1902, 0x1405, nullptr);   // DEPTH_COMPONENT24
+  unsigned err = gx.GetError();
+  if (err != 0) {
+    gx.TexImage2D(0x0DE1, 0, 0x81A5, g_sh_size, g_sh_size, 0, 0x1902, 0x1403, nullptr); // DEPTH_COMPONENT16
+    err = gx.GetError();
+    sh_log("shadow: depth24 gagal, mencoba depth16 (err=0x%x)\n", err);
+  }
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600);   // MIN_FILTER = NEAREST
+  gx.TexParameteri(0x0DE1, 0x2800, 0x2600);   // MAG_FILTER = NEAREST
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F);   // WRAP_S = CLAMP_TO_EDGE
+  gx.TexParameteri(0x0DE1, 0x2803, 0x812F);   // WRAP_T
+  // framebuffer
+  gx.GenFramebuffers(1, &g_sh_fbo);
+  gx.BindFramebuffer(0x8D40, g_sh_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8D00, 0x0DE1, g_sh_tex, 0);   // DEPTH_ATTACHMENT
+  if (gx_drawbuffers) { unsigned none = 0; gx_drawbuffers(1, &none); }
+  if (gx_readbuffer) gx_readbuffer(0);
+  unsigned status = gx.CheckFramebufferStatus(0x8D40);
+  sh_log("shadow: framebuffer hanya-kedalaman status=0x%x (0x8cd5 = lengkap)\n", status);
+  if (status != 0x8CD5) {   // cadangan: tambah lampiran warna
+    gx.GenTextures(1, &g_sh_ctex);
+    gx.BindTexture(0x0DE1, g_sh_ctex);
+    gx.TexImage2D(0x0DE1, 0, 0x1908, g_sh_size, g_sh_size, 0, 0x1908, 0x1401, nullptr);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600);
+    gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_sh_ctex, 0);
+    if (gx_drawbuffers) { unsigned c0 = 0x8CE0; gx_drawbuffers(1, &c0); }
+    status = gx.CheckFramebufferStatus(0x8D40);
+    sh_log("shadow: framebuffer + warna status=0x%x\n", status);
+  }
+  gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
+  gx.BindTexture(0x0DE1, (unsigned)prev_tex);
+  if (status != 0x8CD5) { sh_log("shadow: framebuffer tidak lengkap, bayangan dinonaktifkan\n"); return; }
+  // program bayangan
+  unsigned vs = sh_compile(0x8B31, SH_VS), fs = sh_compile(0x8B30, SH_FS);
+  if (!vs || !fs) return;
+  g_sh_prog = gx.CreateProgram();
+  gx.AttachShader(g_sh_prog, vs); gx.AttachShader(g_sh_prog, fs);
+  gx.BindAttribLocation(g_sh_prog, 0, "POSITION");
+  gx.BindAttribLocation(g_sh_prog, 1, "TEXCOORD_0");
+  gx.LinkProgram(g_sh_prog);
+  int linked = 0; gx.GetProgramiv(g_sh_prog, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(g_sh_prog, 511, &n, buf); sh_log("shadow: link gagal: %s\n", buf); return; }
+  g_sh_loc_lvp = f_getuloc(g_sh_prog, "LVP");
+  g_sh_loc_org = f_getuloc(g_sh_prog, "ORG");
+  g_sh_loc_tex = f_getuloc(g_sh_prog, "TEX");
+  {   // program bayangan untuk mob dan kotak pemain (tanpa tekstur); kalau gagal, hanya fitur ini yang mati
+    unsigned evs = sh_compile(0x8B31, EH_VS), efs = sh_compile(0x8B30, EH_FS);
+    if (evs && efs) {
+      g_eh_prog = gx.CreateProgram();
+      gx.AttachShader(g_eh_prog, evs); gx.AttachShader(g_eh_prog, efs);
+      gx.BindAttribLocation(g_eh_prog, 0, "POSITION");
+      gx.LinkProgram(g_eh_prog);
+      int el = 0; gx.GetProgramiv(g_eh_prog, 0x8B82, &el);
+      if (!el) { sh_log("shadow: program mob gagal di-link\n"); g_eh_prog = 0; }
+      else g_eh_loc = f_getuloc(g_eh_prog, "LVPM");
+    }
+    static const float cv[24] = {-0.5f, -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, -0.5f, -0.5f, 0.5f, -0.5f,
+                                 -0.5f, -0.5f, 0.5f, 0.5f, -0.5f, 0.5f, 0.5f, 0.5f, 0.5f, -0.5f, 0.5f, 0.5f};
+    static const unsigned short ci[36] = {0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 3, 2, 6, 3, 6, 7, 0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2};
+    int pa = 0, pe = 0; f_geti(0x8894, &pa); f_geti(0x8895, &pe);
+    gx.GenBuffers(1, &g_cube_vbo); gx.BindBuffer(0x8892, g_cube_vbo); gx.BufferData(0x8892, (intptr_t)sizeof(cv), cv, 0x88E4);
+    gx.GenBuffers(1, &g_cube_ibo); gx.BindBuffer(0x8893, g_cube_ibo); gx.BufferData(0x8893, (intptr_t)sizeof(ci), ci, 0x88E4);
+    gx.BindBuffer(0x8892, (unsigned)pa); gx.BindBuffer(0x8893, (unsigned)pe);
+  }
+  clear_gl_errors();
+  g_sh_state = 1;
+  sh_log("shadow: siap. ukuran=%d radius=%.0f bias=%.2f\n", g_sh_size, g_cfg_radius, g_cfg_bias);
+}
+
+// ---- status per frame ----
+struct DrawRec { int vbo, ibo, count, vsz, isz; unsigned type; uintptr_t idx; float o[3]; };
+static DrawRec g_dl[2][2048];
+static int g_dn[2] = {0, 0};
+static int g_dcur = 0;
+static unsigned g_tframe = 0xFFFFFFFFu;   // nomor frame terakhir yang punya draw terrain
+static bool g_delta_ok = false, g_delta_exact = false, g_have_prev_delta = false;
+static int g_en = 0;   // jumlah draw mob yang direkam di frame ini (daftar g_el ada di bagian mob)
+static float g_last_delta[3] = {0, 0, 0};
+static float g_delta[3] = {0, 0, 0};
+static unsigned g_delta_ver = 0;
+static float g_wv[16], g_proj[16];
+static bool g_view_ok = false;
+static int g_atlas_tex = 0, g_prev_unit4 = 0;
+static bool g_unit4_saved = false;
+static double g_cam_est[3] = {0, 0, 0};
+static float g_lvp[16];
+static float g_gen_Ly = 1.0f, g_gen_Lz = 0.0f, g_ox0 = 0, g_oy0 = 0;   // dasar cahaya saat peta dibuat (dipakai shader)
+static float g_bs[3] = {0, 0, 1}, g_bu[3] = {1, 0, 0}, g_bf[3] = {0, -1, 0};
+static bool g_lvp_valid = false;
+static float g_sun[3] = {0, 1, 0};
+static bool g_sun_valid = false;
+static unsigned g_sun_frame = 0, g_sun_seen_frame = 0;
+static int g_sun_prog = 0, g_sun_learn = 0;
+struct TexCls { int tex; int half; };
+static TexCls g_tcls[8];
+static int g_ntc = 0;
+static unsigned g_st_frames = 0, g_st_delta_ok = 0, g_st_pass = 0, g_st_draws = 0, g_st_skipped = 0, g_st_logs = 0;
+static double g_st_ms = 0;
+static unsigned g_st_ent = 0;
+
+static bool sun_enabled() {
+  return g_sun_valid && g_sun[1] > 0.02f && (g_frames - g_sun_frame) < 3000;
+}
+
+// membaca posisi vertex pertama kotak (untuk mengenali kotak matahari/bulan); hasil: setengah sisi, 0 bila bukan kotak datar
+static int read_quad_half(unsigned prog) {
+  if (!f_getaloc || !f_vaiv || !f_vaptr || !f_geti) return 0;
+  int loc = f_getaloc(prog, "POSITION");
+  if (loc < 0) return 0;
+  int en = 0, sz = 0, ty = 0, st = 0, bb = 0; void* po = nullptr;
+  f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+  f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb); f_vaptr(loc, 0x8645, &po);
+  if (!en || ty != 0x1406 || sz != 3) return 0;
+  int stride = st ? st : 12;
+  float v[4][3] = {{0}};
+  if (bb == 0 && po) {
+    for (int i = 0; i < 4; i++) memcpy(v[i], (const uint8_t*)po + i * stride, 12);
+  } else if (bb != 0 && f_maprange && f_unmap) {
+    int cur = 0; f_geti(0x8894, &cur);
+    if (cur != bb) return 0;
+    void* m = f_maprange(0x8892, (intptr_t)po, (intptr_t)(3 * stride + 12), 1);
+    if (!m) return 0;
+    for (int i = 0; i < 4; i++) memcpy(v[i], (const uint8_t*)m + i * stride, 12);
+    f_unmap(0x8892);
+  } else return 0;
+  float h = v[2][0];
+  if (fabsf(v[0][1]) > 0.01f || fabsf(v[2][1]) > 0.01f) return 0;
+  if (fabsf(v[0][0] + v[2][0]) > 0.01f || fabsf(v[0][0] - v[0][2]) > 0.01f) return 0;
+  if (h < 10.0f || h > 60.0f) return 0;
+  return (int)(h + 0.5f);
+}
+
+// kotak kecil di luar terrain, digambar sesudah terrain: kandidat matahari/bulan
+static void sky_draw(ProgStat* s, unsigned mode, int count) {
+  if (mode != 4 || !g_view_ok || s->loc_wvp < 0 || count != 6) return;
+  if ((int)s->id != g_sun_prog) {
+    if (g_sun_prog != 0 || g_sun_learn > 80) return;
+    unsigned char dm = 1; f_getb(0x0B72, &dm);
+    if (dm || !f_isen(0x0BE2)) return;
+    g_sun_learn++;
+    if (read_quad_half(s->id) == 0) return;
+    g_sun_prog = (int)s->id;
+    sh_log("shadow: program matahari/bulan = %u\n", s->id);
+  }
+  int tex = 0; f_geti(0x8069, &tex);
+  int half = 0;
+  for (int i = 0; i < g_ntc; i++) if (g_tcls[i].tex == tex) half = g_tcls[i].half;
+  if (!half) {
+    half = read_quad_half(s->id);
+    if (!half) return;
+    if (g_ntc < 8) { g_tcls[g_ntc].tex = tex; g_tcls[g_ntc].half = half; g_ntc++; }
+    else { g_tcls[g_frames & 7].tex = tex; g_tcls[g_frames & 7].half = half; }
+  }
+  float w[16];
+  f_unifv(s->id, s->loc_wvp, w);
+  float xv = w[12] / g_proj[0], yv = w[13] / g_proj[5], zv = -w[15];
+  float len = sqrtf(xv * xv + yv * yv + zv * zv);
+  if (len < 1e-6f) return;
+  xv /= len; yv /= len; zv /= len;
+  float d[3] = {g_wv[0] * xv + g_wv[1] * yv + g_wv[2] * zv,
+                g_wv[4] * xv + g_wv[5] * yv + g_wv[6] * zv,
+                g_wv[8] * xv + g_wv[9] * yv + g_wv[10] * zv};
+  bool is_sun = half >= 25;   // matahari 60x60, bulan 40x40
+  if (!is_sun) { d[0] = -d[0]; d[1] = -d[1]; d[2] = -d[2]; }
+  if (is_sun || g_sun_seen_frame != g_frames) {
+    memcpy(g_sun, d, sizeof(d));
+    static bool first_sun = true;
+    if (first_sun) { first_sun = false; bc("arah matahari pertama terdeteksi"); }
+    g_sun_valid = true; g_sun_frame = g_frames;
+    if (is_sun) g_sun_seen_frame = g_frames;
+  }
+}
+
+// dipanggil sebelum tiap draw terrain
+static int g_u2_prev = 0, g_act_prev = 0;
+// hasil true: slot tekstur 2 ditimpa dengan peta bayangan, panggil terrain_draw_post sesudah draw asli
+static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx) {
+  if (!g_level_inited) level_init();
+  if (g_level < 1 || g_cur_fbo != 0) return false;
+  if (g_tframe != g_frames) {   // draw terrain pertama di frame ini
+    g_tframe = g_frames;
+    g_view_ok = false; g_en = 0;
+    g_delta_exact = false;
+    if (g_have_prev_delta) {   // belum ada chunk yang cocok: pakai dugaan (kamera bergerak sama seperti frame lalu), jangan matikan bayangan
+      g_delta[0] = g_last_delta[0]; g_delta[1] = g_last_delta[1]; g_delta[2] = g_last_delta[2];
+      g_delta_ok = true; g_delta_ver++;
+    } else g_delta_ok = false;
+    if (!g_guard_done) guard_arm();
+    if (g_level >= 2 && g_sh_state == 1) {
+      int act = 0x84C0; f_geti(0x84E0, &act);
+      gx.ActiveTexture(0x84C0); f_geti(0x8069, &g_atlas_tex);
+      gx.ActiveTexture((unsigned)act);
+    }
+  }
+  if (!g_view_ok && f_unifv && s->loc_wv >= 0 && s->loc_proj >= 0) {
+    f_unifv(s->id, s->loc_wv, g_wv); f_unifv(s->id, s->loc_proj, g_proj);
+    g_view_ok = true;
+  }
+  if (g_level < 2 || g_sh_state != 1) return false;
+  int vbo = 0, ibo = 0; f_geti(0x8894, &vbo); f_geti(0x8895, &ibo);
+  float o[4] = {0, 0, 0, 1};
+  if (s->loc_origin >= 0) f_unifv(s->id, s->loc_origin, o);
+  bool blend = f_isen(0x0BE2) != 0;
+  if (!blend) {
+    int prev = 1 - g_dcur;
+    if (!g_delta_exact && g_dn[prev] > 0) {   // chunk yang sama di frame sebelumnya -> selisih posisi kamera yang tepat
+      for (int i = 0; i < g_dn[prev]; i++) {
+        const DrawRec& r = g_dl[prev][i];
+        if (r.vbo == vbo && r.ibo == ibo && r.count == count && r.idx == (uintptr_t)idx) {
+          g_delta[0] = r.o[0] - o[0]; g_delta[1] = r.o[1] - o[1]; g_delta[2] = r.o[2] - o[2];
+          g_last_delta[0] = g_delta[0]; g_last_delta[1] = g_delta[1]; g_last_delta[2] = g_delta[2]; g_have_prev_delta = true;
+          g_cam_est[0] += g_delta[0]; g_cam_est[1] += g_delta[1]; g_cam_est[2] += g_delta[2];
+          g_delta_ok = true; g_delta_exact = true; g_delta_ver++;
+          break;
+        }
+      }
+    }
+    if (g_dn[g_dcur] < 2048 && count > 0 && vbo > 0 && ibo > 0) {
+      int vsz = 0, isz = 0;
+      gx.GetBufferParameteriv(0x8892, 0x8764, &vsz);   // GL_BUFFER_SIZE
+      gx.GetBufferParameteriv(0x8893, 0x8764, &isz);
+      DrawRec& r = g_dl[g_dcur][g_dn[g_dcur]++];
+      r.vbo = vbo; r.ibo = ibo; r.count = count; r.vsz = vsz; r.isz = isz; r.type = type; r.idx = (uintptr_t)idx;
+      r.o[0] = o[0]; r.o[1] = o[1]; r.o[2] = o[2];
+    }
+  }
+  if (g_level < 3) return false;
+  bool want = g_lvp_valid && g_delta_ok && sun_enabled();
+  if (!want) {
+    if (s->vp_state == 1 && s->loc_vp >= 0) { gx.Uniform3f(s->loc_vp, s->vp_orig[0], s->vp_orig[1], s->vp_orig[2]); s->vp_state = 0; }
+    return false;
+  }
+  if (s->loc_vp < 0 || s->loc_cc < 0 || s->loc_t2 < 0) return false;   // shader belum memuat jalur bayangan
+  static bool first_set = true;
+  if (first_set) { first_set = false; bc("parameter bayangan pertama diisi lewat VIEW_DIRECTION dan CURRENT_COLOR"); }
+  if (s->vp_state == 0) f_unifv(s->id, s->loc_vp, s->vp_orig);   // simpan nilai asli supaya bisa dipulihkan
+  // pergeseran kisi: peta dibuat di koordinat kamera frame sebelumnya, jadi tambahkan selisih kamera (g_delta)
+  float ox = g_ox0 + g_bs[0] * g_delta[0] + g_bs[1] * g_delta[1] + g_bs[2] * g_delta[2];
+  float oy = g_oy0 + g_bu[0] * g_delta[0] + g_bu[1] * g_delta[1] + g_bu[2] * g_delta[2];
+  float oz = g_bf[0] * g_delta[0] + g_bf[1] * g_delta[1] + g_bf[2] * g_delta[2];
+  float cc[4] = {0, 0, 0, 1};
+  f_unifv(s->id, s->loc_cc, cc);                       // .r milik game (efek fade chunk) tetap dipertahankan
+  gx.Uniform4f(s->loc_cc, cc[0], ox, oy, cc[3]);
+  gx.Uniform3f(s->loc_vp, -(g_gen_Ly + 2.0f), g_gen_Lz, oz);   // VIEW_DIRECTION = (-(Ly+2), Lz, oz)
+  s->vp_state = 1;
+  gx.Uniform1i(s->loc_t2, 2);
+  f_geti(0x84E0, &g_act_prev);
+  gx.ActiveTexture(0x84C2); f_geti(0x8069, &g_u2_prev); gx.BindTexture(0x0DE1, g_sh_tex);
+  gx.ActiveTexture((unsigned)g_act_prev);
+  return true;
+}
+static void terrain_draw_post() {
+  gx.ActiveTexture(0x84C2); gx.BindTexture(0x0DE1, (unsigned)g_u2_prev);
+  gx.ActiveTexture((unsigned)g_act_prev);
+}
+
+
+// ---- bayangan mob dan item: rekam draw entity (program dengan uniform WORLD) ----
+struct EntRec { int vbo, ibo, vsz, isz, count, first, psize, ptype, pnorm, pstride; unsigned mode, type; uintptr_t idx, poff; bool indexed; float m[16]; };
+static EntRec g_el[512];
+static unsigned g_ent_total = 0, g_ent_skip = 0, g_ent_hand = 0, g_ent_rec = 0;
+static unsigned g_hand_frame = 0xFFFFFFFFu;   // frame terakhir yang punya tangan/item di layar (tanda orang pertama)
+
+static void entity_draw(ProgStat* s, unsigned mode, int first, int count, unsigned type, const void* idx, bool indexed) {
+  if (g_level < 4 || g_sh_state != 1 || g_cur_fbo != 0 || g_tframe != g_frames || count <= 0) return;
+  g_ent_total++;
+  if (s->loc_world < 0 || !f_unifv || !f_getaloc || !f_vaiv || !f_vaptr) return;
+  float m[16];
+  f_unifv(s->id, s->loc_world, m);
+  float dist = sqrtf(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+  if (dist < 1.2f) { g_hand_frame = g_frames; g_ent_hand++; return; }   // tangan / item yang dipegang
+  if (dist > 90.0f || g_en >= 512) return;
+  int loc = f_getaloc(s->id, "POSITION");
+  if (loc < 0) { g_ent_skip++; return; }
+  int en = 0, sz = 0, ty = 0, nm = 0, st = 0, bb = 0; void* po = nullptr;
+  f_vaiv(loc, 0x8622, &en); f_vaiv(loc, 0x8623, &sz); f_vaiv(loc, 0x8625, &ty);
+  f_vaiv(loc, 0x886A, &nm); f_vaiv(loc, 0x8624, &st); f_vaiv(loc, 0x889F, &bb); f_vaptr(loc, 0x8645, &po);
+  int vbo = 0, ibo = 0; f_geti(0x8894, &vbo); f_geti(0x8895, &ibo);
+  if (!en || bb == 0 || vbo != bb || sz < 2 || sz > 4 || (indexed && ibo == 0)) { g_ent_skip++; return; }   // array di memori biasa: tidak bisa diulang nanti
+  int vsz = 0, isz = 0;
+  gx.GetBufferParameteriv(0x8892, 0x8764, &vsz);
+  if (indexed) gx.GetBufferParameteriv(0x8893, 0x8764, &isz);
+  EntRec& r = g_el[g_en++];
+  r.vbo = vbo; r.ibo = ibo; r.vsz = vsz; r.isz = isz; r.count = count; r.first = first; r.psize = sz; r.ptype = ty; r.pnorm = nm; r.pstride = st;
+  r.mode = mode; r.type = type; r.idx = (uintptr_t)idx; r.poff = (uintptr_t)po; r.indexed = indexed;
+  memcpy(r.m, m, sizeof(m));
+  g_ent_rec++;
+  static int first_logs = 0;
+  if (first_logs < 6) {
+    first_logs++;
+    sh_log("mob: prog=%u jarak=%.1f posisi=(%.1f %.1f %.1f) pos attr size=%d type=0x%x stride=%d count=%d indexed=%d\n",
+           s->id, dist, m[12], m[13], m[14], sz, ty, st, count, (int)indexed);
+  }
+}
+
+// ---- simpan / pulihkan status GL ----
+struct SavedState {
+  int fbo, prog, arr, ele, act, tex0, vp[4], dfunc, cullmode;
+  unsigned char dmask, cmask[4], depth, cull, blend, scissor, poff, stencil;
+  float cleard, pofF, pofU;
+  struct VA { int en, size, type, norm, stride, buf; void* ptr; } va[8];
+};
+static void save_state(SavedState* s) {
+  f_geti(0x8CA6, &s->fbo); f_geti(0x8B8D, &s->prog); f_geti(0x8894, &s->arr); f_geti(0x8895, &s->ele);
+  f_geti(0x84E0, &s->act); f_geti(0x0BA2, s->vp); f_geti(0x0B74, &s->dfunc); f_geti(0x0B45, &s->cullmode);
+  f_getb(0x0B72, &s->dmask); f_getb(0x0C23, s->cmask);
+  s->depth = f_isen(0x0B71); s->cull = f_isen(0x0B44); s->blend = f_isen(0x0BE2);
+  s->scissor = f_isen(0x0C11); s->poff = f_isen(0x8037); s->stencil = f_isen(0x0B90);
+  gx.GetFloatv(0x0B73, &s->cleard); gx.GetFloatv(0x8038, &s->pofF); gx.GetFloatv(0x2A00, &s->pofU);
+  gx.ActiveTexture(0x84C0); f_geti(0x8069, &s->tex0); gx.ActiveTexture((unsigned)s->act);
+  for (int i = 0; i < 8; i++) {
+    SavedState::VA& v = s->va[i];
+    v.en = v.size = v.type = v.norm = v.stride = v.buf = 0; v.ptr = nullptr;
+    f_vaiv(i, 0x8622, &v.en); f_vaiv(i, 0x8623, &v.size); f_vaiv(i, 0x8625, &v.type);
+    f_vaiv(i, 0x886A, &v.norm); f_vaiv(i, 0x8624, &v.stride); f_vaiv(i, 0x889F, &v.buf);
+    f_vaptr(i, 0x8645, &v.ptr);
+  }
+}
+static void set_cap(unsigned cap, unsigned char on) { if (on) gx.Enable(cap); else gx.Disable(cap); }
+static void restore_state(const SavedState* s) {
+  gx.BindFramebuffer(0x8D40, (unsigned)s->fbo);
+  gx.Viewport(s->vp[0], s->vp[1], s->vp[2], s->vp[3]);
+  gx.UseProgram((unsigned)s->prog);
+  for (int i = 0; i < 8; i++) {
+    const SavedState::VA& v = s->va[i];
+    if ((v.en || v.buf) && v.size >= 1 && v.size <= 4) {
+      gx.BindBuffer(0x8892, (unsigned)v.buf);
+      gx.VertexAttribPointer((unsigned)i, v.size, (unsigned)v.type, (unsigned char)v.norm, v.stride, v.ptr);
+    }
+    if (v.en) gx.EnableVertexAttribArray((unsigned)i); else gx.DisableVertexAttribArray((unsigned)i);
+  }
+  gx.BindBuffer(0x8892, (unsigned)s->arr);
+  gx.BindBuffer(0x8893, (unsigned)s->ele);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)s->tex0);
+  gx.ActiveTexture((unsigned)s->act);
+  set_cap(0x0B71, s->depth); set_cap(0x0B44, s->cull); set_cap(0x0BE2, s->blend);
+  set_cap(0x0C11, s->scissor); set_cap(0x8037, s->poff); set_cap(0x0B90, s->stencil);
+  gx.DepthMask(s->dmask); gx.ColorMask(s->cmask[0], s->cmask[1], s->cmask[2], s->cmask[3]);
+  gx.DepthFunc((unsigned)s->dfunc); gx.CullFace((unsigned)s->cullmode);
+  gx.PolygonOffset(s->pofF, s->pofU); gx.ClearDepthf(s->cleard);
+}
+
+// matriks 4x4 kolom-utama: C = A * B
+static void mat_mul(const float* A, const float* B, float* C) {
+  for (int c = 0; c < 4; c++)
+    for (int r = 0; r < 4; r++) {
+      float v = 0;
+      for (int k = 0; k < 4; k++) v += A[k * 4 + r] * B[c * 4 + k];
+      C[c * 4 + r] = v;
+    }
+}
+
+static void build_light_matrix(float* lvp) {
+  const double R = (double)g_cfg_radius;
+  const float D = SH_DEPTH_D;
+  float Lv[3] = {0.0f, g_sun[1], g_sun[2]};   // matahari selalu bergerak di bidang Y-Z, jadi x dipaksa 0
+  float ln = sqrtf(Lv[0] * Lv[0] + Lv[1] * Lv[1] + Lv[2] * Lv[2]);
+  Lv[0] /= ln; Lv[1] /= ln; Lv[2] /= ln;
+  float f[3] = {-Lv[0], -Lv[1], -Lv[2]};
+  float up[3] = {1, 0, 0};
+  if (fabsf(Lv[0]) > 0.95f) { up[0] = 0; up[1] = 1; }
+  // s = normalize(cross(f, up)), u = cross(s, f)
+  float s[3] = {f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]};
+  float sn = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+  s[0] /= sn; s[1] /= sn; s[2] /= sn;
+  float u[3] = {s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
+  // pusat peta dikunci ke kisi texel di dunia supaya tepi bayangan tidak bergeser saat pemain bergerak
+  double texel = 2.0 * R / (double)g_sh_size;
+  double a = g_cam_est[0] * s[0] + g_cam_est[1] * s[1] + g_cam_est[2] * s[2];
+  double b = g_cam_est[0] * u[0] + g_cam_est[1] * u[1] + g_cam_est[2] * u[2];
+  double sa = floor(a / texel + 0.5) * texel, sb = floor(b / texel + 0.5) * texel;
+  float c[3];
+  for (int i = 0; i < 3; i++) c[i] = (float)((sa - a) * s[i] + (sb - b) * u[i]);
+  g_gen_Ly = Lv[1]; g_gen_Lz = Lv[2];
+  g_ox0 = (float)(a - sa); g_oy0 = (float)(b - sb);   // -(s.c) dan -(u.c)
+  for (int i = 0; i < 3; i++) { g_bs[i] = s[i]; g_bu[i] = u[i]; g_bf[i] = f[i]; }
+  float eye[3] = {c[0] + Lv[0] * D, c[1] + Lv[1] * D, c[2] + Lv[2] * D};
+  float V[16] = {s[0], u[0], -f[0], 0, s[1], u[1], -f[1], 0, s[2], u[2], -f[2], 0,
+                 -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]),
+                 -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]),
+                 (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]), 1};
+  float nr = 1.0f, fr = 2.0f * D, Rf = (float)R;
+  float P[16] = {1.0f / Rf, 0, 0, 0, 0, 1.0f / Rf, 0, 0, 0, 0, -2.0f / (fr - nr), 0,
+                 0, 0, -(fr + nr) / (fr - nr), 1};
+  mat_mul(P, V, lvp);
+}
+
+// dijalankan tepat sebelum eglSwapBuffers; menggambar ulang terrain frame ini dari arah matahari
+static void shadow_pass() {
+  g_lvp_valid = false;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n == 0 || !sun_enabled()) return;
+  static bool first_pass = true;
+  if (first_pass) bc("pass bayangan pertama mulai");
+  float lvp[16];
+  build_light_matrix(lvp);
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  gx.BindFramebuffer(0x8D40, g_sh_fbo);
+  gx.Viewport(0, 0, g_sh_size, g_sh_size);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0201); gx.DepthMask(1); gx.ColorMask(0, 0, 0, 0);
+  gx.Enable(0x8037); gx.PolygonOffset(1.5f, 2.0f);
+  gx.ClearDepthf(1.0f); gx.Clear(0x100);
+  gx.UseProgram(g_sh_prog);
+  gx.UniformMatrix4fv(g_sh_loc_lvp, 1, 0, lvp);
+  gx.Uniform1i(g_sh_loc_tex, 0);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)g_atlas_tex);
+  for (int i = 0; i < 4; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.EnableVertexAttribArray(0); gx.EnableVertexAttribArray(1);
+  float margin = 14.0f / g_cfg_radius;
+  unsigned drawn = 0, skipped = 0;
+  for (int i = 0; i < n && drawn < 1800; i++) {
+    const DrawRec& r = g_dl[cur][i];
+    float cx = r.o[0] + 8.0f, cy = r.o[1] + 8.0f, cz = r.o[2] + 8.0f;
+    float x = lvp[0] * cx + lvp[4] * cy + lvp[8] * cz + lvp[12];
+    float y = lvp[1] * cx + lvp[5] * cy + lvp[9] * cz + lvp[13];
+    if (fabsf(x) > 1.0f + margin || fabsf(y) > 1.0f + margin) { skipped++; continue; }
+    gx.BindBuffer(0x8892, (unsigned)r.vbo);
+    gx.BindBuffer(0x8893, (unsigned)r.ibo);
+    int vs = 0, is = 0;
+    gx.GetBufferParameteriv(0x8892, 0x8764, &vs);
+    gx.GetBufferParameteriv(0x8893, 0x8764, &is);
+    if (vs != r.vsz || is != r.isz || vs <= 0 || is <= 0) { skipped++; continue; }   // buffer sudah diganti/dihapus game
+    gx.VertexAttribPointer(0, 3, 0x1406, 0, 24, (const void*)0);
+    gx.VertexAttribPointer(1, 2, 0x1403, 1, 24, (const void*)20);
+    gx.Uniform3f(g_sh_loc_org, r.o[0], r.o[1], r.o[2]);
+    gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
+    drawn++;
+  }
+  // ---- mob, item, dan kotak pemain (orang pertama) ----
+  unsigned edrawn = 0;
+  if (g_level >= 4 && g_eh_prog && g_eh_loc >= 0) {
+    gx.UseProgram(g_eh_prog);
+    gx.DisableVertexAttribArray(1);
+    gx.EnableVertexAttribArray(0);
+    float emg = 6.0f / g_cfg_radius;
+    for (int i = 0; i < g_en; i++) {
+      const EntRec& r = g_el[i];
+      float x = lvp[0] * r.m[12] + lvp[4] * r.m[13] + lvp[8] * r.m[14] + lvp[12];
+      float y = lvp[1] * r.m[12] + lvp[5] * r.m[13] + lvp[9] * r.m[14] + lvp[13];
+      if (fabsf(x) > 1.0f + emg || fabsf(y) > 1.0f + emg) continue;
+      gx.BindBuffer(0x8892, (unsigned)r.vbo);
+      int evs = 0, eis = 0;
+      gx.GetBufferParameteriv(0x8892, 0x8764, &evs);
+      if (evs != r.vsz || evs <= 0) continue;
+      if (r.indexed) {
+        gx.BindBuffer(0x8893, (unsigned)r.ibo);
+        gx.GetBufferParameteriv(0x8893, 0x8764, &eis);
+        if (eis != r.isz || eis <= 0) continue;
+      }
+      gx.VertexAttribPointer(0, r.psize, (unsigned)r.ptype, (unsigned char)r.pnorm, r.pstride, (const void*)r.poff);
+      float lm[16]; mat_mul(lvp, r.m, lm);
+      gx.UniformMatrix4fv(g_eh_loc, 1, 0, lm);
+      if (r.indexed) gx.DrawElements(r.mode, r.count, r.type, (const void*)r.idx);
+      else gx.DrawArrays(r.mode, (int)r.first, r.count);
+      edrawn++;
+    }
+    // game tidak menggambar tubuh pemain di orang pertama: dipasang kotak sederhana (0.6 x 1.8 x 0.4) di posisi kamera
+    if (g_cfg_playerbox && g_cube_vbo && g_cube_ibo && g_hand_frame + 1 == g_frames && g_view_ok) {
+      float fx = -g_wv[2], fz = -g_wv[10];
+      float fl = sqrtf(fx * fx + fz * fz);
+      if (fl > 1e-4f) {
+        fx /= fl; fz /= fl;
+        float M[16] = {fz * 0.6f, 0, -fx * 0.6f, 0,   0, 1.8f, 0, 0,   fx * 0.4f, 0, fz * 0.4f, 0,   0, -0.72f, 0, 1};
+        float lm[16]; mat_mul(lvp, M, lm);
+        gx.BindBuffer(0x8892, g_cube_vbo); gx.BindBuffer(0x8893, g_cube_ibo);
+        gx.VertexAttribPointer(0, 3, 0x1406, 0, 12, (const void*)0);
+        gx.UniformMatrix4fv(g_eh_loc, 1, 0, lm);
+        gx.DrawElements(4, 36, 0x1403, (const void*)0);
+        edrawn++;
+      }
+    }
+  }
+  g_st_ent += edrawn;
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  memcpy(g_lvp, lvp, sizeof(lvp));
+  g_lvp_valid = true;
+  if (first_pass) { first_pass = false; bc("pass bayangan pertama selesai"); }
+  g_st_pass++; g_st_draws += drawn; g_st_skipped += skipped; g_st_ms += (mono_sec() - t0) * 1000.0;
+  if (err != 0 && g_st_logs < 8) { g_st_logs++; sh_log("shadow: kesalahan GL 0x%x setelah pass (frame %u)\n", err, g_frames); }
+}
+
+// akhir frame: gambar peta bayangan lalu tukar daftar draw
+static void shadow_end_frame() {
+  if (g_level < 1) return;
+  bool had_terrain = (g_tframe + 1 == g_frames);   // g_frames sudah naik di awal spy_swap
+  if (had_terrain) {
+    g_guard_frames++;
+    if (g_guard_armed && g_guard_frames >= 90) {
+      guard_write(g_level, 0); g_guard_armed = false;
+      sh_log("pipe3d: level %d lolos 90 frame terrain tanpa crash\n", g_level);
+    }
+  }
+  if (g_level < 2 || !had_terrain) return;
+  if (g_sh_state == 0) {   // inisialisasi di titik aman: akhir frame, tidak sedang di tengah draw game
+    bc("shadow_init mulai");
+    shadow_init();
+    bc(g_sh_state == 1 ? "shadow_init selesai (siap)" : "shadow_init selesai (gagal/nonaktif)");
+    return;
+  }
+  if (g_sh_state != 1) return;
+  g_st_frames++;
+  if (g_delta_exact) g_st_delta_ok++;
+  else if (g_delta_ok) { g_cam_est[0] += g_delta[0]; g_cam_est[1] += g_delta[1]; g_cam_est[2] += g_delta[2]; }   // tidak ada chunk cocok: pakai dugaan
+  shadow_pass();
+  g_dcur = 1 - g_dcur;
+  g_dn[g_dcur] = 0;
+  if (g_frames % 600 == 0 && g_st_logs < 12) {
+    g_st_logs++;
+    sh_log("shadow frame %u: pass=%u draw/pass=%.0f lewati/pass=%.0f ms/pass=%.2f delta_tepat=%u/%u matahari=(%.3f %.3f %.3f) valid=%d lvp=%d | mob: total=%u terekam=%u dilewati=%u tangan=%u digambar/pass=%.1f orang_pertama=%d\n",
+           g_frames, g_st_pass, g_st_pass ? (double)g_st_draws / g_st_pass : 0.0, g_st_pass ? (double)g_st_skipped / g_st_pass : 0.0,
+           g_st_pass ? g_st_ms / g_st_pass : 0.0, g_st_delta_ok, g_st_frames, g_sun[0], g_sun[1], g_sun[2],
+           (int)g_sun_valid, (int)g_lvp_valid, g_ent_total, g_ent_rec, g_ent_skip, g_ent_hand, g_st_pass ? (double)g_st_ent / g_st_pass : 0.0,
+           (int)(g_hand_frame + 1 == g_frames));
+    g_st_pass = g_st_draws = g_st_skipped = g_st_delta_ok = g_st_frames = 0; g_st_ms = 0; g_st_ent = 0;
+    g_ent_total = g_ent_rec = g_ent_skip = g_ent_hand = 0;
+  }
+}
+
+static void spy_use_program(GLuint_t p) {
+  g_cur_prog = p;
+  if (p) {
+    ProgStat* s = prog_stat(p);
+    if (s->kind == 0) {   // program terrain = yang punya uniform CHUNK_ORIGIN_AND_SCALE
+      cap_init();
+      int loc = f_getuloc ? f_getuloc(p, "CHUNK_ORIGIN_AND_SCALE") : -1;
+      s->kind = loc >= 0 ? 1 : 2;
+      s->loc_origin = loc;
+      s->loc_wv = f_getuloc ? f_getuloc(p, "WORLDVIEW") : -1;
+      s->loc_proj = f_getuloc ? f_getuloc(p, "PROJ") : -1;
+      s->loc_wvp = f_getuloc ? f_getuloc(p, "WORLDVIEWPROJ") : -1;
+      s->loc_cc = f_getuloc ? f_getuloc(p, "CURRENT_COLOR") : -1;
+      s->loc_vp = f_getuloc ? f_getuloc(p, "VIEW_DIRECTION") : -1;   // uniform bawaan engine yang dipinjam untuk arah matahari
+      s->loc_t2 = f_getuloc ? f_getuloc(p, "TEXTURE_2") : -1;
+      s->vp_state = 0;
+      s->loc_world = f_getuloc ? f_getuloc(p, "WORLD") : -1;
+      if (s->kind == 2 && s->loc_world >= 0 && s->loc_wvp >= 0) s->kind = 3;   // program entity (mob, item, tangan): punya WORLD dan WORLDVIEWPROJ
+    }
+  }
+  o_useprog(p);
+}
+static void spy_draw_elements(unsigned mode, int count, unsigned type, const void* idx) {
+  ProgStat* s = prog_stat(g_cur_prog);
+  s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = type;
+  if (g_capturing) {
+    capture_other(s, mode, count, s->kind != 1);
+    if (s->kind == 1) capture_draw(s, mode, count, type, idx);
+  }
+  bool u2 = false;
+  if (s->kind == 1) u2 = terrain_draw(s, count, type, idx);
+  else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
+  else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
+  o_drawel(mode, count, type, idx);
+  if (u2) terrain_draw_post();
+}
+static void spy_draw_arrays(unsigned mode, int first, int count) {
+  ProgStat* s = prog_stat(g_cur_prog);
+  s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = 0;
+  if (g_capturing) capture_other(s, mode, count, s->kind != 1);
+  if (s->kind == 3) entity_draw(s, mode, first, count, 0, nullptr, false);
+  o_drawar(mode, first, count);
+}
+static void spy_bind_fb(unsigned target, GLuint_t fb) { g_cur_fbo = fb; g_fbo_binds++; o_bindfb(target, fb); }
+static void spy_viewport(int x, int y, int w, int h) {
+  g_vp_calls++;
+  int i = 0;
+  for (; i < g_nvp; i++) if (g_vp_w[i] == w && g_vp_h[i] == h) break;
+  if (i == g_nvp && g_nvp < 8) { g_vp_w[i] = w; g_vp_h[i] = h; g_vp_n[i] = 0; g_nvp++; }
+  if (i < g_nvp) g_vp_n[i]++;
+  o_viewport(x, y, w, h);
+}
+
+typedef const unsigned char* (*gl_getstring_t)(unsigned);
+typedef void (*gl_getprogramiv_t)(unsigned, unsigned, int*);
+typedef void (*gl_getactive_t)(unsigned, unsigned, int, int*, int*, unsigned*, char*);
+typedef void (*gl_getintegerv_t)(unsigned, int*);
+
+static void describe_program(FILE* f, void* lib, unsigned id) {
+  gl_getprogramiv_t giv = (gl_getprogramiv_t)dlsym(lib, "glGetProgramiv");
+  gl_getactive_t gau = (gl_getactive_t)dlsym(lib, "glGetActiveUniform");
+  gl_getactive_t gaa = (gl_getactive_t)dlsym(lib, "glGetActiveAttrib");
+  if (!giv || !gau || !gaa) { fprintf(f, "  (fungsi query GL tidak ada)\n"); return; }
+  int nu = 0, na = 0;
+  giv(id, 0x8B86, &nu);   // GL_ACTIVE_UNIFORMS
+  giv(id, 0x8B89, &na);   // GL_ACTIVE_ATTRIBUTES
+  fprintf(f, "  attrib:");
+  for (int i = 0; i < na && i < 16; i++) {
+    char name[64] = {0}; int len = 0, size = 0; unsigned type = 0;
+    gaa(id, i, 63, &len, &size, &type, name);
+    fprintf(f, " %s(0x%x)", name, type);
+  }
+  fprintf(f, "\n  uniform:");
+  for (int i = 0; i < nu && i < 40; i++) {
+    char name[64] = {0}; int len = 0, size = 0; unsigned type = 0;
+    gau(id, i, 63, &len, &size, &type, name);
+    fprintf(f, " %s(0x%x)", name, type);
+  }
+  fprintf(f, "\n");
+}
+
+static unsigned spy_swap(void* dpy, void* surf) {
+  g_frames++;
+  if (g_capturing) {
+    g_capturing = false;
+    if (g_cap_f) { fprintf(g_cap_f, "T2 selesai frame=%u, total draw terrain=%u\n", g_frames, g_cap_draws); fclose(g_cap_f); g_cap_f = nullptr; }
+  }
+  {
+    double tnow = mono_sec();
+    if (g_next_cap == 0) g_next_cap = tnow + 60.0;
+    if (!g_cfg_loaded) cfg_load();
+    if (g_cfg_capture && tnow >= g_next_cap && g_cap_count < 30) {
+      g_cap_count++;
+      g_next_cap = tnow + 45.0;
+      g_cap_f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+      if (g_cap_f) {
+        g_capturing = true; g_cap_draws = 0; g_cap_mat = false; g_seq = 0; g_cap_other = 0;
+        g_cap_full = (g_cap_count == 1);
+        fprintf(g_cap_f, "T2 mulai frame=%u capture=%u\n", g_frames, g_cap_count);
+      }
+    }
+  }
+  void* lib = dlopen("libGLESv2.so", RTLD_NOW);
+  if (!g_gl_info_done && g_frames >= 60 && lib) {
+    g_gl_info_done = true;
+    gl_getstring_t gs = (gl_getstring_t)dlsym(lib, "glGetString");
+    gl_getintegerv_t gi = (gl_getintegerv_t)dlsym(lib, "glGetIntegerv");
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f && gs) {
+      const char* ver = (const char*)gs(0x1F02);
+      const char* ren = (const char*)gs(0x1F01);
+      const char* ext = (const char*)gs(0x1F03);
+      fprintf(f, "GL version=%s renderer=%s\n", ver ? ver : "?", ren ? ren : "?");
+      if (ext) {
+        fprintf(f, "GL ext: depth_texture=%d depth24=%d shadow_samplers=%d standard_derivatives=%d texture_half_float=%d\n",
+                strstr(ext, "OES_depth_texture") != nullptr, strstr(ext, "OES_depth24") != nullptr,
+                strstr(ext, "EXT_shadow_samplers") != nullptr, strstr(ext, "OES_standard_derivatives") != nullptr,
+                strstr(ext, "OES_texture_half_float") != nullptr);
+      }
+      int units = 0; if (gi) gi(0x8872, &units);   // GL_MAX_TEXTURE_IMAGE_UNITS
+      fprintf(f, "GL max texture units=%d\n", units);
+    }
+    if (f) fclose(f);
+  }
+  if (g_frames % 300 == 0 && g_summaries < 1) {
+    g_summaries++;
+    FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+    if (f) {
+      fprintf(f, "== GL ringkasan %u (frame %u): bindFramebuffer=%u, viewport=%u, fbo terakhir=%u\n",
+              g_summaries, g_frames, g_fbo_binds, g_vp_calls, g_cur_fbo);
+      for (int i = 0; i < g_nvp; i++) fprintf(f, " viewport %dx%d: %u kali\n", g_vp_w[i], g_vp_h[i], g_vp_n[i]);
+      for (int i = 0; i < g_np; i++) {
+        ProgStat* s = &g_prog[i];
+        if (!s->draws) continue;
+        fprintf(f, " program %u: draw=%u verts=%u mode=0x%x type=0x%x\n", s->id, s->draws, s->verts, s->mode, s->type);
+        if (!s->described && lib) { s->described = true; describe_program(f, lib, s->id); }
+        s->draws = 0; s->verts = 0;
+      }
+      fclose(f);
+    }
+    g_fbo_binds = 0; g_vp_calls = 0;
+    for (int i = 0; i < g_nvp; i++) g_vp_n[i] = 0;
+  }
+  shadow_end_frame();
+  return o_swap(dpy, surf);
+}
+
+struct GotHook { const char* name; void* hook; void** orig; bool found; };
+static GotHook g_got_hooks[] = {
+  {"glUseProgram", (void*)spy_use_program, (void**)&o_useprog, false},
+  {"glDrawElements", (void*)spy_draw_elements, (void**)&o_drawel, false},
+  {"glDrawArrays", (void*)spy_draw_arrays, (void**)&o_drawar, false},
+  {"glBindFramebuffer", (void*)spy_bind_fb, (void**)&o_bindfb, false},
+  {"glViewport", (void*)spy_viewport, (void**)&o_viewport, false},
+  {"eglSwapBuffers", (void*)spy_swap, (void**)&o_swap, false},
+};
+
+struct LibInfo { uintptr_t base; const Elf32_Phdr* ph; int n; };
+static int find_lib_cb(struct dl_phdr_info* info, size_t, void* data) {
+  if (info->dlpi_name && strstr(info->dlpi_name, "libminecraftpe.so")) {
+    LibInfo* li = (LibInfo*)data;
+    li->base = (uintptr_t)info->dlpi_addr;
+    li->ph = (const Elf32_Phdr*)info->dlpi_phdr;
+    li->n = info->dlpi_phnum;
+    return 1;
+  }
+  return 0;
+}
+
+static void patch_got_entry(uint32_t* got, void* hook, void** orig) {
+  if (*orig == nullptr) *orig = (void*)(uintptr_t)(*got);
+  uintptr_t page = (uintptr_t)got & ~(uintptr_t)4095;
+  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE) != 0) return;
+  *got = (uint32_t)(uintptr_t)hook;
+  mprotect((void*)page, 4096, PROT_READ);
+}
+
+static void install_gl_spy() {
+  LibInfo li = {0, nullptr, 0};
+  dl_iterate_phdr(find_lib_cb, &li);
+  if (!li.base || !li.ph) { LOG("spy: lib tidak ditemukan"); return; }
+  const Elf32_Dyn* dyn = nullptr;
+  for (int i = 0; i < li.n; i++) if (li.ph[i].p_type == PT_DYNAMIC) { dyn = (const Elf32_Dyn*)(li.base + li.ph[i].p_vaddr); break; }
+  if (!dyn) { LOG("spy: PT_DYNAMIC tidak ada"); return; }
+  uintptr_t symtab = 0, strtab = 0, jmprel = 0, rel = 0; uint32_t pltrelsz = 0, relsz = 0;
+  for (const Elf32_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
+    uintptr_t v = d->d_un.d_ptr;
+    if (d->d_tag == DT_SYMTAB) symtab = v;
+    else if (d->d_tag == DT_STRTAB) strtab = v;
+    else if (d->d_tag == DT_JMPREL) jmprel = v;
+    else if (d->d_tag == DT_PLTRELSZ) pltrelsz = d->d_un.d_val;
+    else if (d->d_tag == DT_REL) rel = v;
+    else if (d->d_tag == DT_RELSZ) relsz = d->d_un.d_val;
+  }
+  // Pada beberapa versi Android, alamat di tabel dinamis sudah mutlak; pada yang lain masih relatif
+  if (symtab && symtab < li.base) symtab += li.base;
+  if (strtab && strtab < li.base) strtab += li.base;
+  if (jmprel && jmprel < li.base) jmprel += li.base;
+  if (rel && rel < li.base) rel += li.base;
+  if (!symtab || !strtab) { LOG("spy: symtab/strtab kosong"); return; }
+  struct Sect { uintptr_t a; uint32_t sz; } sects[2] = {{jmprel, pltrelsz}, {rel, relsz}};
+  int patched = 0;
+  for (int s = 0; s < 2; s++) {
+    if (!sects[s].a) continue;
+    const Elf32_Rel* r = (const Elf32_Rel*)sects[s].a;
+    int n = sects[s].sz / sizeof(Elf32_Rel);
+    for (int i = 0; i < n; i++) {
+      unsigned type = ELF32_R_TYPE(r[i].r_info), sym = ELF32_R_SYM(r[i].r_info);
+      if (type != 21 && type != 22) continue;   // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT
+      if (!sym) continue;
+      const Elf32_Sym* sy = (const Elf32_Sym*)symtab + sym;
+      const char* name = (const char*)strtab + sy->st_name;
+      for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++) {
+        if (strcmp(name, g_got_hooks[k].name) == 0) {
+          patch_got_entry((uint32_t*)(li.base + r[i].r_offset), g_got_hooks[k].hook, g_got_hooks[k].orig);
+          g_got_hooks[k].found = true; patched++;
+        }
+      }
+    }
+  }
+  for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++)
+    LOG("spy: %s %s", g_got_hooks[k].name, g_got_hooks[k].found ? "dipasang" : "TIDAK ditemukan");
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_log.txt", "a");
+  if (f) {
+    fprintf(f, "spy GL: dipasang %d entri GOT;", patched);
+    for (unsigned k = 0; k < sizeof(g_got_hooks) / sizeof(g_got_hooks[0]); k++)
+      fprintf(f, " %s=%d", g_got_hooks[k].name, (int)g_got_hooks[k].found);
+    fprintf(f, "\n");
+    fclose(f);
+  }
 }
 
 static void* worker(void*) {
@@ -627,6 +1403,7 @@ static void* worker(void*) {
     if (!base) usleep(100000);
   }
   if (!base) { LOG("libminecraftpe.so tidak ditemukan"); return nullptr; }
+  install_gl_spy();   // tahap 1: hanya mencatat, tidak mengubah tampilan
   uintptr_t target = base + OFF_TESS_BLOCK;
   if (memcmp((void*)target, SIG_TESS_BLOCK, 8) != 0) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
@@ -641,7 +1418,6 @@ static void* worker(void*) {
   } else {
     LOG("hook gagal dipasang");
   }
-  install_anim_hooks(base);
   return nullptr;
 }
 
