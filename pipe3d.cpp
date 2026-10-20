@@ -1,5 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + LENTERA tahap 1: blok baru "lantern" didaftarkan setelah Block::initBlocks (aktif kalau pipe3d_lantern.txt berisi enabled=1).
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
 // Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
 // Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
@@ -1503,6 +1504,116 @@ static void install_biome_patch(uintptr_t base) {
 }
 // =======================================================================
 
+// ===================== LENTERA (tahap 1: daftarkan blok baru) =====================
+// Blok "lantern" dibuat sebagai blok BARU di ID kosong (bukan mengganti blok lain).
+// Cara: setelah Block::initBlocks() selesai, panggil registerBlock<Block, char const(&)[8], int, Material const&>
+// (fungsi game yang sama dipakai untuk blok polos), lalu setLightEmission(1.0) = cahaya level 15.
+// Tahap 1 hanya mendaftarkan blok dan mencatat hasilnya di pipe3d_lantern_log.txt; belum ada bentuk/gambar/item.
+// Pengaman: baru jalan kalau file /sdcard/games/com.mojang/pipe3d_lantern.txt ada dan berisi enabled=1.
+static const uintptr_t OFF_INIT_BLOCKS = 0xCB2CD9;          // Block::initBlocks()
+static const uint8_t SIG_INIT_BLOCKS[10] = {0x2d,0xe9,0xf0,0x4f,0x81,0xb0,0x2d,0xed,0x02,0x8b}; // push.w, sub sp, vpush (10 byte utuh)
+static const uintptr_t OFF_REGISTER_BLOCK_8 = 0xCB71B1;     // registerBlock<Block, char const(&)[8], int, Material const&>
+static const uintptr_t OFF_GET_MATERIAL = 0xD7A999;         // Material::getMaterial(MaterialType)
+static const uintptr_t OFF_SET_LIGHT_EMISSION = 0xCC3F25;   // Block::setLightEmission(float)
+static const uintptr_t OFF_MBLOCKS = 0x1705814;             // Block::mBlocks[256]
+static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt1 wood2 stone3 metal4 (cocok dengan blok yang sudah ada)
+
+typedef void (*InitBlocksFn)();
+typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* material);
+typedef const void* (*GetMaterialFn)(int type);
+typedef void* (*SetLightEmissionFn)(void* block, float v);
+static InitBlocksFn orig_init_blocks = nullptr;
+static int g_lantern_id = -1;
+
+static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void lantern_log(const char* fmt, ...) {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_lantern_log.txt", "a");
+  if (!f) return;
+  va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+  fputc('\n', f); fclose(f);
+}
+
+static bool lantern_enabled() {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_lantern.txt", "r");
+  if (!f) return false;
+  char line[64]; bool on = false;
+  while (fgets(line, sizeof(line), f)) { int v; if (sscanf(line, " enabled=%d", &v) == 1) on = (v != 0); }
+  fclose(f);
+  return on;
+}
+
+static void register_lantern() {
+  void** blocks = (void**)(g_base + OFF_MBLOCKS);
+  int id = -1;
+  for (int i = 200; i < 256; i++) if (!blocks[i]) { id = i; break; }   // ID kosong pertama di 200..255
+  if (id < 0) { lantern_log("tidak ada ID kosong di 200..255, dibatalkan"); return; }
+  GetMaterialFn get_material = (GetMaterialFn)(g_base + OFF_GET_MATERIAL);
+  RegBlock8Fn reg = (RegBlock8Fn)(g_base + OFF_REGISTER_BLOCK_8);
+  SetLightEmissionFn set_light = (SetLightEmissionFn)(g_base + OFF_SET_LIGHT_EMISSION);
+  const void* mat = get_material(MATERIAL_TYPE_METAL);
+  if (!mat) { lantern_log("material tidak ditemukan, dibatalkan"); return; }
+  static const char name[8] = {'l','a','n','t','e','r','n','\0'};
+  int idv = id;
+  void* blk = reg(&name, &idv, mat);
+  if (!blk) { lantern_log("registerBlock mengembalikan null"); return; }
+  set_light(blk, 1.0f);
+  g_lantern_id = id;
+  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p", id, blk, blocks[id]);
+}
+
+static void hook_init_blocks() {
+  orig_init_blocks();             // semua blok bawaan sudah terdaftar
+  if (lantern_enabled()) register_lantern();
+  else lantern_log("lentera nonaktif (pipe3d_lantern.txt tidak ada / enabled=0)");
+}
+
+// Seperti install_hook, tapi menyalin copy_len byte awal (harus instruksi utuh dan tidak bergantung posisi).
+// Dipakai untuk fungsi yang 8 byte pertamanya memotong instruksi 32-bit.
+static bool install_hook_len(uintptr_t target, void* hook, void** orig_out, int copy_len) {
+  uint8_t* t = (uint8_t*)target;
+  uint8_t* tr = (uint8_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (tr == (uint8_t*)MAP_FAILED) return false;
+  memcpy(tr, t, copy_len);
+  int ldr_off = copy_len;                       // genap (Thumb)
+  int lit_off = (((ldr_off + 4) & ~3) + 4);     // alamat literal, sejajar 4 byte, tepat 4 byte setelah titik baca PC
+  tr[ldr_off] = 0xDF; tr[ldr_off + 1] = 0xF8; tr[ldr_off + 2] = 0x04; tr[ldr_off + 3] = 0xF0;  // ldr.w pc, [pc, #4]
+  uint32_t back = (uint32_t)(target + copy_len) | 1;
+  memcpy(tr + lit_off, &back, 4);
+  __builtin___clear_cache((char*)tr, (char*)tr + lit_off + 4);
+  *orig_out = (void*)((uintptr_t)tr | 1);
+
+  uintptr_t page = target & ~(uintptr_t)4095;
+  if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+  uint8_t patch[8] = {0xDF, 0xF8, 0x00, 0xF0, 0, 0, 0, 0};
+  uint32_t h = (uint32_t)(uintptr_t)hook | 1;
+  memcpy(patch + 4, &h, 4);
+  memcpy(t, patch, 8);
+  __builtin___clear_cache((char*)t, (char*)t + 8);
+  mprotect((void*)page, 4096, PROT_READ | PROT_EXEC);
+  return true;
+}
+
+static void install_lantern_patch(uintptr_t base) {
+  g_base = base;
+  uintptr_t target = base + OFF_INIT_BLOCKS - 1;   // OFF_INIT_BLOCKS punya bit Thumb
+  if (memcmp((void*)target, SIG_INIT_BLOCKS, 10) != 0) {
+    LOG("lentera: tanda Block::initBlocks tidak cocok, dibatalkan");
+    return;
+  }
+  void** blocks = (void**)(g_base + OFF_MBLOCKS);
+  if (blocks[1]) {   // initBlocks sudah selesai sebelum hook terpasang: daftarkan langsung (jalur cadangan)
+    lantern_log("initBlocks sudah jalan sebelum hook; jalur cadangan");
+    if (lantern_enabled()) register_lantern();
+    return;
+  }
+  if (install_hook_len(target, (void*)hook_init_blocks, (void**)&orig_init_blocks, 10))
+    LOG("lentera: hook initBlocks terpasang");
+  else
+    LOG("lentera: hook initBlocks gagal");
+}
+// ==================================================================================
+
 static void* worker(void*) {
   uintptr_t base = 0;
   for (int i = 0; i < 600 && !base; i++) {   // tunggu sampai 60 detik
@@ -1512,6 +1623,7 @@ static void* worker(void*) {
   if (!base) { LOG("libminecraftpe.so tidak ditemukan"); return nullptr; }
   install_gl_spy();   // tahap 1: hanya mencatat, tidak mengubah tampilan
   install_biome_patch(base);   // gunung tinggi (lihat bagian GUNUNG TINGGI)
+  install_lantern_patch(base);   // lentera tahap 1 (lihat bagian LENTERA)
   uintptr_t target = base + OFF_TESS_BLOCK;
   if (memcmp((void*)target, SIG_TESS_BLOCK, 8) != 0) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
