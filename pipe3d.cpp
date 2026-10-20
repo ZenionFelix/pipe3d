@@ -499,7 +499,7 @@ static void gx_init() {
 }
 
 // ---- pengaturan ----
-static int g_cfg_on = 1, g_cfg_size = 1024, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
+static int g_cfg_on = 1, g_cfg_size = 4096, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
 static float g_cfg_radius = 56.0f, g_cfg_bias = 0.12f;
 static bool g_cfg_loaded = false;
 static void cfg_load() {
@@ -511,7 +511,7 @@ static void cfg_load() {
   while (fgets(line, sizeof(line), f)) {
     int iv; float fv;
     if (sscanf(line, "on=%d", &iv) == 1) g_cfg_on = iv;
-    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 1024;
+    else if (sscanf(line, "size=%d", &iv) == 1) g_cfg_size = (iv >= 256 && iv <= 4096) ? iv : 4096;
     else if (sscanf(line, "capture=%d", &iv) == 1) g_cfg_capture = iv;
     else if (sscanf(line, "level=%d", &iv) == 1) g_cfg_level = (iv < 0) ? 0 : (iv > 4 ? 4 : iv);
     else if (sscanf(line, "playerbox=%d", &iv) == 1) g_cfg_playerbox = iv;
@@ -575,7 +575,7 @@ static void guard_arm() {
 static int g_sh_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
 static unsigned g_sh_tex = 0, g_sh_fbo = 0, g_sh_prog = 0, g_sh_ctex = 0;
 static int g_sh_loc_lvp = -1, g_sh_loc_org = -1, g_sh_loc_tex = -1;
-static int g_sh_size = 1024;
+static int g_sh_size = 4096;
 static unsigned g_eh_prog = 0, g_cube_vbo = 0, g_cube_ibo = 0;
 static int g_eh_loc = -1;
 static const float SH_DEPTH_D = 160.0f;   // jarak mata cahaya dari pusat; kedalaman total = 2 * D
