@@ -164,14 +164,16 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
   return true;
 }
 
-// Lentera: id diisi saat pendaftaran blok (tahap lentera), -1 = belum ada
-static int g_lantern_id = -1;
+// Lentera, rantai, lentera gantung: id diisi saat pendaftaran blok, -1 = belum ada
+#define LT_COUNT 3
+static int g_lt_ids[LT_COUNT] = {-1, -1, -1};
 static int g_lantern_shape = 0;
-// Kotak lentera dalam satuan 1/16 blok: x0,y0,z0,x1,y1,z1 (badan, tutup, cincin gantungan)
-static const float LANTERN_BOXES[3][6] = {
-  {5, 0, 5, 11, 7, 11},
-  {6, 7, 6, 10, 9, 10},
-  {7, 9, 7, 9, 10, 9},
+// Model tiap blok dalam kotak (satuan 1/16 blok): x0,y0,z0,x1,y1,z1
+struct LtModel { int n; float b[4][6]; };
+static const LtModel LT_MODELS[LT_COUNT] = {
+  {3, {{5, 0, 5, 11, 7, 11}, {6, 7, 6, 10, 9, 10}, {7, 9, 7, 9, 10, 9}}},       // lentera berdiri: badan, tutup, cincin
+  {2, {{6, 0, 7, 10, 16, 9}, {7, 0, 6, 9, 16, 10}}},                            // rantai: dua bidang menyilang
+  {3, {{5, 6, 5, 11, 13, 11}, {6, 13, 6, 10, 15, 10}, {7, 15, 7, 9, 16, 9}}},   // lentera gantung: tangkai sampai atas blok
 };
 
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
@@ -185,19 +187,22 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
     if (draw_leaf_planes(self, block, pos, data)) return 1;
     return orig_tess_block(self, block, pos, data);   // cadangan kalau gagal
   }
-  if (g_lantern_shape && g_lantern_id >= 0 && id == g_lantern_id) {
-    uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
-    uint8_t lsaved[28];
-    memcpy(lsaved, lb, 28);
-    int lr = 1;
-    for (int i = 0; i < 3; i++) {
-      float* f = (float*)lb;
-      for (int k = 0; k < 6; k++) f[k] = LANTERN_BOXES[i][k] / 16.0f;
-      lb[24] = 1;
-      lr = orig_tess_block(self, block, pos, data);
+  if (g_lantern_shape) {
+    for (int m = 0; m < LT_COUNT; m++) {
+      if (g_lt_ids[m] < 0 || id != g_lt_ids[m]) continue;
+      uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
+      uint8_t lsaved[28];
+      memcpy(lsaved, lb, 28);
+      int lr = 1;
+      for (int i = 0; i < LT_MODELS[m].n; i++) {
+        float* f = (float*)lb;
+        for (int k = 0; k < 6; k++) f[k] = LT_MODELS[m].b[i][k] / 16.0f;
+        lb[24] = 1;
+        lr = orig_tess_block(self, block, pos, data);
+      }
+      memcpy(lb, lsaved, 28);
+      return lr;
     }
-    memcpy(lb, lsaved, 28);
-    return lr;
   }
   if (id != ID_CRAFTING_TABLE) {
     return orig_tess_block(self, block, pos, data);
@@ -1529,7 +1534,7 @@ static void install_biome_patch(uintptr_t base) {
 // =======================================================================
 
 // ===================== LENTERA (blok baru) =====================
-// Blok "lantern" dibuat sebagai blok BARU di ID kosong (bukan mengganti blok lain).
+// Tiga blok BARU di ID kosong (bukan mengganti blok lain): lantern (berdiri), chain (rantai), hanging_lantern (gantung).
 // Urutan kerja (semua lewat hook di awal-akhir fungsi game):
 //  1. Setelah Block::initBlocks(): daftarkan blok lewat registerBlock<Block,...>, atur cahaya, kategori, bentuk.
 //     Item otomatis dibuat game di Item::addBlockItems (ia memeriksa semua blok yang terdaftar).
@@ -1567,18 +1572,28 @@ static const uintptr_t OFF_MLIGHTBLOCK = 0x1705C3C;         // Block::mLightBloc
 static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt1 wood2 stone3 metal4 (cocok dengan blok yang sudah ada)
 static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCategory: 1 blok, 2 dekorasi, 3 alat, 4 item
 
-// Gambar blok (format sama dengan blocks.json). Memakai tekstur bawaan: atas/bawah besi, sisi glowstone.
-// PENTING: registerBlock<BlockGraphics>(root, nama) mengambil root["lantern"] sendiri, jadi JSON harus
-// dibungkus dengan nama blok di tingkat paling luar (seperti isi blocks.json).
-static const char LANTERN_GFX_JSON[] =
-  "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}}";
-
-// Versi dengan tekstur lentera sendiri (lantern_side/top/icon, ditambahkan lewat terrain_texture.json + resources.json).
-// Dipakai kalau pipe3d_lantern.txt berisi texture=1. Tekstur harus sudah ada di APK, kalau tidak lentera salah gambar.
-static const char LANTERN_GFX_JSON_CUSTOM[] =
+// Gambar blok (format sama dengan blocks.json). registerBlock<BlockGraphics>(root, nama) mengambil root[nama] sendiri,
+// jadi JSON dibungkus dengan nama tiap blok di tingkat paling luar.
+// Versi bawaan (texture=0): memakai tekstur yang sudah ada di game.
+static const char LT_GFX_JSON_BASIC[] =
+  "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}},"
+  "\"chain\":{\"textures\":\"iron_block\"},"
+  "\"hanging_lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}}";
+// Versi tekstur sendiri (texture=1): gambar harus sudah ada di APK (lihat lantern_texture_pack.zip).
+static const char LT_GFX_JSON_CUSTOM[] =
   "{\"lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_side\"},"
+  "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}},"
+  "\"chain\":{\"textures\":{\"up\":\"chain_top\",\"down\":\"chain_top\",\"side\":\"chain_side\"},"
+  "\"carried_textures\":{\"up\":\"chain_top\",\"down\":\"chain_top\",\"side\":\"chain_icon\"}},"
+  "\"hanging_lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_hang_side\"},"
   "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}}}";
 static int g_lt_texture = 0;
+static const char* LT_NAMES[LT_COUNT] = {"lantern", "chain", "hanging_lantern"};
+static const float LT_LIGHT[LT_COUNT] = {1.0f, 0.0f, 1.0f};
+// Kotak seleksi (outline) tiap blok, satuan 1/16: xmin,ymin,zmin,xmax,ymax,zmax
+static const float LT_OUTLINE[LT_COUNT][6] = {
+  {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11},
+};
 
 typedef void (*InitVoidFn)();
 typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* material);
@@ -1598,7 +1613,7 @@ static InitVoidFn orig_init_blocks = nullptr;
 static InitVoidFn orig_bg_init_blocks = nullptr;
 static InitVoidFn orig_init_creative = nullptr;
 static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
-static int g_lt_id = 210;   // slot ID yang dipakai (200..242 tidak dipakai blok bawaan 0.15.10)
+static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lantern_log(const char* fmt, ...) {
@@ -1619,34 +1634,38 @@ static bool lantern_enabled() {
     else if (sscanf(line, " graphics=%d", &v) == 1) g_lt_graphics = v;
     else if (sscanf(line, " creative=%d", &v) == 1) g_lt_creative = v;
     else if (sscanf(line, " shape=%d", &v) == 1) g_lantern_shape = v;
-    else if (sscanf(line, " id=%d", &v) == 1) g_lt_id = v;
+    else if (sscanf(line, " id=%d", &v) == 1) g_lt_cfg_id[0] = v;
+    else if (sscanf(line, " chain_id=%d", &v) == 1) g_lt_cfg_id[1] = v;
+    else if (sscanf(line, " hang_id=%d", &v) == 1) g_lt_cfg_id[2] = v;
     else if (sscanf(line, " texture=%d", &v) == 1) g_lt_texture = v;
   }
   fclose(f);
   return on;
 }
 
-static void register_lantern() {
+static void register_one(int k) {
   void** blocks = (void**)(g_base + OFF_MBLOCKS);
   // Di akhir initBlocks game mengisi SEMUA ID yang kosong dengan blok pengganti bernama "" (itu sebabnya
-  // tidak ada ID null). Jadi kita ambil satu slot pengganti, kosongkan penunjuknya, lalu daftarkan lentera di situ.
-  int id = g_lt_id;
-  if (id < 1 || id > 255) id = 210;
+  // tidak ada ID null). Jadi kita ambil satu slot pengganti, kosongkan penunjuknya, lalu daftarkan blok di situ.
+  int id = g_lt_cfg_id[k];
+  if (id < 1 || id > 255) id = 210 + k;
   void* old_block = blocks[id];
   if (old_block && blocks[255] && *(void**)old_block != *(void**)blocks[255]) {
-    lantern_log("slot id=%d bukan blok pengganti (jenis berbeda), dibatalkan; ubah id= di pipe3d_lantern.txt", id);
+    lantern_log("[%s] slot id=%d bukan blok pengganti (jenis berbeda), dibatalkan; ubah id di pipe3d_lantern.txt", LT_NAMES[k], id);
     return;
   }
-  blocks[id] = nullptr;   // konstruktor Block mengisi slot ini lagi dengan lentera
+  blocks[id] = nullptr;   // konstruktor Block mengisi slot ini lagi dengan blok baru
   GetMaterialFn get_material = (GetMaterialFn)(g_base + OFF_GET_MATERIAL);
   RegBlock8Fn reg = (RegBlock8Fn)(g_base + OFF_REGISTER_BLOCK_8);
   const void* mat = get_material(MATERIAL_TYPE_METAL);
-  if (!mat) { blocks[id] = old_block; lantern_log("material tidak ditemukan, dibatalkan"); return; }
-  static const char name[8] = {'l','a','n','t','e','r','n','\0'};
+  if (!mat) { blocks[id] = old_block; lantern_log("[%s] material tidak ditemukan, dibatalkan", LT_NAMES[k]); return; }
+  char name[32];
+  memset(name, 0, sizeof(name));
+  strncpy(name, LT_NAMES[k], sizeof(name) - 1);   // fungsi game membaca nama sampai karakter NUL, jadi panjang larik tidak masalah
   int idv = id;
-  void* blk = reg(&name, &idv, mat);
-  if (!blk) { blocks[id] = old_block; lantern_log("registerBlock mengembalikan null"); return; }
-  ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, 1.0f);      // cahaya level 15
+  void* blk = reg((const char(*)[8])name, &idv, mat);
+  if (!blk) { blocks[id] = old_block; lantern_log("[%s] registerBlock mengembalikan null", LT_NAMES[k]); return; }
+  if (LT_LIGHT[k] > 0.0f) ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, LT_LIGHT[k]);   // cahaya
   ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, 1.0f);        // cepat dihancurkan
   int cat = CATEGORY_DECORATIONS;
   if (blocks[50]) cat = ((GetIntFn)(g_base + OFF_GET_CATEGORY))(blocks[50]);   // samakan dengan obor: pasti tab yang ada
@@ -1654,13 +1673,17 @@ static void register_lantern() {
   if (g_lantern_shape) {
     ((uint8_t*)(g_base + OFF_MSOLID))[id] = 0;        // bukan kubus penuh: sisi blok tetangga tetap digambar
     ((uint8_t*)(g_base + OFF_MLIGHTBLOCK))[id] = 0;   // tidak menghalangi cahaya
-    const float vmin[3] = {5.0f / 16, 0.0f, 5.0f / 16};
-    const float vmax[3] = {11.0f / 16, 10.0f / 16, 11.0f / 16};
+    const float vmin[3] = {LT_OUTLINE[k][0] / 16, LT_OUTLINE[k][1] / 16, LT_OUTLINE[k][2] / 16};
+    const float vmax[3] = {LT_OUTLINE[k][3] / 16, LT_OUTLINE[k][4] / 16, LT_OUTLINE[k][5] / 16};
     ((SetShapeFn)(g_base + OFF_SET_VISUAL_SHAPE))(blk, vmin, vmax);   // kotak seleksi
   }
-  g_lantern_id = id;
-  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p (pengganti lama=%p) kategori=%d item=%d graphics=%d creative=%d shape=%d",
-              id, blk, blocks[id], old_block, cat, g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
+  g_lt_ids[k] = id;
+  lantern_log("[%s] terdaftar: id=%d blok=%p mBlocks[id]=%p (pengganti lama=%p) kategori=%d item=%d graphics=%d creative=%d shape=%d",
+              LT_NAMES[k], id, blk, blocks[id], old_block, cat, g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
+}
+
+static void register_lantern() {
+  for (int k = 0; k < LT_COUNT; k++) register_one(k);
 }
 
 static void register_lantern_graphics() {
@@ -1670,38 +1693,50 @@ static void register_lantern_graphics() {
   memset(root, 0, sizeof(root));
   ((JsonReaderCtorFn)(g_base + OFF_JSON_READER_CTOR))(reader);
   ((JsonValueCtorFn)(g_base + OFF_JSON_VALUE_CTOR))(root, 0);
-  const char* js = g_lt_texture ? LANTERN_GFX_JSON_CUSTOM : LANTERN_GFX_JSON;
-  size_t jl = g_lt_texture ? sizeof(LANTERN_GFX_JSON_CUSTOM) - 1 : sizeof(LANTERN_GFX_JSON) - 1;
+  const char* js = g_lt_texture ? LT_GFX_JSON_CUSTOM : LT_GFX_JSON_BASIC;
+  size_t jl = g_lt_texture ? sizeof(LT_GFX_JSON_CUSTOM) - 1 : sizeof(LT_GFX_JSON_BASIC) - 1;
   bool ok = ((JsonParseFn)(g_base + OFF_JSON_READER_PARSE))(reader, js, js + jl, root, false);
   if (!ok) { lantern_log("gambar: JSON tidak terbaca"); return; }
-  static const char name[8] = {'l','a','n','t','e','r','n','\0'};
-  void* gfx = ((RegGfx8Fn)(g_base + OFF_REGISTER_GFX_8))(root, &name);
-  ((JsonValueDtorFn)(g_base + OFF_JSON_VALUE_DTOR))(root);
   void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
-  lantern_log("gambar lentera (texture=%d): registerBlock=%p slot=%p", g_lt_texture, gfx, gt[g_lantern_id]);
-  if (gfx && !gt[g_lantern_id]) gt[g_lantern_id] = gfx;   // jaga-jaga kalau slot belum terisi
+  for (int k = 0; k < LT_COUNT; k++) {
+    if (g_lt_ids[k] < 0) continue;
+    char name[32];
+    memset(name, 0, sizeof(name));
+    strncpy(name, LT_NAMES[k], sizeof(name) - 1);
+    void* gfx = ((RegGfx8Fn)(g_base + OFF_REGISTER_GFX_8))(root, (const char(*)[8])name);
+    lantern_log("gambar [%s] (texture=%d): registerBlock=%p slot=%p", LT_NAMES[k], g_lt_texture, gfx, gt[g_lt_ids[k]]);
+    if (gfx && !gt[g_lt_ids[k]]) gt[g_lt_ids[k]] = gfx;   // jaga-jaga kalau slot belum terisi
+  }
+  ((JsonValueDtorFn)(g_base + OFF_JSON_VALUE_DTOR))(root);
 }
 
 // Pengaman: ikon di inventory membaca BlockGraphics::mBlocks[id]; kalau kosong, game crash saat ikon digambar.
 static void ensure_lantern_graphics_slot() {
   void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
-  if (!gt[g_lantern_id]) {
-    gt[g_lantern_id] = gt[ID_GLOWSTONE];   // cadangan: pakai gambar glowstone
-    lantern_log("gambar lentera kosong; memakai gambar glowstone sebagai cadangan (%p)", gt[g_lantern_id]);
+  for (int k = 0; k < LT_COUNT; k++) {
+    if (g_lt_ids[k] < 0) continue;
+    if (!gt[g_lt_ids[k]]) {
+      gt[g_lt_ids[k]] = gt[ID_GLOWSTONE];   // cadangan: pakai gambar glowstone
+      lantern_log("gambar [%s] kosong; memakai gambar glowstone sebagai cadangan (%p)", LT_NAMES[k], gt[g_lt_ids[k]]);
+    }
   }
 }
 
 static void add_lantern_creative() {
   void** items = (void**)(g_base + OFF_ITEM_MITEMS);
   void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
-  lantern_log("cek sebelum masuk kreatif: item=%p gambar=%p", items[g_lantern_id], gt[g_lantern_id]);
-  if (!items[g_lantern_id]) { lantern_log("item lentera tidak dibuat game; tidak dimasukkan ke inventory (mencegah crash)"); return; }
-  if (!gt[g_lantern_id]) { lantern_log("gambar lentera kosong; tidak dimasukkan ke inventory (mencegah crash)"); return; }
-  alignas(8) uint8_t inst[64];
-  memset(inst, 0, sizeof(inst));
-  ((ItemInstanceCtorFn)(g_base + OFF_ITEMINSTANCE_IIII))(inst, g_lantern_id, 1, 0);
-  ((AddCreativeFn)(g_base + OFF_ADD_CREATIVE))(inst);
-  lantern_log("lentera masuk inventory kreatif (id=%d)", g_lantern_id);
+  for (int k = 0; k < LT_COUNT; k++) {
+    int id = g_lt_ids[k];
+    if (id < 0) continue;
+    lantern_log("[%s] cek sebelum masuk kreatif: item=%p gambar=%p", LT_NAMES[k], items[id], gt[id]);
+    if (!items[id]) { lantern_log("[%s] item tidak dibuat game; tidak dimasukkan ke inventory (mencegah crash)", LT_NAMES[k]); continue; }
+    if (!gt[id]) { lantern_log("[%s] gambar kosong; tidak dimasukkan ke inventory (mencegah crash)", LT_NAMES[k]); continue; }
+    alignas(8) uint8_t inst[64];
+    memset(inst, 0, sizeof(inst));
+    ((ItemInstanceCtorFn)(g_base + OFF_ITEMINSTANCE_IIII))(inst, id, 1, 0);
+    ((AddCreativeFn)(g_base + OFF_ADD_CREATIVE))(inst);
+    lantern_log("[%s] masuk inventory kreatif (id=%d)", LT_NAMES[k], id);
+  }
 }
 
 static void hook_init_blocks() {
@@ -1711,14 +1746,14 @@ static void hook_init_blocks() {
 }
 static void hook_bg_init_blocks() {
   orig_bg_init_blocks();          // gambar semua blok bawaan sudah terdaftar
-  if (g_lantern_id >= 0) {
+  if (g_lt_ids[0] >= 0 || g_lt_ids[1] >= 0 || g_lt_ids[2] >= 0) {
     if (g_lt_graphics) register_lantern_graphics();
     ensure_lantern_graphics_slot();
   }
 }
 static void hook_init_creative() {
   orig_init_creative();           // daftar kreatif bawaan sudah terisi
-  if (g_lantern_id >= 0 && g_lt_creative) add_lantern_creative();
+  if (g_lt_creative) add_lantern_creative();
 }
 
 // Seperti install_hook, tapi menyalin copy_len byte awal (harus instruksi utuh dan tidak bergantung posisi).
