@@ -1568,8 +1568,10 @@ static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt
 static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCategory: 1 blok, 2 dekorasi, 3 alat, 4 item
 
 // Gambar blok (format sama dengan blocks.json). Memakai tekstur bawaan: atas/bawah besi, sisi glowstone.
+// PENTING: registerBlock<BlockGraphics>(root, nama) mengambil root["lantern"] sendiri, jadi JSON harus
+// dibungkus dengan nama blok di tingkat paling luar (seperti isi blocks.json).
 static const char LANTERN_GFX_JSON[] =
-  "{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}";
+  "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}}";
 
 typedef void (*InitVoidFn)();
 typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* material);
