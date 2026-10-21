@@ -1551,6 +1551,7 @@ static const uintptr_t OFF_SET_LIGHT_EMISSION = 0xCC3F25;   // Block::setLightEm
 static const uintptr_t OFF_SET_DESTROY_TIME = 0xCC51A9;     // Block::setDestroyTime(float)
 static const uintptr_t OFF_SET_VISUAL_SHAPE = 0xCC5211;     // Block::setVisualShape(Vec3 const&, Vec3 const&)
 static const uintptr_t OFF_SET_CATEGORY = 0xCB6BA5;         // Block::setCategory(CreativeItemCategory)
+static const uintptr_t OFF_GET_CATEGORY = 0xCC3EE5;         // Block::getCreativeCategory()
 static const uintptr_t OFF_ADD_CREATIVE = 0xC87715;         // Item::addCreativeItem(ItemInstance const&)
 static const uintptr_t OFF_ITEMINSTANCE_IIII = 0xC93E91;    // ItemInstance::ItemInstance(int id, int count, int aux)
 static const uintptr_t OFF_JSON_VALUE_CTOR = 0x119BC35;     // Json::Value::Value(ValueType)
@@ -1572,6 +1573,7 @@ typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* materia
 typedef const void* (*GetMaterialFn)(int type);
 typedef void* (*SetFloatFn)(void* block, float v);
 typedef void* (*SetIntFn)(void* block, int v);
+typedef int (*GetIntFn)(void* block);
 typedef void* (*SetShapeFn)(void* block, const float* vmin, const float* vmax);
 typedef void (*JsonValueCtorFn)(void* self, int type);
 typedef void (*JsonValueDtorFn)(void* self);
@@ -1624,7 +1626,9 @@ static void register_lantern() {
   if (!blk) { lantern_log("registerBlock mengembalikan null"); return; }
   ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, 1.0f);      // cahaya level 15
   ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, 1.0f);        // cepat dihancurkan
-  if (g_lt_item) ((SetIntFn)(g_base + OFF_SET_CATEGORY))(blk, CATEGORY_DECORATIONS);   // dibaca Item::addBlockItems
+  int cat = CATEGORY_DECORATIONS;
+  if (blocks[50]) cat = ((GetIntFn)(g_base + OFF_GET_CATEGORY))(blocks[50]);   // samakan dengan obor: pasti tab yang ada
+  if (g_lt_item) ((SetIntFn)(g_base + OFF_SET_CATEGORY))(blk, cat);            // dibaca Item::addBlockItems
   if (g_lantern_shape) {
     ((uint8_t*)(g_base + OFF_MSOLID))[id] = 0;        // bukan kubus penuh: sisi blok tetangga tetap digambar
     ((uint8_t*)(g_base + OFF_MLIGHTBLOCK))[id] = 0;   // tidak menghalangi cahaya
@@ -1633,8 +1637,8 @@ static void register_lantern() {
     ((SetShapeFn)(g_base + OFF_SET_VISUAL_SHAPE))(blk, vmin, vmax);   // kotak seleksi
   }
   g_lantern_id = id;
-  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p item=%d graphics=%d creative=%d shape=%d",
-              id, blk, blocks[id], g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
+  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p kategori=%d item=%d graphics=%d creative=%d shape=%d",
+              id, blk, blocks[id], cat, g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
 }
 
 static void register_lantern_graphics() {
