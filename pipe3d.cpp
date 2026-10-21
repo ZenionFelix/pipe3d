@@ -1573,6 +1573,13 @@ static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCateg
 static const char LANTERN_GFX_JSON[] =
   "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}}";
 
+// Versi dengan tekstur lentera sendiri (lantern_side/top/icon, ditambahkan lewat terrain_texture.json + resources.json).
+// Dipakai kalau pipe3d_lantern.txt berisi texture=1. Tekstur harus sudah ada di APK, kalau tidak lentera salah gambar.
+static const char LANTERN_GFX_JSON_CUSTOM[] =
+  "{\"lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_side\"},"
+  "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}}}";
+static int g_lt_texture = 0;
+
 typedef void (*InitVoidFn)();
 typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* material);
 typedef const void* (*GetMaterialFn)(int type);
@@ -1613,6 +1620,7 @@ static bool lantern_enabled() {
     else if (sscanf(line, " creative=%d", &v) == 1) g_lt_creative = v;
     else if (sscanf(line, " shape=%d", &v) == 1) g_lantern_shape = v;
     else if (sscanf(line, " id=%d", &v) == 1) g_lt_id = v;
+    else if (sscanf(line, " texture=%d", &v) == 1) g_lt_texture = v;
   }
   fclose(f);
   return on;
@@ -1662,14 +1670,15 @@ static void register_lantern_graphics() {
   memset(root, 0, sizeof(root));
   ((JsonReaderCtorFn)(g_base + OFF_JSON_READER_CTOR))(reader);
   ((JsonValueCtorFn)(g_base + OFF_JSON_VALUE_CTOR))(root, 0);
-  bool ok = ((JsonParseFn)(g_base + OFF_JSON_READER_PARSE))(
-      reader, LANTERN_GFX_JSON, LANTERN_GFX_JSON + sizeof(LANTERN_GFX_JSON) - 1, root, false);
+  const char* js = g_lt_texture ? LANTERN_GFX_JSON_CUSTOM : LANTERN_GFX_JSON;
+  size_t jl = g_lt_texture ? sizeof(LANTERN_GFX_JSON_CUSTOM) - 1 : sizeof(LANTERN_GFX_JSON) - 1;
+  bool ok = ((JsonParseFn)(g_base + OFF_JSON_READER_PARSE))(reader, js, js + jl, root, false);
   if (!ok) { lantern_log("gambar: JSON tidak terbaca"); return; }
   static const char name[8] = {'l','a','n','t','e','r','n','\0'};
   void* gfx = ((RegGfx8Fn)(g_base + OFF_REGISTER_GFX_8))(root, &name);
   ((JsonValueDtorFn)(g_base + OFF_JSON_VALUE_DTOR))(root);
   void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
-  lantern_log("gambar lentera: registerBlock=%p slot=%p", gfx, gt[g_lantern_id]);
+  lantern_log("gambar lentera (texture=%d): registerBlock=%p slot=%p", g_lt_texture, gfx, gt[g_lantern_id]);
   if (gfx && !gt[g_lantern_id]) gt[g_lantern_id] = gfx;   // jaga-jaga kalau slot belum terisi
 }
 
