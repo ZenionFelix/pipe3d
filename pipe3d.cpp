@@ -531,6 +531,7 @@ static void gx_init() {
 
 // ---- pengaturan ----
 static int g_cfg_on = 1, g_cfg_size = 1024, g_cfg_capture = 0, g_cfg_level = -1, g_cfg_playerbox = 1;
+static int g_cfg_guard = 1;   // guard=0 di pipe3d_shadow.txt mematikan pengaman crash (level bayangan tidak pernah turun sendiri)
 static float g_cfg_radius = 56.0f, g_cfg_bias = 0.12f;
 static bool g_cfg_loaded = false;
 static void cfg_load() {
@@ -546,6 +547,7 @@ static void cfg_load() {
     else if (sscanf(line, "capture=%d", &iv) == 1) g_cfg_capture = iv;
     else if (sscanf(line, "level=%d", &iv) == 1) g_cfg_level = (iv < 0) ? 0 : (iv > 4 ? 4 : iv);
     else if (sscanf(line, "playerbox=%d", &iv) == 1) g_cfg_playerbox = iv;
+    else if (sscanf(line, "guard=%d", &iv) == 1) g_cfg_guard = iv;
     else if (sscanf(line, "radius=%f", &fv) == 1) { (void)fv; }   // radius dikunci 56 (sama dengan konstanta di shader)
     else if (sscanf(line, "bias=%f", &fv) == 1) { (void)fv; }     // bias dikunci di shader
   }
@@ -561,6 +563,7 @@ static void sh_log(const char* fmt, ...) {
 
 
 // ---- pengaman crash ----
+// Pengaman bisa dimatikan: tulis "guard=0" di pipe3d_shadow.txt.
 // level 0: mati; 1: hanya mengenali arah matahari; 2: + menggambar peta bayangan (belum dipakai shader); 3: bayangan terrain; 4: + bayangan mob dan pemain.
 // Pada frame terrain pertama, file status ditandai "armed=1". Kalau game crash atau macet sebelum 90 frame terrain berlalu,
 // peluncuran berikutnya otomatis turun satu level. Untuk memaksa level tertentu: tulis "level=N" di pipe3d_shadow.txt.
@@ -588,6 +591,7 @@ static void level_init() {
     fclose(f);
   }
   if (g_cfg_level >= 0) { lvl = g_cfg_level; armed = 0; sh_log("pipe3d: level dipaksa lewat pengaturan = %d\n", lvl); }
+  else if (!g_cfg_guard) { sh_log("pipe3d: pengaman crash dimatikan (guard=0); level selalu 4, level lama di file status (%d) diabaikan\n", have ? lvl : 4); lvl = 4; armed = 0; }
   else if (have && armed) { sh_log("pipe3d: peluncuran sebelumnya tidak lolos 90 frame terrain pada level %d, turun ke level %d\n", lvl, lvl > 0 ? lvl - 1 : 0); lvl = lvl > 0 ? lvl - 1 : 0; }
   if (lvl < 0) lvl = 0;
   if (lvl > 4) lvl = 4;
@@ -598,7 +602,7 @@ static void level_init() {
 }
 static void guard_arm() {
   g_guard_done = true;
-  if (g_level >= 1) { guard_write(g_level, 1); g_guard_armed = true; }
+  if (g_level >= 1 && g_cfg_guard) { guard_write(g_level, 1); g_guard_armed = true; }   // guard=0: tidak ditandai, jadi tidak pernah menurunkan level
   bc("frame terrain pertama, pengaman aktif");
 }
 
