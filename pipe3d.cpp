@@ -1559,6 +1559,9 @@ static const uintptr_t OFF_JSON_VALUE_DTOR = 0x119BF6D;     // Json::Value::~Val
 static const uintptr_t OFF_JSON_READER_CTOR = 0x119893D;    // Json::Reader::Reader()
 static const uintptr_t OFF_JSON_READER_PARSE = 0x1198BD9;   // Json::Reader::parse(char const*, char const*, Value&, bool)
 static const uintptr_t OFF_MBLOCKS = 0x1705814;             // Block::mBlocks[256]
+static const uintptr_t OFF_BG_MBLOCKS = 0x16B350C;          // BlockGraphics::mBlocks[256]
+static const uintptr_t OFF_ITEM_MITEMS = 0x1703A00;         // Item::mItems[512]
+static const int ID_GLOWSTONE = 89;                         // gambar cadangan kalau pendaftaran gambar gagal
 static const uintptr_t OFF_MSOLID = 0x1705E3C;              // Block::mSolid[256]
 static const uintptr_t OFF_MLIGHTBLOCK = 0x1705C3C;         // Block::mLightBlock[256]
 static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt1 wood2 stone3 metal4 (cocok dengan blok yang sudah ada)
@@ -1663,10 +1666,26 @@ static void register_lantern_graphics() {
   static const char name[8] = {'l','a','n','t','e','r','n','\0'};
   void* gfx = ((RegGfx8Fn)(g_base + OFF_REGISTER_GFX_8))(root, &name);
   ((JsonValueDtorFn)(g_base + OFF_JSON_VALUE_DTOR))(root);
-  lantern_log("gambar lentera terdaftar: %p", gfx);
+  void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
+  lantern_log("gambar lentera: registerBlock=%p slot=%p", gfx, gt[g_lantern_id]);
+  if (gfx && !gt[g_lantern_id]) gt[g_lantern_id] = gfx;   // jaga-jaga kalau slot belum terisi
+}
+
+// Pengaman: ikon di inventory membaca BlockGraphics::mBlocks[id]; kalau kosong, game crash saat ikon digambar.
+static void ensure_lantern_graphics_slot() {
+  void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
+  if (!gt[g_lantern_id]) {
+    gt[g_lantern_id] = gt[ID_GLOWSTONE];   // cadangan: pakai gambar glowstone
+    lantern_log("gambar lentera kosong; memakai gambar glowstone sebagai cadangan (%p)", gt[g_lantern_id]);
+  }
 }
 
 static void add_lantern_creative() {
+  void** items = (void**)(g_base + OFF_ITEM_MITEMS);
+  void** gt = (void**)(g_base + OFF_BG_MBLOCKS);
+  lantern_log("cek sebelum masuk kreatif: item=%p gambar=%p", items[g_lantern_id], gt[g_lantern_id]);
+  if (!items[g_lantern_id]) { lantern_log("item lentera tidak dibuat game; tidak dimasukkan ke inventory (mencegah crash)"); return; }
+  if (!gt[g_lantern_id]) { lantern_log("gambar lentera kosong; tidak dimasukkan ke inventory (mencegah crash)"); return; }
   alignas(8) uint8_t inst[64];
   memset(inst, 0, sizeof(inst));
   ((ItemInstanceCtorFn)(g_base + OFF_ITEMINSTANCE_IIII))(inst, g_lantern_id, 1, 0);
@@ -1681,7 +1700,10 @@ static void hook_init_blocks() {
 }
 static void hook_bg_init_blocks() {
   orig_bg_init_blocks();          // gambar semua blok bawaan sudah terdaftar
-  if (g_lantern_id >= 0 && g_lt_graphics) register_lantern_graphics();
+  if (g_lantern_id >= 0) {
+    if (g_lt_graphics) register_lantern_graphics();
+    ensure_lantern_graphics_slot();
+  }
 }
 static void hook_init_creative() {
   orig_init_creative();           // daftar kreatif bawaan sudah terisi
