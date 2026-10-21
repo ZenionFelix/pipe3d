@@ -1,6 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
-// + LENTERA tahap 1: blok baru "lantern" didaftarkan setelah Block::initBlocks (aktif kalau pipe3d_lantern.txt berisi enabled=1).
+// + LENTERA: blok baru "lantern" (item, gambar, inventory kreatif, bentuk kotak); aktif kalau pipe3d_lantern.txt berisi enabled=1.
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
 // Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
 // Tahap 2b: tiap 45 detik (mulai 60 detik setelah game jalan, sampai 30 kali = sekitar 23 menit, cukup untuk satu siklus siang-malam)
@@ -164,6 +164,16 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
   return true;
 }
 
+// Lentera: id diisi saat pendaftaran blok (tahap lentera), -1 = belum ada
+static int g_lantern_id = -1;
+static int g_lantern_shape = 0;
+// Kotak lentera dalam satuan 1/16 blok: x0,y0,z0,x1,y1,z1 (badan, tutup, cincin gantungan)
+static const float LANTERN_BOXES[3][6] = {
+  {5, 0, 5, 11, 7, 11},
+  {6, 7, 6, 10, 9, 10},
+  {7, 9, 7, 9, 10, 9},
+};
+
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
   int id = *((uint8_t*)block + BLOCK_ID_OFF);
   log_block(id, block);
@@ -174,6 +184,20 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
   if (id == ID_LEAVES || id == ID_LEAVES2) {
     if (draw_leaf_planes(self, block, pos, data)) return 1;
     return orig_tess_block(self, block, pos, data);   // cadangan kalau gagal
+  }
+  if (g_lantern_shape && g_lantern_id >= 0 && id == g_lantern_id) {
+    uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
+    uint8_t lsaved[28];
+    memcpy(lsaved, lb, 28);
+    int lr = 1;
+    for (int i = 0; i < 3; i++) {
+      float* f = (float*)lb;
+      for (int k = 0; k < 6; k++) f[k] = LANTERN_BOXES[i][k] / 16.0f;
+      lb[24] = 1;
+      lr = orig_tess_block(self, block, pos, data);
+    }
+    memcpy(lb, lsaved, 28);
+    return lr;
   }
   if (id != ID_CRAFTING_TABLE) {
     return orig_tess_block(self, block, pos, data);
@@ -1504,26 +1528,62 @@ static void install_biome_patch(uintptr_t base) {
 }
 // =======================================================================
 
-// ===================== LENTERA (tahap 1: daftarkan blok baru) =====================
+// ===================== LENTERA (blok baru) =====================
 // Blok "lantern" dibuat sebagai blok BARU di ID kosong (bukan mengganti blok lain).
-// Cara: setelah Block::initBlocks() selesai, panggil registerBlock<Block, char const(&)[8], int, Material const&>
-// (fungsi game yang sama dipakai untuk blok polos), lalu setLightEmission(1.0) = cahaya level 15.
-// Tahap 1 hanya mendaftarkan blok dan mencatat hasilnya di pipe3d_lantern_log.txt; belum ada bentuk/gambar/item.
-// Pengaman: baru jalan kalau file /sdcard/games/com.mojang/pipe3d_lantern.txt ada dan berisi enabled=1.
+// Urutan kerja (semua lewat hook di awal-akhir fungsi game):
+//  1. Setelah Block::initBlocks(): daftarkan blok lewat registerBlock<Block,...>, atur cahaya, kategori, bentuk.
+//     Item otomatis dibuat game di Item::addBlockItems (ia memeriksa semua blok yang terdaftar).
+//  2. Setelah BlockGraphics::initBlocks(): daftarkan gambar blok dari JSON kecil di dalam kode (tanpa edit APK).
+//  3. Setelah Item::initCreativeItems(): tambahkan lentera ke inventory kreatif.
+//  4. Di hook_tess_block (atas): lentera digambar dari 3 kotak (badan, tutup, cincin), cara yang sama seperti meja kerja.
+// Pengaman: baru jalan kalau /sdcard/games/com.mojang/pipe3d_lantern.txt ada dan berisi enabled=1.
+// Tiap bagian bisa dimatikan sendiri di file itu: item=0 graphics=0 creative=0 shape=0 (untuk mencari penyebab crash).
 static const uintptr_t OFF_INIT_BLOCKS = 0xCB2CD9;          // Block::initBlocks()
 static const uint8_t SIG_INIT_BLOCKS[10] = {0x2d,0xe9,0xf0,0x4f,0x81,0xb0,0x2d,0xed,0x02,0x8b}; // push.w, sub sp, vpush (10 byte utuh)
+static const uintptr_t OFF_BG_INIT_BLOCKS = 0x98A355;       // BlockGraphics::initBlocks()
+static const uint8_t SIG_BG_INIT_BLOCKS[8] = {0x2d,0xe9,0xf0,0x4f,0xad,0xf5,0x19,0x7d};
+static const uintptr_t OFF_INIT_CREATIVE = 0xC79A31;        // Item::initCreativeItems()
+static const uint8_t SIG_INIT_CREATIVE[8] = {0x2d,0xe9,0xf0,0x4f,0xad,0xf5,0xef,0x5d};
 static const uintptr_t OFF_REGISTER_BLOCK_8 = 0xCB71B1;     // registerBlock<Block, char const(&)[8], int, Material const&>
+static const uintptr_t OFF_REGISTER_GFX_8 = 0x98E0FD;       // registerBlock<BlockGraphics, char const(&)[8]>(Json::Value const&, ...)
 static const uintptr_t OFF_GET_MATERIAL = 0xD7A999;         // Material::getMaterial(MaterialType)
 static const uintptr_t OFF_SET_LIGHT_EMISSION = 0xCC3F25;   // Block::setLightEmission(float)
+static const uintptr_t OFF_SET_DESTROY_TIME = 0xCC51A9;     // Block::setDestroyTime(float)
+static const uintptr_t OFF_SET_VISUAL_SHAPE = 0xCC5211;     // Block::setVisualShape(Vec3 const&, Vec3 const&)
+static const uintptr_t OFF_SET_CATEGORY = 0xCB6BA5;         // Block::setCategory(CreativeItemCategory)
+static const uintptr_t OFF_ADD_CREATIVE = 0xC87715;         // Item::addCreativeItem(ItemInstance const&)
+static const uintptr_t OFF_ITEMINSTANCE_IIII = 0xC93E91;    // ItemInstance::ItemInstance(int id, int count, int aux)
+static const uintptr_t OFF_JSON_VALUE_CTOR = 0x119BC35;     // Json::Value::Value(ValueType)
+static const uintptr_t OFF_JSON_VALUE_DTOR = 0x119BF6D;     // Json::Value::~Value()
+static const uintptr_t OFF_JSON_READER_CTOR = 0x119893D;    // Json::Reader::Reader()
+static const uintptr_t OFF_JSON_READER_PARSE = 0x1198BD9;   // Json::Reader::parse(char const*, char const*, Value&, bool)
 static const uintptr_t OFF_MBLOCKS = 0x1705814;             // Block::mBlocks[256]
+static const uintptr_t OFF_MSOLID = 0x1705E3C;              // Block::mSolid[256]
+static const uintptr_t OFF_MLIGHTBLOCK = 0x1705C3C;         // Block::mLightBlock[256]
 static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt1 wood2 stone3 metal4 (cocok dengan blok yang sudah ada)
+static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCategory: 1 blok, 2 dekorasi, 3 alat, 4 item
 
-typedef void (*InitBlocksFn)();
+// Gambar blok (format sama dengan blocks.json). Memakai tekstur bawaan: atas/bawah besi, sisi glowstone.
+static const char LANTERN_GFX_JSON[] =
+  "{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}";
+
+typedef void (*InitVoidFn)();
 typedef void* (*RegBlock8Fn)(const char (*name)[8], int* id, const void* material);
 typedef const void* (*GetMaterialFn)(int type);
-typedef void* (*SetLightEmissionFn)(void* block, float v);
-static InitBlocksFn orig_init_blocks = nullptr;
-static int g_lantern_id = -1;
+typedef void* (*SetFloatFn)(void* block, float v);
+typedef void* (*SetIntFn)(void* block, int v);
+typedef void* (*SetShapeFn)(void* block, const float* vmin, const float* vmax);
+typedef void (*JsonValueCtorFn)(void* self, int type);
+typedef void (*JsonValueDtorFn)(void* self);
+typedef void (*JsonReaderCtorFn)(void* self);
+typedef bool (*JsonParseFn)(void* reader, const char* b, const char* e, void* root, bool comments);
+typedef void* (*RegGfx8Fn)(const void* json, const char (*name)[8]);
+typedef void (*ItemInstanceCtorFn)(void* self, int id, int count, int aux);
+typedef void (*AddCreativeFn)(const void* inst);
+static InitVoidFn orig_init_blocks = nullptr;
+static InitVoidFn orig_bg_init_blocks = nullptr;
+static InitVoidFn orig_init_creative = nullptr;
+static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lantern_log(const char* fmt, ...) {
@@ -1537,7 +1597,14 @@ static bool lantern_enabled() {
   FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_lantern.txt", "r");
   if (!f) return false;
   char line[64]; bool on = false;
-  while (fgets(line, sizeof(line), f)) { int v; if (sscanf(line, " enabled=%d", &v) == 1) on = (v != 0); }
+  while (fgets(line, sizeof(line), f)) {
+    int v;
+    if (sscanf(line, " enabled=%d", &v) == 1) on = (v != 0);
+    else if (sscanf(line, " item=%d", &v) == 1) g_lt_item = v;
+    else if (sscanf(line, " graphics=%d", &v) == 1) g_lt_graphics = v;
+    else if (sscanf(line, " creative=%d", &v) == 1) g_lt_creative = v;
+    else if (sscanf(line, " shape=%d", &v) == 1) g_lantern_shape = v;
+  }
   fclose(f);
   return on;
 }
@@ -1549,22 +1616,63 @@ static void register_lantern() {
   if (id < 0) { lantern_log("tidak ada ID kosong di 200..255, dibatalkan"); return; }
   GetMaterialFn get_material = (GetMaterialFn)(g_base + OFF_GET_MATERIAL);
   RegBlock8Fn reg = (RegBlock8Fn)(g_base + OFF_REGISTER_BLOCK_8);
-  SetLightEmissionFn set_light = (SetLightEmissionFn)(g_base + OFF_SET_LIGHT_EMISSION);
   const void* mat = get_material(MATERIAL_TYPE_METAL);
   if (!mat) { lantern_log("material tidak ditemukan, dibatalkan"); return; }
   static const char name[8] = {'l','a','n','t','e','r','n','\0'};
   int idv = id;
   void* blk = reg(&name, &idv, mat);
   if (!blk) { lantern_log("registerBlock mengembalikan null"); return; }
-  set_light(blk, 1.0f);
+  ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, 1.0f);      // cahaya level 15
+  ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, 1.0f);        // cepat dihancurkan
+  if (g_lt_item) ((SetIntFn)(g_base + OFF_SET_CATEGORY))(blk, CATEGORY_DECORATIONS);   // dibaca Item::addBlockItems
+  if (g_lantern_shape) {
+    ((uint8_t*)(g_base + OFF_MSOLID))[id] = 0;        // bukan kubus penuh: sisi blok tetangga tetap digambar
+    ((uint8_t*)(g_base + OFF_MLIGHTBLOCK))[id] = 0;   // tidak menghalangi cahaya
+    const float vmin[3] = {5.0f / 16, 0.0f, 5.0f / 16};
+    const float vmax[3] = {11.0f / 16, 10.0f / 16, 11.0f / 16};
+    ((SetShapeFn)(g_base + OFF_SET_VISUAL_SHAPE))(blk, vmin, vmax);   // kotak seleksi
+  }
   g_lantern_id = id;
-  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p", id, blk, blocks[id]);
+  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p item=%d graphics=%d creative=%d shape=%d",
+              id, blk, blocks[id], g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
+}
+
+static void register_lantern_graphics() {
+  alignas(8) uint8_t reader[512];
+  alignas(8) uint8_t root[64];
+  memset(reader, 0, sizeof(reader));
+  memset(root, 0, sizeof(root));
+  ((JsonReaderCtorFn)(g_base + OFF_JSON_READER_CTOR))(reader);
+  ((JsonValueCtorFn)(g_base + OFF_JSON_VALUE_CTOR))(root, 0);
+  bool ok = ((JsonParseFn)(g_base + OFF_JSON_READER_PARSE))(
+      reader, LANTERN_GFX_JSON, LANTERN_GFX_JSON + sizeof(LANTERN_GFX_JSON) - 1, root, false);
+  if (!ok) { lantern_log("gambar: JSON tidak terbaca"); return; }
+  static const char name[8] = {'l','a','n','t','e','r','n','\0'};
+  void* gfx = ((RegGfx8Fn)(g_base + OFF_REGISTER_GFX_8))(root, &name);
+  ((JsonValueDtorFn)(g_base + OFF_JSON_VALUE_DTOR))(root);
+  lantern_log("gambar lentera terdaftar: %p", gfx);
+}
+
+static void add_lantern_creative() {
+  alignas(8) uint8_t inst[64];
+  memset(inst, 0, sizeof(inst));
+  ((ItemInstanceCtorFn)(g_base + OFF_ITEMINSTANCE_IIII))(inst, g_lantern_id, 1, 0);
+  ((AddCreativeFn)(g_base + OFF_ADD_CREATIVE))(inst);
+  lantern_log("lentera masuk inventory kreatif (id=%d)", g_lantern_id);
 }
 
 static void hook_init_blocks() {
   orig_init_blocks();             // semua blok bawaan sudah terdaftar
   if (lantern_enabled()) register_lantern();
   else lantern_log("lentera nonaktif (pipe3d_lantern.txt tidak ada / enabled=0)");
+}
+static void hook_bg_init_blocks() {
+  orig_bg_init_blocks();          // gambar semua blok bawaan sudah terdaftar
+  if (g_lantern_id >= 0 && g_lt_graphics) register_lantern_graphics();
+}
+static void hook_init_creative() {
+  orig_init_creative();           // daftar kreatif bawaan sudah terisi
+  if (g_lantern_id >= 0 && g_lt_creative) add_lantern_creative();
 }
 
 // Seperti install_hook, tapi menyalin copy_len byte awal (harus instruksi utuh dan tidak bergantung posisi).
@@ -1596,21 +1704,24 @@ static bool install_hook_len(uintptr_t target, void* hook, void** orig_out, int 
 
 static void install_lantern_patch(uintptr_t base) {
   g_base = base;
-  uintptr_t target = base + OFF_INIT_BLOCKS - 1;   // OFF_INIT_BLOCKS punya bit Thumb
-  if (memcmp((void*)target, SIG_INIT_BLOCKS, 10) != 0) {
-    LOG("lentera: tanda Block::initBlocks tidak cocok, dibatalkan");
+  uintptr_t t1 = base + OFF_INIT_BLOCKS - 1;       // alamat di atas punya bit Thumb
+  uintptr_t t2 = base + OFF_BG_INIT_BLOCKS - 1;
+  uintptr_t t3 = base + OFF_INIT_CREATIVE - 1;
+  if (memcmp((void*)t1, SIG_INIT_BLOCKS, 10) != 0 ||
+      memcmp((void*)t2, SIG_BG_INIT_BLOCKS, 8) != 0 ||
+      memcmp((void*)t3, SIG_INIT_CREATIVE, 8) != 0) {
+    LOG("lentera: tanda fungsi tidak cocok, dibatalkan");
     return;
   }
   void** blocks = (void**)(g_base + OFF_MBLOCKS);
-  if (blocks[1]) {   // initBlocks sudah selesai sebelum hook terpasang: daftarkan langsung (jalur cadangan)
-    lantern_log("initBlocks sudah jalan sebelum hook; jalur cadangan");
-    if (lantern_enabled()) register_lantern();
+  if (blocks[1]) {   // initBlocks sudah selesai sebelum hook terpasang: blok baru tidak aman ditambah sekarang
+    lantern_log("initBlocks sudah jalan sebelum hook terpasang; lentera dilewati (tutup game sepenuhnya lalu buka lagi)");
     return;
   }
-  if (install_hook_len(target, (void*)hook_init_blocks, (void**)&orig_init_blocks, 10))
-    LOG("lentera: hook initBlocks terpasang");
-  else
-    LOG("lentera: hook initBlocks gagal");
+  bool ok1 = install_hook_len(t1, (void*)hook_init_blocks, (void**)&orig_init_blocks, 10);
+  bool ok2 = install_hook(t2, (void*)hook_bg_init_blocks, (void**)&orig_bg_init_blocks);
+  bool ok3 = install_hook(t3, (void*)hook_init_creative, (void**)&orig_init_creative);
+  LOG("lentera: hook initBlocks=%d graphics=%d creative=%d", (int)ok1, (int)ok2, (int)ok3);
 }
 // ==================================================================================
 
@@ -1623,7 +1734,7 @@ static void* worker(void*) {
   if (!base) { LOG("libminecraftpe.so tidak ditemukan"); return nullptr; }
   install_gl_spy();   // tahap 1: hanya mencatat, tidak mengubah tampilan
   install_biome_patch(base);   // gunung tinggi (lihat bagian GUNUNG TINGGI)
-  install_lantern_patch(base);   // lentera tahap 1 (lihat bagian LENTERA)
+  install_lantern_patch(base);   // lentera (lihat bagian LENTERA)
   uintptr_t target = base + OFF_TESS_BLOCK;
   if (memcmp((void*)target, SIG_TESS_BLOCK, 8) != 0) {
     LOG("tanda fungsi tidak cocok, hook dibatalkan");
