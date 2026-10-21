@@ -1586,6 +1586,7 @@ static InitVoidFn orig_init_blocks = nullptr;
 static InitVoidFn orig_bg_init_blocks = nullptr;
 static InitVoidFn orig_init_creative = nullptr;
 static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
+static int g_lt_id = 210;   // slot ID yang dipakai (200..242 tidak dipakai blok bawaan 0.15.10)
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lantern_log(const char* fmt, ...) {
@@ -1606,6 +1607,7 @@ static bool lantern_enabled() {
     else if (sscanf(line, " graphics=%d", &v) == 1) g_lt_graphics = v;
     else if (sscanf(line, " creative=%d", &v) == 1) g_lt_creative = v;
     else if (sscanf(line, " shape=%d", &v) == 1) g_lantern_shape = v;
+    else if (sscanf(line, " id=%d", &v) == 1) g_lt_id = v;
   }
   fclose(f);
   return on;
@@ -1613,17 +1615,24 @@ static bool lantern_enabled() {
 
 static void register_lantern() {
   void** blocks = (void**)(g_base + OFF_MBLOCKS);
-  int id = -1;
-  for (int i = 200; i < 256; i++) if (!blocks[i]) { id = i; break; }   // ID kosong pertama di 200..255
-  if (id < 0) { lantern_log("tidak ada ID kosong di 200..255, dibatalkan"); return; }
+  // Di akhir initBlocks game mengisi SEMUA ID yang kosong dengan blok pengganti bernama "" (itu sebabnya
+  // tidak ada ID null). Jadi kita ambil satu slot pengganti, kosongkan penunjuknya, lalu daftarkan lentera di situ.
+  int id = g_lt_id;
+  if (id < 1 || id > 255) id = 210;
+  void* old_block = blocks[id];
+  if (old_block && blocks[255] && *(void**)old_block != *(void**)blocks[255]) {
+    lantern_log("slot id=%d bukan blok pengganti (jenis berbeda), dibatalkan; ubah id= di pipe3d_lantern.txt", id);
+    return;
+  }
+  blocks[id] = nullptr;   // konstruktor Block mengisi slot ini lagi dengan lentera
   GetMaterialFn get_material = (GetMaterialFn)(g_base + OFF_GET_MATERIAL);
   RegBlock8Fn reg = (RegBlock8Fn)(g_base + OFF_REGISTER_BLOCK_8);
   const void* mat = get_material(MATERIAL_TYPE_METAL);
-  if (!mat) { lantern_log("material tidak ditemukan, dibatalkan"); return; }
+  if (!mat) { blocks[id] = old_block; lantern_log("material tidak ditemukan, dibatalkan"); return; }
   static const char name[8] = {'l','a','n','t','e','r','n','\0'};
   int idv = id;
   void* blk = reg(&name, &idv, mat);
-  if (!blk) { lantern_log("registerBlock mengembalikan null"); return; }
+  if (!blk) { blocks[id] = old_block; lantern_log("registerBlock mengembalikan null"); return; }
   ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, 1.0f);      // cahaya level 15
   ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, 1.0f);        // cepat dihancurkan
   int cat = CATEGORY_DECORATIONS;
@@ -1637,8 +1646,8 @@ static void register_lantern() {
     ((SetShapeFn)(g_base + OFF_SET_VISUAL_SHAPE))(blk, vmin, vmax);   // kotak seleksi
   }
   g_lantern_id = id;
-  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p kategori=%d item=%d graphics=%d creative=%d shape=%d",
-              id, blk, blocks[id], cat, g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
+  lantern_log("lentera terdaftar: id=%d blok=%p mBlocks[id]=%p (pengganti lama=%p) kategori=%d item=%d graphics=%d creative=%d shape=%d",
+              id, blk, blocks[id], old_block, cat, g_lt_item, g_lt_graphics, g_lt_creative, g_lantern_shape);
 }
 
 static void register_lantern_graphics() {
