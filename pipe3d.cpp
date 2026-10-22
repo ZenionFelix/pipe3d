@@ -1,5 +1,6 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + API UNGGUN (tahap 1): blok baru "campfire" (id 213) ikut sistem lentera.
 // + LENTERA: blok baru "lantern" (item, gambar, inventory kreatif, bentuk kotak); aktif kalau pipe3d_lantern.txt berisi enabled=1.
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
 // Tahap 3+4: peta bayangan matahari asli (lihat bagian "peta bayangan" di bawah). Pencatatan tahap 2b hanya jalan bila capture=1 di pipe3d_shadow.txt.
@@ -165,15 +166,18 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
 }
 
 // Lentera, rantai, lentera gantung: id diisi saat pendaftaran blok, -1 = belum ada
-#define LT_COUNT 3
-static int g_lt_ids[LT_COUNT] = {-1, -1, -1};
+#define LT_COUNT 4
+static int g_lt_ids[LT_COUNT] = {-1, -1, -1, -1};
 static int g_lantern_shape = 0;
 // Model tiap blok dalam kotak (satuan 1/16 blok): x0,y0,z0,x1,y1,z1
-struct LtModel { int n; float b[4][6]; };
+struct LtModel { int n; float b[6][6]; };
 static const LtModel LT_MODELS[LT_COUNT] = {
   {3, {{5, 0, 5, 11, 7, 11}, {6, 7, 6, 10, 9, 10}, {7, 9, 7, 9, 10, 9}}},       // lentera berdiri: badan, tutup, cincin
   {2, {{6, 0, 7, 10, 16, 9}, {7, 0, 6, 9, 16, 10}}},                            // rantai: dua bidang menyilang
   {3, {{5, 6, 5, 11, 13, 11}, {6, 13, 6, 10, 15, 10}, {7, 15, 7, 9, 16, 9}}},   // lentera gantung: tangkai sampai atas blok
+  {5, {{0, 0, 2, 16, 4, 6}, {0, 0, 10, 16, 4, 14},                               // api unggun: dua kayu searah X (bawah)
+       {2, 4, 0, 6, 7, 16}, {10, 4, 0, 14, 7, 16},                               //   dua kayu searah Z (atas, menyilang)
+       {5, 0, 5, 11, 3, 11}}},                                                   //   dasar bara di tengah
 };
 
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
@@ -1582,7 +1586,8 @@ static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCateg
 static const char LT_GFX_JSON_BASIC[] =
   "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}},"
   "\"chain\":{\"textures\":\"iron_block\"},"
-  "\"hanging_lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}}}";
+  "\"hanging_lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}},"
+  "\"campfire\":{\"textures\":\"glowstone\"}}";
 // Versi tekstur sendiri (texture=1): gambar harus sudah ada di APK (lihat lantern_texture_pack.zip).
 static const char LT_GFX_JSON_CUSTOM[] =
   "{\"lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_side\"},"
@@ -1590,13 +1595,17 @@ static const char LT_GFX_JSON_CUSTOM[] =
   "\"chain\":{\"textures\":{\"up\":\"chain_top\",\"down\":\"chain_top\",\"side\":\"chain_side\"},"
   "\"carried_textures\":{\"up\":\"chain_top\",\"down\":\"chain_top\",\"side\":\"chain_icon\"}},"
   "\"hanging_lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_hang_side\"},"
-  "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}}}";
+  "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}},"
+  "\"campfire\":{\"textures\":{\"up\":\"campfire_log_top\",\"down\":\"campfire_log_top\",\"side\":\"campfire_log_side\"},"
+  "\"carried_textures\":{\"up\":\"campfire_log_top\",\"down\":\"campfire_log_top\",\"side\":\"campfire_icon\"}}}";
 static int g_lt_texture = 0;
-static const char* LT_NAMES[LT_COUNT] = {"lantern", "chain", "hanging_lantern"};
-static const float LT_LIGHT[LT_COUNT] = {1.0f, 0.0f, 1.0f};
+static const char* LT_NAMES[LT_COUNT] = {"lantern", "chain", "hanging_lantern", "campfire"};
+static const float LT_LIGHT[LT_COUNT] = {1.0f, 0.0f, 1.0f, 1.0f};
+static const int LT_MATERIAL[LT_COUNT] = {4, 4, 4, 2};            // 4 = metal, 2 = kayu (api unggun)
+static const float LT_HARDNESS[LT_COUNT] = {1.0f, 1.0f, 1.0f, 2.0f};
 // Kotak seleksi (outline) tiap blok, satuan 1/16: xmin,ymin,zmin,xmax,ymax,zmax
 static const float LT_OUTLINE[LT_COUNT][6] = {
-  {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11},
+  {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11}, {0, 0, 0, 16, 7, 16},
 };
 
 typedef void (*InitVoidFn)();
@@ -1617,7 +1626,7 @@ static InitVoidFn orig_init_blocks = nullptr;
 static InitVoidFn orig_bg_init_blocks = nullptr;
 static InitVoidFn orig_init_creative = nullptr;
 static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
-static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
+static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212, 213};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lantern_log(const char* fmt, ...) {
@@ -1641,6 +1650,7 @@ static bool lantern_enabled() {
     else if (sscanf(line, " id=%d", &v) == 1) g_lt_cfg_id[0] = v;
     else if (sscanf(line, " chain_id=%d", &v) == 1) g_lt_cfg_id[1] = v;
     else if (sscanf(line, " hang_id=%d", &v) == 1) g_lt_cfg_id[2] = v;
+    else if (sscanf(line, " fire_id=%d", &v) == 1) g_lt_cfg_id[3] = v;
     else if (sscanf(line, " texture=%d", &v) == 1) g_lt_texture = v;
   }
   fclose(f);
@@ -1661,7 +1671,7 @@ static void register_one(int k) {
   blocks[id] = nullptr;   // konstruktor Block mengisi slot ini lagi dengan blok baru
   GetMaterialFn get_material = (GetMaterialFn)(g_base + OFF_GET_MATERIAL);
   RegBlock8Fn reg = (RegBlock8Fn)(g_base + OFF_REGISTER_BLOCK_8);
-  const void* mat = get_material(MATERIAL_TYPE_METAL);
+  const void* mat = get_material(LT_MATERIAL[k]);
   if (!mat) { blocks[id] = old_block; lantern_log("[%s] material tidak ditemukan, dibatalkan", LT_NAMES[k]); return; }
   char name[32];
   memset(name, 0, sizeof(name));
@@ -1670,7 +1680,7 @@ static void register_one(int k) {
   void* blk = reg((const char(*)[8])name, &idv, mat);
   if (!blk) { blocks[id] = old_block; lantern_log("[%s] registerBlock mengembalikan null", LT_NAMES[k]); return; }
   if (LT_LIGHT[k] > 0.0f) ((SetFloatFn)(g_base + OFF_SET_LIGHT_EMISSION))(blk, LT_LIGHT[k]);   // cahaya
-  ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, 1.0f);        // cepat dihancurkan
+  ((SetFloatFn)(g_base + OFF_SET_DESTROY_TIME))(blk, LT_HARDNESS[k]);   // kekerasan
   int cat = CATEGORY_DECORATIONS;
   if (blocks[50]) cat = ((GetIntFn)(g_base + OFF_GET_CATEGORY))(blocks[50]);   // samakan dengan obor: pasti tab yang ada
   if (g_lt_item) ((SetIntFn)(g_base + OFF_SET_CATEGORY))(blk, cat);            // dibaca Item::addBlockItems
@@ -1750,7 +1760,7 @@ static void hook_init_blocks() {
 }
 static void hook_bg_init_blocks() {
   orig_bg_init_blocks();          // gambar semua blok bawaan sudah terdaftar
-  if (g_lt_ids[0] >= 0 || g_lt_ids[1] >= 0 || g_lt_ids[2] >= 0) {
+  if (g_lt_ids[0] >= 0 || g_lt_ids[1] >= 0 || g_lt_ids[2] >= 0 || g_lt_ids[3] >= 0) {
     if (g_lt_graphics) register_lantern_graphics();
     ensure_lantern_graphics_slot();
   }
