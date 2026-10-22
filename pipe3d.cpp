@@ -1783,7 +1783,8 @@ static long long g_fire_last_ms = 0;
 static uint32_t g_fire_rng = 2463534242u;
 typedef void (*LevelAnimTickFn)(void* level, void* entity);
 typedef void (*AddParticleFn)(void* level, int type, const float* pos, const float* vel, int data);
-typedef int (*GetBlockIdXYZFn)(void* region, int x, int y, int z);
+// BlockID dikembalikan lewat penunjuk tersembunyi di r1 (bukti: fungsi game mengoper r1 apa adanya, x=r2, y=r3, z=stack)
+typedef void (*GetBlockIdXYZFn)(void* region, void* ret, int x, int y, int z);
 static LevelAnimTickFn orig_level_anim = nullptr;
 
 static float fire_rand() {   // 0..1
@@ -1820,7 +1821,9 @@ static void campfire_effects(void* level, void* entity) {
     int x = g_fire_pos[i][0], y = g_fire_pos[i][1], z = g_fire_pos[i][2];
     float dx = x + 0.5f - pp[0], dy = y - pp[1], dz = z + 0.5f - pp[2];
     if (dx * dx + dz * dz > FIRE_RANGE * FIRE_RANGE || dy > FIRE_RANGE || dy < -FIRE_RANGE) { i++; continue; }
-    if ((get_id(region, x, y, z) & 0xFF) != g_lt_ids[3]) {   // blok sudah dihancurkan: hapus dari daftar
+    alignas(8) uint8_t bid[8] = {0};
+    get_id(region, bid, x, y, z);
+    if (bid[0] != g_lt_ids[3]) {   // blok sudah dihancurkan: hapus dari daftar
       g_fire_pos[i][0] = g_fire_pos[g_fire_cnt - 1][0]; g_fire_pos[i][1] = g_fire_pos[g_fire_cnt - 1][1]; g_fire_pos[i][2] = g_fire_pos[g_fire_cnt - 1][2];
       g_fire_cnt--;
       continue;
