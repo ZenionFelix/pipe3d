@@ -180,6 +180,8 @@ static const LtModel LT_MODELS[LT_COUNT] = {
        {5, 0, 5, 11, 3, 11}}},                                                   //   dasar bara di tengah
 };
 
+static void fire_record(int x, int y, int z);   // daftar posisi api unggun untuk efek asap (lihat bagian API UNGGUN)
+
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
   int id = *((uint8_t*)block + BLOCK_ID_OFF);
   log_block(id, block);
@@ -194,6 +196,7 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
   if (g_lantern_shape) {
     for (int m = 0; m < LT_COUNT; m++) {
       if (g_lt_ids[m] < 0 || id != g_lt_ids[m]) continue;
+      if (m == 3 && pos) { int* fp = (int*)pos; fire_record(fp[0], fp[1], fp[2]); }   // api unggun: catat posisinya
       uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
       uint8_t lsaved[28];
       memcpy(lsaved, lb, 28);
@@ -1626,6 +1629,7 @@ static InitVoidFn orig_init_blocks = nullptr;
 static InitVoidFn orig_bg_init_blocks = nullptr;
 static InitVoidFn orig_init_creative = nullptr;
 static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
+static int g_fire_smoke = 1, g_fire_flame = 1;   // efek api unggun (smoke=0 mematikan semua, flame=0 hanya percikan api)
 static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212, 213};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1651,6 +1655,8 @@ static bool lantern_enabled() {
     else if (sscanf(line, " chain_id=%d", &v) == 1) g_lt_cfg_id[1] = v;
     else if (sscanf(line, " hang_id=%d", &v) == 1) g_lt_cfg_id[2] = v;
     else if (sscanf(line, " fire_id=%d", &v) == 1) g_lt_cfg_id[3] = v;
+    else if (sscanf(line, " smoke=%d", &v) == 1) g_fire_smoke = v;
+    else if (sscanf(line, " flame=%d", &v) == 1) g_fire_flame = v;
     else if (sscanf(line, " texture=%d", &v) == 1) g_lt_texture = v;
   }
   fclose(f);
@@ -1753,6 +1759,100 @@ static void add_lantern_creative() {
   }
 }
 
+// ===================== API UNGGUN: asap dan percikan api =====================
+// Blok api unggun adalah Block biasa (tidak punya animateTick sendiri), jadi efeknya dibuat dari luar:
+//  - hook_tess_block mencatat posisi tiap api unggun yang digambar (daftar kecil, maksimal 64).
+//  - Level::animateTick(Entity&) dipanggil game tiap tick untuk pemain; di akhirnya kita lewati daftar itu,
+//    cek blok masih ada (BlockSource::getBlockID), lalu panggil Level::addParticle untuk asap dan api kecil.
+// Tipe partikel dibaca dari obor dan tungku bawaan (animateTick keduanya memanggil addParticle dengan 3 lalu 6): 3 = asap, 6 = api.
+// Dimatikan lewat pipe3d_lantern.txt: smoke=0 (semua efek), flame=0 (hanya percikan api).
+static const uintptr_t OFF_LEVEL_ANIMATE_TICK = 0xD27A59;   // Level::animateTick(Entity&)
+static const uint8_t SIG_LEVEL_ANIMATE_TICK[8] = {0x2d,0xe9,0xf0,0x4f,0x8b,0xb0,0x0d,0x46};  // push.w, sub sp, mov r5,r1 (8 byte utuh)
+static const uintptr_t OFF_LEVEL_ADD_PARTICLE = 0xD26695;   // Level::addParticle(ParticleType, Vec3 const&, Vec3 const&, int)
+static const uintptr_t OFF_BS_GET_BLOCK_ID_XYZ = 0xD102D5;  // BlockSource::getBlockID(int, int, int)
+static const int ENTITY_POS_OFF = 8;        // Entity::getPos() hanya "adds r0,#8": Vec3 posisi ada di entity+8
+static const int ENTITY_REGION_OFF = 0x194; // Entity::getRegion() hanya membaca entity+0x194 (BlockSource*)
+static const int PARTICLE_SMOKE = 3;
+static const int PARTICLE_FLAME = 6;
+static const int FIRE_MAX = 64;
+static const float FIRE_RANGE = 24.0f;      // efek hanya dibuat kalau pemain dalam jarak ini
+static int g_fire_pos[FIRE_MAX][3];
+static int g_fire_cnt = 0, g_fire_next = 0;
+static pthread_mutex_t g_fire_mu = PTHREAD_MUTEX_INITIALIZER;
+static long long g_fire_last_ms = 0;
+static uint32_t g_fire_rng = 2463534242u;
+typedef void (*LevelAnimTickFn)(void* level, void* entity);
+typedef void (*AddParticleFn)(void* level, int type, const float* pos, const float* vel, int data);
+typedef int (*GetBlockIdXYZFn)(void* region, int x, int y, int z);
+static LevelAnimTickFn orig_level_anim = nullptr;
+
+static float fire_rand() {   // 0..1
+  g_fire_rng ^= g_fire_rng << 13; g_fire_rng ^= g_fire_rng >> 17; g_fire_rng ^= g_fire_rng << 5;
+  return (g_fire_rng & 0xFFFFFF) / 16777216.0f;
+}
+
+static void fire_record(int x, int y, int z) {
+  if (x < -30000000 || x > 30000000 || z < -30000000 || z > 30000000 || y < -64 || y > 512) return;
+  pthread_mutex_lock(&g_fire_mu);
+  bool have = false;
+  for (int i = 0; i < g_fire_cnt; i++)
+    if (g_fire_pos[i][0] == x && g_fire_pos[i][1] == y && g_fire_pos[i][2] == z) { have = true; break; }
+  if (!have) {
+    int i = (g_fire_cnt < FIRE_MAX) ? g_fire_cnt++ : (g_fire_next++ % FIRE_MAX);
+    g_fire_pos[i][0] = x; g_fire_pos[i][1] = y; g_fire_pos[i][2] = z;
+  }
+  pthread_mutex_unlock(&g_fire_mu);
+}
+
+static void campfire_effects(void* level, void* entity) {
+  uint8_t* e = (uint8_t*)entity;
+  void* region = *(void**)(e + ENTITY_REGION_OFF);
+  if (!region) return;
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  long long ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  if (ms - g_fire_last_ms < 50) return;   // paling sering 20 kali per detik
+  g_fire_last_ms = ms;
+  const float* pp = (const float*)(e + ENTITY_POS_OFF);
+  AddParticleFn add = (AddParticleFn)(g_base + OFF_LEVEL_ADD_PARTICLE);
+  GetBlockIdXYZFn get_id = (GetBlockIdXYZFn)(g_base + OFF_BS_GET_BLOCK_ID_XYZ);
+  pthread_mutex_lock(&g_fire_mu);
+  for (int i = 0; i < g_fire_cnt; ) {
+    int x = g_fire_pos[i][0], y = g_fire_pos[i][1], z = g_fire_pos[i][2];
+    float dx = x + 0.5f - pp[0], dy = y - pp[1], dz = z + 0.5f - pp[2];
+    if (dx * dx + dz * dz > FIRE_RANGE * FIRE_RANGE || dy > FIRE_RANGE || dy < -FIRE_RANGE) { i++; continue; }
+    if ((get_id(region, x, y, z) & 0xFF) != g_lt_ids[3]) {   // blok sudah dihancurkan: hapus dari daftar
+      g_fire_pos[i][0] = g_fire_pos[g_fire_cnt - 1][0]; g_fire_pos[i][1] = g_fire_pos[g_fire_cnt - 1][1]; g_fire_pos[i][2] = g_fire_pos[g_fire_cnt - 1][2];
+      g_fire_cnt--;
+      continue;
+    }
+    if (fire_rand() < 0.35f) {   // asap naik pelan dari tengah tumpukan kayu
+      float p[3] = {x + 0.5f + (fire_rand() - 0.5f) * 0.4f, y + 0.55f, z + 0.5f + (fire_rand() - 0.5f) * 0.4f};
+      float v[3] = {(fire_rand() - 0.5f) * 0.01f, 0.05f + fire_rand() * 0.03f, (fire_rand() - 0.5f) * 0.01f};
+      add(level, PARTICLE_SMOKE, p, v, 0);
+    }
+    if (g_fire_flame && fire_rand() < 0.5f) {   // percikan api kecil di atas kayu
+      float p[3] = {x + 0.5f + (fire_rand() - 0.5f) * 0.5f, y + 0.3f + fire_rand() * 0.15f, z + 0.5f + (fire_rand() - 0.5f) * 0.5f};
+      float v[3] = {0.0f, 0.01f, 0.0f};
+      add(level, PARTICLE_FLAME, p, v, 0);
+    }
+    i++;
+  }
+  pthread_mutex_unlock(&g_fire_mu);
+}
+
+static void hook_level_animate_tick(void* level, void* entity) {
+  orig_level_anim(level, entity);   // sampling animateTick bawaan jalan dulu
+  if (g_fire_smoke && g_fire_cnt > 0 && g_lt_ids[3] >= 0 && level && entity) campfire_effects(level, entity);
+}
+
+static void install_campfire_fx(uintptr_t base) {
+  uintptr_t t = base + OFF_LEVEL_ANIMATE_TICK - 1;
+  if (memcmp((void*)t, SIG_LEVEL_ANIMATE_TICK, 8) != 0) { lantern_log("asap api unggun: tanda Level::animateTick tidak cocok, dilewati"); return; }
+  bool ok = install_hook(t, (void*)hook_level_animate_tick, (void**)&orig_level_anim);
+  lantern_log("asap api unggun: hook Level::animateTick=%d smoke=%d flame=%d", (int)ok, g_fire_smoke, g_fire_flame);
+}
+// ==============================================================================
+
 static void hook_init_blocks() {
   orig_init_blocks();             // semua blok bawaan sudah terdaftar
   if (lantern_enabled()) register_lantern();
@@ -1817,6 +1917,7 @@ static void install_lantern_patch(uintptr_t base) {
   bool ok2 = install_hook(t2, (void*)hook_bg_init_blocks, (void**)&orig_bg_init_blocks);
   bool ok3 = install_hook(t3, (void*)hook_init_creative, (void**)&orig_init_creative);
   LOG("lentera: hook initBlocks=%d graphics=%d creative=%d", (int)ok1, (int)ok2, (int)ok3);
+  install_campfire_fx(base);   // asap api unggun
 }
 // ==================================================================================
 
