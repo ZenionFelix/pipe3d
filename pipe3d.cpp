@@ -1610,7 +1610,9 @@ static const int LT_MATERIAL[LT_COUNT] = {4, 4, 4, 2};            // 4 = metal, 
 static const float LT_HARDNESS[LT_COUNT] = {1.0f, 1.0f, 1.0f, 2.0f};
 // Kotak seleksi (outline) tiap blok, satuan 1/16: xmin,ymin,zmin,xmax,ymax,zmax
 static const float LT_OUTLINE[LT_COUNT][6] = {
-  {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11}, {0, 0, 0, 16, 7, 16},
+  // unggun: ymin=1 (bukan 0) sengaja. Game menyembunyikan sisi atas blok di bawah unggun kalau kotak bentuk unggun menempel dan menutupi
+  // seluruh sisi itu (cek ymin<=0 dan x/z 0..1 di BlockOccluder::_shouldRenderFace), padahal model kayunya berlubang, jadi blok bawah tembus pandang.
+  {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11}, {0, 1, 0, 16, 7, 16},
 };
 
 typedef void (*InitVoidFn)();
