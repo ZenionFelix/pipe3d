@@ -181,6 +181,7 @@ static const LtModel LT_MODELS[LT_COUNT] = {
 };
 
 static void fire_record(int x, int y, int z);   // daftar posisi api unggun untuk efek asap (lihat bagian API UNGGUN)
+static void fire_trace(const char* tag, int a, int b, int c);   // jejak diagnosa crash unggun (maks 60 baris)
 
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
   int id = *((uint8_t*)block + BLOCK_ID_OFF);
@@ -196,7 +197,7 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
   if (g_lantern_shape) {
     for (int m = 0; m < LT_COUNT; m++) {
       if (g_lt_ids[m] < 0 || id != g_lt_ids[m]) continue;
-      if (m == 3 && pos) { int* fp = (int*)pos; fire_record(fp[0], fp[1], fp[2]); }   // api unggun: catat posisinya
+      if (m == 3 && pos) { int* fp = (int*)pos; fire_trace("tess mulai", fp[0], fp[1], fp[2]); fire_record(fp[0], fp[1], fp[2]); }   // api unggun: catat posisinya
       uint8_t* lb = (uint8_t*)self + BOUNDS_OFF;
       uint8_t lsaved[28];
       memcpy(lsaved, lb, 28);
@@ -208,6 +209,7 @@ static int hook_tess_block(void* self, void* block, void* pos, int data) {
         lr = orig_tess_block(self, block, pos, data);
       }
       memcpy(lb, lsaved, 28);
+      if (m == 3) fire_trace("tess selesai", 0, 0, 0);
       return lr;
     }
   }
@@ -1792,6 +1794,13 @@ static float fire_rand() {   // 0..1
   return (g_fire_rng & 0xFFFFFF) / 16777216.0f;
 }
 
+static int g_fire_trace_n = 0;
+static void fire_trace(const char* tag, int a, int b, int c) {
+  if (g_fire_trace_n >= 60) return;
+  g_fire_trace_n++;
+  lantern_log("[jejak unggun] %s %d %d %d", tag, a, b, c);
+}
+
 static void fire_record(int x, int y, int z) {
   if (x < -30000000 || x > 30000000 || z < -30000000 || z > 30000000 || y < -64 || y > 512) return;
   pthread_mutex_lock(&g_fire_mu);
@@ -1808,7 +1817,7 @@ static void fire_record(int x, int y, int z) {
 static void campfire_effects(void* level, void* entity) {
   uint8_t* e = (uint8_t*)entity;
   void* region = *(void**)(e + ENTITY_REGION_OFF);
-  if (!region) return;
+  if (!region) { fire_trace("effects: region null", 0, 0, 0); return; }
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   long long ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
   if (ms - g_fire_last_ms < 50) return;   // paling sering 20 kali per detik
@@ -1822,7 +1831,9 @@ static void campfire_effects(void* level, void* entity) {
     float dx = x + 0.5f - pp[0], dy = y - pp[1], dz = z + 0.5f - pp[2];
     if (dx * dx + dz * dz > FIRE_RANGE * FIRE_RANGE || dy > FIRE_RANGE || dy < -FIRE_RANGE) { i++; continue; }
     alignas(8) uint8_t bid[8] = {0};
+    fire_trace("effects: sebelum getBlockID", x, y, z);
     get_id(region, bid, x, y, z);
+    fire_trace("effects: sesudah getBlockID id=", bid[0], 0, 0);
     if (bid[0] != g_lt_ids[3]) {   // blok sudah dihancurkan: hapus dari daftar
       g_fire_pos[i][0] = g_fire_pos[g_fire_cnt - 1][0]; g_fire_pos[i][1] = g_fire_pos[g_fire_cnt - 1][1]; g_fire_pos[i][2] = g_fire_pos[g_fire_cnt - 1][2];
       g_fire_cnt--;
@@ -1831,12 +1842,16 @@ static void campfire_effects(void* level, void* entity) {
     if (fire_rand() < 0.35f) {   // asap naik pelan dari tengah tumpukan kayu
       float p[3] = {x + 0.5f + (fire_rand() - 0.5f) * 0.4f, y + 0.55f, z + 0.5f + (fire_rand() - 0.5f) * 0.4f};
       float v[3] = {(fire_rand() - 0.5f) * 0.01f, 0.05f + fire_rand() * 0.03f, (fire_rand() - 0.5f) * 0.01f};
+      fire_trace("effects: sebelum asap", x, y, z);
       add(level, PARTICLE_SMOKE, p, v, 0);
+      fire_trace("effects: sesudah asap", 0, 0, 0);
     }
     if (g_fire_flame && fire_rand() < 0.5f) {   // percikan api kecil di atas kayu
       float p[3] = {x + 0.5f + (fire_rand() - 0.5f) * 0.5f, y + 0.3f + fire_rand() * 0.15f, z + 0.5f + (fire_rand() - 0.5f) * 0.5f};
       float v[3] = {0.0f, 0.01f, 0.0f};
+      fire_trace("effects: sebelum api", x, y, z);
       add(level, PARTICLE_FLAME, p, v, 0);
+      fire_trace("effects: sesudah api", 0, 0, 0);
     }
     i++;
   }
