@@ -1,5 +1,5 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
-// + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
+// + BAYANGAN PEMAIN: model sederhana (kaki, badan, lengan, kepala) ikut peta bayangan di orang pertama; orang pertama dikenali dari tangan di layar atau kamera = posisi pemain (Level::animateTick + uniform VIEW_POS).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
 // + API UNGGUN (tahap 1): blok baru "campfire" (id 213) ikut sistem lentera.
 // + LENTERA: blok baru "lantern" (item, gambar, inventory kreatif, bentuk kotak); aktif kalau pipe3d_lantern.txt berisi enabled=1.
@@ -282,7 +282,7 @@ static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
 struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
-  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; int loc_vpos; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -513,17 +513,7 @@ static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
   X(void, GetBufferParameteriv, (unsigned, unsigned, int*)) \
   X(void, GenBuffers, (int, unsigned*)) \
   X(void, BufferData, (unsigned, intptr_t, const void*, unsigned)) \
-  X(void, DrawArrays, (unsigned, int, int)) \
-  X(void, Uniform1f, (int, float)) \
-  X(void, Uniform2f, (int, float, float)) \
-  X(void, FrontFace, (unsigned)) \
-  X(void, BlendFuncSeparate, (unsigned, unsigned, unsigned, unsigned)) \
-  X(void, ClearColor, (float, float, float, float)) \
-  X(void, GenRenderbuffers, (int, unsigned*)) \
-  X(void, BindRenderbuffer, (unsigned, unsigned)) \
-  X(void, RenderbufferStorage, (unsigned, unsigned, int, int)) \
-  X(void, FramebufferRenderbuffer, (unsigned, unsigned, unsigned, unsigned)) \
-  X(void, DeleteProgram, (unsigned))
+  X(void, DrawArrays, (unsigned, int, int))
 
 struct GLX {
 #define X(ret, name, args) ret (*name) args;
@@ -766,7 +756,7 @@ static void shadow_init() {
 }
 
 // ---- status per frame ----
-struct DrawRec { int vbo, ibo, count, vsz, isz; unsigned type; uintptr_t idx; float o[3]; unsigned pid; float sc; };
+struct DrawRec { int vbo, ibo, count, vsz, isz; unsigned type; uintptr_t idx; float o[3]; };
 static DrawRec g_dl[2][2048];
 static int g_dn[2] = {0, 0};
 static int g_dcur = 0;
@@ -781,6 +771,15 @@ static bool g_view_ok = false;
 static int g_atlas_tex = 0, g_prev_unit4 = 0;
 static bool g_unit4_saved = false;
 static double g_cam_est[3] = {0, 0, 0};
+// Posisi pemain (dari Level::animateTick, diisi thread game) dan posisi kamera asli (uniform VIEW_POS), dipakai untuk bayangan pemain.
+// Kalau kamera berada di posisi pemain = orang pertama (game tidak menggambar tubuh pemain, jadi dipasang model sederhana di peta bayangan).
+static volatile float g_pl_pos[3] = {0, 0, 0};
+static volatile double g_pl_time = 0;      // detik (mono_sec) terakhir posisi pemain diperbarui
+static float g_cam_abs[3] = {0, 0, 0};
+static bool g_vpos_ok = false;
+static bool g_pl_trust = false;            // posisi pemain terbukti cocok dengan kamera (dicek saat orang pertama)
+static float g_pl_eyeoff = 0.0f;           // 0 = posisi pemain setinggi mata, 1.62 = setinggi kaki
+static float g_dbg_hd = -1.0f; static int g_dbg_fp = 0, g_dbg_box = 0, g_dbg_rec = 0;
 static float g_lvp[16];
 static float g_gen_Ly = 1.0f, g_gen_Lz = 0.0f, g_ox0 = 0, g_oy0 = 0;   // dasar cahaya saat peta dibuat (dipakai shader)
 static float g_bs[3] = {0, 0, 1}, g_bu[3] = {1, 0, 0}, g_bf[3] = {0, -1, 0};
@@ -869,8 +868,6 @@ static void sky_draw(ProgStat* s, unsigned mode, int count) {
   }
 }
 
-static void water_frame_begin(ProgStat* s);    // bagian AIR: PANTULAN (di bawah)
-static void water_capture_prog(ProgStat* s);
 // dipanggil sebelum tiap draw terrain
 static int g_u2_prev = 0, g_act_prev = 0;
 // hasil true: slot tekstur 2 ditimpa dengan peta bayangan, panggil terrain_draw_post sesudah draw asli
@@ -879,14 +876,13 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
   if (g_level < 1 || g_cur_fbo != 0) return false;
   if (g_tframe != g_frames) {   // draw terrain pertama di frame ini
     g_tframe = g_frames;
-    g_view_ok = false; g_en = 0;
+    g_view_ok = false; g_vpos_ok = false; g_en = 0;
     g_delta_exact = false;
     if (g_have_prev_delta) {   // belum ada chunk yang cocok: pakai dugaan (kamera bergerak sama seperti frame lalu), jangan matikan bayangan
       g_delta[0] = g_last_delta[0]; g_delta[1] = g_last_delta[1]; g_delta[2] = g_last_delta[2];
       g_delta_ok = true; g_delta_ver++;
     } else g_delta_ok = false;
     if (!g_guard_done) guard_arm();
-    water_frame_begin(s);
     if (g_level >= 2 && g_sh_state == 1) {
       int act = 0x84C0; f_geti(0x84E0, &act);
       gx.ActiveTexture(0x84C0); f_geti(0x8069, &g_atlas_tex);
@@ -896,6 +892,10 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
   if (!g_view_ok && f_unifv && s->loc_wv >= 0 && s->loc_proj >= 0) {
     f_unifv(s->id, s->loc_wv, g_wv); f_unifv(s->id, s->loc_proj, g_proj);
     g_view_ok = true;
+  }
+  if (!g_vpos_ok && f_unifv && s->loc_vpos >= 0) {
+    f_unifv(s->id, s->loc_vpos, g_cam_abs);
+    g_vpos_ok = true;
   }
   if (g_level < 2 || g_sh_state != 1) return false;
   int vbo = 0, ibo = 0; f_geti(0x8894, &vbo); f_geti(0x8895, &ibo);
@@ -920,10 +920,9 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
       int vsz = 0, isz = 0;
       gx.GetBufferParameteriv(0x8892, 0x8764, &vsz);   // GL_BUFFER_SIZE
       gx.GetBufferParameteriv(0x8893, 0x8764, &isz);
-      water_capture_prog(s);
       DrawRec& r = g_dl[g_dcur][g_dn[g_dcur]++];
       r.vbo = vbo; r.ibo = ibo; r.count = count; r.vsz = vsz; r.isz = isz; r.type = type; r.idx = (uintptr_t)idx;
-      r.o[0] = o[0]; r.o[1] = o[1]; r.o[2] = o[2]; r.pid = s->id; r.sc = o[3];
+      r.o[0] = o[0]; r.o[1] = o[1]; r.o[2] = o[2];
     }
   }
   if (g_level < 3) return false;
@@ -1087,6 +1086,34 @@ static void build_light_matrix(float* lvp) {
   mat_mul(P, V, lvp);
 }
 
+// Model pemain sederhana untuk peta bayangan: 6 kotak (2 kaki, badan, 2 lengan, kepala), tinggi total sekitar 1.85 blok.
+// feet = posisi telapak kaki relatif terhadap kamera; (fx, fz) = arah hadap mendatar (satuan). Buffer kubus dan atribut
+// harus sudah terpasang. Hasil: jumlah draw.
+static unsigned draw_player_proxy(const float* lvp, const float* feet, float fx, float fz) {
+  // {geser kanan, tinggi tengah dari kaki, geser depan, lebar, tinggi, tebal}
+  static const float PART[6][6] = {
+    {-0.12f, 0.35f, 0.0f, 0.23f, 0.70f, 0.24f},   // kaki kiri
+    { 0.12f, 0.35f, 0.0f, 0.23f, 0.70f, 0.24f},   // kaki kanan
+    { 0.00f, 1.05f, 0.0f, 0.47f, 0.70f, 0.24f},   // badan
+    {-0.36f, 1.05f, 0.0f, 0.23f, 0.70f, 0.24f},   // lengan kiri
+    { 0.36f, 1.05f, 0.0f, 0.23f, 0.70f, 0.24f},   // lengan kanan
+    { 0.00f, 1.62f, 0.0f, 0.47f, 0.47f, 0.47f}};  // kepala
+  const float rx = fz, rz = -fx;   // arah kanan; arah depan = (fx, fz)
+  unsigned n = 0;
+  for (int i = 0; i < 6; i++) {
+    const float* b = PART[i];
+    float M[16] = {rx * b[3], 0, rz * b[3], 0,
+                   0, b[4], 0, 0,
+                   fx * b[5], 0, fz * b[5], 0,
+                   feet[0] + rx * b[0] + fx * b[2], feet[1] + b[1], feet[2] + rz * b[0] + fz * b[2], 1};
+    float lm[16]; mat_mul(lvp, M, lm);
+    gx.UniformMatrix4fv(g_eh_loc, 1, 0, lm);
+    gx.DrawElements(4, 36, 0x1403, (const void*)0);
+    n++;
+  }
+  return n;
+}
+
 // dijalankan tepat sebelum eglSwapBuffers; menggambar ulang terrain frame ini dari arah matahari
 static void shadow_pass() {
   g_lvp_valid = false;
@@ -1159,19 +1186,49 @@ static void shadow_pass() {
       else gx.DrawArrays(r.mode, (int)r.first, r.count);
       edrawn++;
     }
-    // game tidak menggambar tubuh pemain di orang pertama: dipasang kotak sederhana (0.6 x 1.8 x 0.4) di posisi kamera
-    if (g_cfg_playerbox && g_cube_vbo && g_cube_ibo && g_hand_frame + 1 == g_frames && g_view_ok) {
-      float fx = -g_wv[2], fz = -g_wv[10];
-      float fl = sqrtf(fx * fx + fz * fz);
-      if (fl > 1e-4f) {
-        fx /= fl; fz /= fl;
-        float M[16] = {fz * 0.6f, 0, -fx * 0.6f, 0,   0, 1.8f, 0, 0,   fx * 0.4f, 0, fz * 0.4f, 0,   0, -0.72f, 0, 1};
-        float lm[16]; mat_mul(lvp, M, lm);
-        gx.BindBuffer(0x8892, g_cube_vbo); gx.BindBuffer(0x8893, g_cube_ibo);
-        gx.VertexAttribPointer(0, 3, 0x1406, 0, 12, (const void*)0);
-        gx.UniformMatrix4fv(g_eh_loc, 1, 0, lm);
-        gx.DrawElements(4, 36, 0x1403, (const void*)0);
-        edrawn++;
+    // Bayangan pemain. Di orang pertama game tidak menggambar tubuh pemain, jadi dipasang model sederhana (kaki, badan, lengan, kepala)
+    // di peta bayangan. Orang pertama dikenali dari dua cara: ada tangan/item di layar, atau kamera berada tepat di posisi pemain
+    // (posisi pemain dari Level::animateTick, posisi kamera dari uniform VIEW_POS). Di orang ketiga model bawaan game ikut tergambar
+    // sebagai mob; kalau tidak ada model yang cocok dengan posisi pemain, model sederhana yang dipasang.
+    g_dbg_box = 0; g_dbg_fp = 0; g_dbg_rec = 0; g_dbg_hd = -1.0f;
+    if (g_cfg_playerbox && g_cube_vbo && g_cube_ibo && g_view_ok) {
+      bool hand = (g_hand_frame + 1 == g_frames);
+      bool plOk = g_vpos_ok && g_pl_time > 0 && (mono_sec() - g_pl_time) < 1.0;
+      float prx = 0, pry = 0, prz = 0, hd = 1e9f;
+      if (plOk) {
+        prx = g_pl_pos[0] - g_cam_abs[0]; pry = g_pl_pos[1] - g_cam_abs[1]; prz = g_pl_pos[2] - g_cam_abs[2];
+        hd = sqrtf(prx * prx + prz * prz);
+        if (hd > 5000.0f) plOk = false;   // nilai tidak masuk akal (uniform bukan posisi kamera)
+      }
+      g_dbg_hd = plOk ? hd : -1.0f;
+      bool fp = hand || (plOk && hd < 0.8f && fabsf(pry) < 2.2f);
+      if (plOk && hd < 0.8f && fabsf(pry) < 2.2f) g_pl_eyeoff = (pry < -0.8f) ? 1.62f : 0.0f;   // kamera setinggi mata: tahu apakah posisi pemain di mata atau di kaki
+      if (plOk && hand) g_pl_trust = (hd < 1.2f);
+      float feet[3] = {0, 0, 0};
+      bool draw = false;
+      if (fp) {
+        feet[0] = 0; feet[1] = -1.62f; feet[2] = 0;   // kamera di mata pemain
+        draw = true;
+      } else if (plOk && g_pl_trust && hd < 60.0f) {
+        bool rec = false;   // apakah model pemain bawaan game sudah tergambar di dekat posisi pemain?
+        for (int i = 0; i < g_en; i++) {
+          float ex = g_cam_abs[0] + g_el[i].m[12] - g_pl_pos[0], ez = g_cam_abs[2] + g_el[i].m[14] - g_pl_pos[2];
+          if (ex * ex + ez * ez < 0.8f * 0.8f) { rec = true; break; }
+        }
+        g_dbg_rec = rec ? 1 : 0;
+        if (!rec) { feet[0] = prx; feet[1] = pry + g_pl_eyeoff - 1.62f; feet[2] = prz; draw = true; }
+      }
+      g_dbg_fp = fp ? 1 : 0;
+      if (draw) {
+        float fx = -g_wv[2], fz = -g_wv[10];
+        float fl = sqrtf(fx * fx + fz * fz);
+        if (fl > 1e-4f) {
+          fx /= fl; fz /= fl;
+          gx.BindBuffer(0x8892, g_cube_vbo); gx.BindBuffer(0x8893, g_cube_ibo);
+          gx.VertexAttribPointer(0, 3, 0x1406, 0, 12, (const void*)0);
+          edrawn += draw_player_proxy(lvp, feet, fx, fz);
+          g_dbg_box = 1;
+        }
       }
     }
   }
@@ -1213,477 +1270,15 @@ static void shadow_end_frame() {
   g_dn[g_dcur] = 0;
   if (g_frames % 600 == 0 && g_st_logs < 12) {
     g_st_logs++;
-    sh_log("shadow frame %u: pass=%u draw/pass=%.0f lewati/pass=%.0f ms/pass=%.2f delta_tepat=%u/%u matahari=(%.3f %.3f %.3f) valid=%d lvp=%d | mob: total=%u terekam=%u dilewati=%u tangan=%u digambar/pass=%.1f orang_pertama=%d\n",
+    sh_log("shadow frame %u: pass=%u draw/pass=%.0f lewati/pass=%.0f ms/pass=%.2f delta_tepat=%u/%u matahari=(%.3f %.3f %.3f) valid=%d lvp=%d | mob: total=%u terekam=%u dilewati=%u tangan=%u digambar/pass=%.1f orang_pertama=%d | pemain: jarak_kamera=%.2f fp=%d model_bawaan=%d kotak=%d percaya=%d tinggi_mata=%.2f\n",
            g_frames, g_st_pass, g_st_pass ? (double)g_st_draws / g_st_pass : 0.0, g_st_pass ? (double)g_st_skipped / g_st_pass : 0.0,
            g_st_pass ? g_st_ms / g_st_pass : 0.0, g_st_delta_ok, g_st_frames, g_sun[0], g_sun[1], g_sun[2],
            (int)g_sun_valid, (int)g_lvp_valid, g_ent_total, g_ent_rec, g_ent_skip, g_ent_hand, g_st_pass ? (double)g_st_ent / g_st_pass : 0.0,
-           (int)(g_hand_frame + 1 == g_frames));
+           (int)(g_hand_frame + 1 == g_frames), g_dbg_hd, g_dbg_fp, g_dbg_rec, g_dbg_box, (int)g_pl_trust, g_pl_eyeoff);
     g_st_pass = g_st_draws = g_st_skipped = g_st_delta_ok = g_st_frames = 0; g_st_ms = 0; g_st_ent = 0;
     g_ent_total = g_ent_rec = g_ent_skip = g_ent_hand = 0;
   }
 }
-
-// ===================== AIR: PANTULAN (bidang pantul, tiru mod water shader Java) =====================
-// Cara kerja (semua dari libpipe3d, shader game TIDAK diubah, tidak ada sampler/uniform baru di shader game):
-//  1. Draw terrain (opaque + alpha test) tiap frame sudah direkam oleh bagian peta bayangan (g_dl).
-//  2. Tepat sebelum draw blend pertama (air) di frame itu, terrain digambar ulang TERBALIK terhadap bidang air
-//     ke tekstur warna kecil (setengah resolusi). Memakai program terrain game sendiri, jadi warna/cahaya/kabut sama.
-//     Bidang potong miring (oblique near plane) membuang semua yang ada di bawah permukaan air.
-//  3. Sesudah tiap draw air bawaan, geometri air yang sama digambar sekali lagi dengan program kecil milik pipe3d:
-//     hanya fragmen di ketinggian permukaan air yang dipakai, warnanya = pantulan (dibaca per piksel layar, digeser riak
-//     gelombang sinus seperti water.frag di mod Java), alpha = fresnel (makin miring makin memantul).
-//  Pengaturan opsional di /sdcard/games/com.mojang/pipe3d_water.txt: on=1 stage=2 scale=0.5 radius=72 watery=62.889 strength=1.0 lift=0.02 tol=0.07
-//  stage 0 mati; 1 hanya menggambar tekstur pantulan (tidak terlihat, untuk uji aman); 2 tampil di air.
-//  Pengaman crash sendiri (pipe3d_state_w.txt): kalau peluncuran sebelumnya tidak lolos 120 frame pantulan, stage turun satu.
-//  Butuh: bagian bayangan level >= 2 (daftar draw), dan hook Level::animateTick (posisi pemain) untuk ketinggian kamera.
-static int g_w_stage = -1;   // -1 belum dibaca
-static float g_w_scale = 0.5f, g_w_rr = 72.0f, g_w_water_y = 62.889f, g_w_str = 1.0f, g_w_lift = 0.02f, g_w_tol = 0.07f;
-static const char* WGUARD_FILE = "/sdcard/games/com.mojang/pipe3d_state_w.txt";
-static bool g_w_armed = false;
-static unsigned g_w_okframes = 0, g_w_logs = 0;
-static double g_w_ms = 0; static unsigned g_w_passes = 0, g_w_draws = 0;
-// posisi pemain dari hook Level::animateTick
-static float g_pl_x = 0, g_pl_y = 0, g_pl_z = 0;
-static bool g_pl_ok = false;
-static unsigned g_pl_frame = 0;
-static float g_w_camy = 0;
-
-static void wguard_write(int st, int armed) {
-  FILE* f = fopen(WGUARD_FILE, "w");
-  if (f) { fprintf(f, "stage=%d\narmed=%d\n", st, armed); fclose(f); }
-}
-static void water_cfg_init() {
-  cfg_load();
-  int on = 1, forced = -1, stage = 2, armed = 0; bool have = false;
-  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_water.txt", "r");
-  if (f) {
-    char line[128];
-    while (fgets(line, sizeof(line), f)) {
-      int iv; float fv;
-      if (sscanf(line, "on=%d", &iv) == 1) on = iv;
-      else if (sscanf(line, "stage=%d", &iv) == 1) forced = iv;
-      else if (sscanf(line, "scale=%f", &fv) == 1) g_w_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
-      else if (sscanf(line, "radius=%f", &fv) == 1) g_w_rr = (fv < 24.0f) ? 24.0f : (fv > 160.0f ? 160.0f : fv);
-      else if (sscanf(line, "watery=%f", &fv) == 1) g_w_water_y = fv;
-      else if (sscanf(line, "strength=%f", &fv) == 1) g_w_str = (fv < 0.0f) ? 0.0f : (fv > 1.5f ? 1.5f : fv);
-      else if (sscanf(line, "lift=%f", &fv) == 1) g_w_lift = (fv < 0.0f) ? 0.0f : (fv > 0.2f ? 0.2f : fv);
-      else if (sscanf(line, "tol=%f", &fv) == 1) g_w_tol = (fv < 0.01f) ? 0.01f : (fv > 0.3f ? 0.3f : fv);
-    }
-    fclose(f);
-  }
-  f = fopen(WGUARD_FILE, "r");
-  if (f) {
-    char line[64]; int v;
-    while (fgets(line, sizeof(line), f)) {
-      if (sscanf(line, "stage=%d", &v) == 1) { stage = v; have = true; }
-      else if (sscanf(line, "armed=%d", &v) == 1) armed = v;
-    }
-    fclose(f);
-  }
-  if (forced >= 0) { stage = forced; armed = 0; }
-  else if (have && armed) { sh_log("air: peluncuran sebelumnya tidak lolos 120 frame pantulan pada stage %d, turun ke stage %d\n", stage, stage > 0 ? stage - 1 : 0); stage = stage > 0 ? stage - 1 : 0; }
-  if (!on) stage = 0;
-  if (stage < 0) stage = 0;
-  if (stage > 2) stage = 2;
-  g_w_stage = stage;
-  wguard_write(stage, 0);
-  sh_log("air: stage=%d scale=%.2f radius=%.0f watery=%.3f strength=%.2f lift=%.3f tol=%.3f\n", stage, g_w_scale, g_w_rr, g_w_water_y, g_w_str, g_w_lift, g_w_tol);
-}
-
-// ---- matriks ----
-static bool mat_inv4(const float* m, float* out) {
-  float inv[16];
-  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
-  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
-  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
-  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
-  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
-  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
-  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
-  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
-  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
-  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
-  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
-  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
-  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
-  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
-  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
-  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
-  float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
-  if (fabsf(det) < 1e-12f) return false;
-  det = 1.0f / det;
-  for (int i = 0; i < 16; i++) out[i] = inv[i] * det;
-  return true;
-}
-// Lengyel: bidang near proyeksi dimiringkan ke bidang C (ruang mata); sisi positif C dipertahankan, kamera di sisi negatif
-static bool oblique_proj(float* p, const float* C) {
-  float q[4];
-  q[0] = (((C[0] > 0) - (C[0] < 0)) + p[8]) / p[0];
-  q[1] = (((C[1] > 0) - (C[1] < 0)) + p[9]) / p[5];
-  q[2] = -1.0f;
-  q[3] = (1.0f + p[10]) / p[14];
-  float d = C[0] * q[0] + C[1] * q[1] + C[2] * q[2] + C[3] * q[3];
-  if (d < 0.02f) return false;   // bidang air ada di belakang kamera (kamera menengadah): air tidak terlihat, lewati
-  float a = 2.0f / d;
-  p[2] = C[0] * a; p[6] = C[1] * a; p[10] = C[2] * a + 1.0f; p[14] = C[3] * a;
-  return true;
-}
-
-// ---- sumber daya ----
-static unsigned g_w_tex = 0, g_w_fbo = 0, g_w_rb = 0, g_w_prog = 0;
-static int g_w_tw = 0, g_w_th = 0, g_w_prog_pos = -2;
-static int g_wu_wv = -1, g_wu_proj = -1, g_wu_org = -1, g_wu_lift = -1, g_wu_refl = -1, g_wu_vp = -1, g_wu_plane = -1,
-           g_wu_time = -1, g_wu_str = -1, g_wu_tol = -1, g_wu_camxz = -1, g_wu_skyh = -1, g_wu_skyz = -1;
-static bool g_w_ready = false;
-static unsigned g_w_pass_frame = 0xFFFFFFFFu, g_w_uni_frame = 0xFFFFFFFFu;
-static float g_w_h = 0;
-static float g_w_fog[3] = {0.62f, 0.74f, 0.93f};
-
-static const char* WTR_VS =
-  "attribute vec3 POSITION;\n"
-  "uniform mat4 WV;\n"
-  "uniform mat4 PROJ;\n"
-  "uniform vec4 ORG;\n"
-  "uniform float LIFT;\n"
-  "varying vec3 vp;\n"
-  "void main() {\n"
-  "  vec3 p = POSITION * ORG.w + ORG.xyz;\n"
-  "  vp = p;\n"
-  "  p.y += LIFT;\n"
-  "  gl_Position = PROJ * (WV * vec4(p, 1.0));\n"
-  "}\n";
-static const char* WTR_FS =
-  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
-  "precision highp float;\n"
-  "#else\n"
-  "precision mediump float;\n"
-  "#endif\n"
-  "varying vec3 vp;\n"
-  "uniform sampler2D REFL;\n"
-  "uniform vec4 VP;\n"
-  "uniform float PLANE;\n"
-  "uniform float TIME;\n"
-  "uniform float STR;\n"
-  "uniform float TOL;\n"
-  "uniform vec2 CAMXZ;\n"
-  "uniform vec3 SKYH;\n"
-  "uniform vec3 SKYZ;\n"
-  "void main() {\n"
-  "  if (abs(vp.y - PLANE) > TOL) discard;\n"
-  "  float dist = max(length(vp), 0.001);\n"
-  "  vec3 v = vp / dist;\n"
-  "  float cosT = clamp(abs(v.y), 0.0, 1.0);\n"
-  "  vec2 wp = vp.xz + CAMXZ;\n"
-  "  float t = TIME;\n"
-  "  vec2 d = vec2(sin(wp.x * 1.3 + t * 1.1 + sin(wp.y * 0.7 + t * 0.6) * 1.5),\n"
-  "                sin(wp.y * 1.1 - t * 0.9 + sin(wp.x * 0.8 - t * 0.5) * 1.5));\n"
-  "  d += 0.5 * vec2(sin(wp.x * 3.1 + wp.y * 1.7 + t * 1.7), sin(wp.y * 3.3 - wp.x * 1.3 + t * 1.4));\n"
-  "  vec2 uv = (gl_FragCoord.xy - VP.xy) / VP.zw;\n"
-  "  uv += d * (0.007 / (1.0 + dist * 0.05));\n"
-  "  uv = clamp(uv, vec2(0.003), vec2(0.997));\n"
-  "  vec4 tx = texture2D(REFL, uv);\n"
-  "  vec3 sky = mix(SKYH, SKYZ, smoothstep(0.0, 0.8, cosT));\n"
-  "  vec3 refl = mix(sky, tx.rgb, clamp(tx.a * 1.5, 0.0, 1.0));\n"
-  "  refl *= vec3(0.80, 0.95, 0.93);\n"
-  "  float fr = pow(1.0 - cosT, 4.0);\n"
-  "  float alpha = clamp((0.28 + 0.72 * fr) * STR, 0.0, 0.95);\n"
-  "  gl_FragColor = vec4(refl, alpha);\n"
-  "}\n";
-
-static bool water_resources(int w, int h) {
-  if (g_w_tex && w == g_w_tw && h == g_w_th) return true;
-  clear_gl_errors();
-  int prev_fbo = 0, prev_rb = 0, prev_tex = 0, prev_act = 0;
-  f_geti(0x8CA6, &prev_fbo); f_geti(0x8CA7, &prev_rb); f_geti(0x84E0, &prev_act);
-  gx.ActiveTexture(0x84C3); f_geti(0x8069, &prev_tex);
-  bool first = (g_w_tex == 0);
-  if (first) { gx.GenTextures(1, &g_w_tex); gx.GenRenderbuffers(1, &g_w_rb); gx.GenFramebuffers(1, &g_w_fbo); }
-  gx.BindTexture(0x0DE1, g_w_tex);
-  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
-  gx.TexParameteri(0x0DE1, 0x2801, 0x2601);   // MIN = LINEAR
-  gx.TexParameteri(0x0DE1, 0x2800, 0x2601);   // MAG = LINEAR
-  gx.TexParameteri(0x0DE1, 0x2802, 0x812F);
-  gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
-  gx.BindRenderbuffer(0x8D41, g_w_rb);
-  clear_gl_errors();
-  gx.RenderbufferStorage(0x8D41, 0x81A6, w, h);   // DEPTH_COMPONENT24
-  if (gx.GetError() != 0) gx.RenderbufferStorage(0x8D41, 0x81A5, w, h);   // DEPTH_COMPONENT16
-  gx.BindFramebuffer(0x8D40, g_w_fbo);
-  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_w_tex, 0);
-  gx.FramebufferRenderbuffer(0x8D40, 0x8D00, 0x8D41, g_w_rb);
-  unsigned status = gx.CheckFramebufferStatus(0x8D40);
-  gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
-  gx.BindRenderbuffer(0x8D41, (unsigned)prev_rb);
-  gx.BindTexture(0x0DE1, (unsigned)prev_tex);
-  gx.ActiveTexture((unsigned)prev_act);
-  clear_gl_errors();
-  sh_log("air: framebuffer pantulan %dx%d status=0x%x (0x8cd5 = lengkap)\n", w, h, status);
-  if (status != 0x8CD5) return false;
-  g_w_tw = w; g_w_th = h;
-  return true;
-}
-
-static bool water_make_prog(int posloc) {
-  if (g_w_prog) { gx.DeleteProgram(g_w_prog); g_w_prog = 0; }
-  unsigned vs = sh_compile(0x8B31, WTR_VS), fs = sh_compile(0x8B30, WTR_FS);
-  if (!vs || !fs) return false;
-  unsigned p = gx.CreateProgram();
-  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
-  gx.BindAttribLocation(p, (unsigned)posloc, "POSITION");
-  gx.LinkProgram(p);
-  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
-  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("air: link gagal: %s\n", buf); return false; }
-  g_w_prog = p; g_w_prog_pos = posloc;
-  g_wu_wv = f_getuloc(p, "WV"); g_wu_proj = f_getuloc(p, "PROJ"); g_wu_org = f_getuloc(p, "ORG"); g_wu_lift = f_getuloc(p, "LIFT");
-  g_wu_refl = f_getuloc(p, "REFL"); g_wu_vp = f_getuloc(p, "VP"); g_wu_plane = f_getuloc(p, "PLANE"); g_wu_time = f_getuloc(p, "TIME");
-  g_wu_str = f_getuloc(p, "STR"); g_wu_tol = f_getuloc(p, "TOL"); g_wu_camxz = f_getuloc(p, "CAMXZ");
-  g_wu_skyh = f_getuloc(p, "SKYH"); g_wu_skyz = f_getuloc(p, "SKYZ");
-  sh_log("air: program pantulan siap (POSITION di lokasi %d)\n", posloc);
-  return true;
-}
-
-// ---- catatan per program terrain (tata letak atribut vertex, nilai uniform yang akan dipulihkan) ----
-struct WLay { int loc, size, type, norm, stride; uintptr_t off; bool ok; };
-struct WProg { unsigned id; unsigned frame; bool usable; WLay lay[4]; float wv[16], pr[16], org[4], vp[4]; };
-static WProg g_wp[8];
-static int g_nwp = 0;
-static WProg* wprog_find(unsigned id) {
-  for (int i = 0; i < g_nwp; i++) if (g_wp[i].id == id) return &g_wp[i];
-  return nullptr;
-}
-// dipanggil di awal frame terrain (dari terrain_draw): baca pengaturan, catat warna kabut
-static void water_frame_begin(ProgStat* s) {
-  g_w_ready = false;
-  if (g_w_stage < 0) {
-    water_cfg_init();
-    cap_init();
-    if (!g_gx_ok) gx_init();
-    if (!g_gx_ok || !f_getaloc || !f_getuloc || !f_unifv || !f_vaiv || !f_vaptr || !f_geti || !f_isen || !f_getb) { sh_log("air: fungsi GL tidak lengkap, dimatikan\n"); g_w_stage = 0; }
-  }
-  if (g_w_stage < 1) return;
-  int fl = f_getuloc(s->id, "FOG_COLOR");
-  if (fl >= 0) {
-    float v[4] = {g_w_fog[0], g_w_fog[1], g_w_fog[2], 1.0f};
-    f_unifv(s->id, fl, v);
-    for (int i = 0; i < 3; i++) g_w_fog[i] = v[i] < 0 ? 0 : (v[i] > 1 ? 1 : v[i]);
-  }
-}
-// dipanggil tiap draw terrain yang direkam (bukan blend)
-static void water_capture_prog(ProgStat* s) {
-  if (g_w_stage < 1) return;
-  WProg* p = wprog_find(s->id);
-  if (!p) {
-    if (g_nwp >= 8) return;
-    p = &g_wp[g_nwp++];
-    memset(p, 0, sizeof(*p));
-    p->id = s->id; p->frame = 0xFFFFFFFFu;
-  }
-  if (p->frame == g_frames) return;
-  p->frame = g_frames;
-  p->usable = (s->kind == 1 && s->loc_wv >= 0 && s->loc_proj >= 0 && s->loc_origin >= 0);
-  static const char* an[4] = {"POSITION", "COLOR", "TEXCOORD_0", "TEXCOORD_1"};
-  for (int i = 0; i < 4; i++) {
-    WLay& L = p->lay[i];
-    L.ok = false;
-    int loc = f_getaloc(s->id, an[i]);
-    L.loc = loc;
-    if (loc < 0) continue;
-    int en = 0, sz = 0, ty = 0, nm = 0, st = 0; void* po = nullptr;
-    f_vaiv((unsigned)loc, 0x8622, &en);
-    if (!en) continue;
-    f_vaiv((unsigned)loc, 0x8623, &sz); f_vaiv((unsigned)loc, 0x8625, &ty);
-    f_vaiv((unsigned)loc, 0x886A, &nm); f_vaiv((unsigned)loc, 0x8624, &st);
-    f_vaptr((unsigned)loc, 0x8645, &po);
-    if (sz < 1 || sz > 4) continue;
-    L.size = sz; L.type = ty; L.norm = nm; L.stride = st; L.off = (uintptr_t)po; L.ok = true;
-  }
-  if (!p->lay[0].ok) p->usable = false;   // tanpa POSITION tidak bisa digambar
-}
-
-// ketinggian bidang air relatif kamera. Tinggi kamera = kelipatan 16 (asal chunk) dikurangi origin chunk, dipilih yang paling dekat dengan posisi pemain
-static bool water_plane(float* h_out) {
-  int cur = g_dcur;
-  if (g_dn[cur] <= 0 || !g_pl_ok || g_frames - g_pl_frame > 900) return false;
-  float oy = g_dl[cur][0].o[1];
-  float k = floorf((g_pl_y + oy) / 16.0f + 0.5f);
-  float camy = 16.0f * k - oy;
-  g_w_camy = camy;
-  *h_out = g_w_water_y - camy;
-  return camy > g_w_water_y + 0.05f;   // kamera di atas permukaan
-}
-
-static bool water_reflect_pass() {
-  double t0 = mono_sec();
-  int cur = g_dcur, n = g_dn[cur];
-  float h = g_w_h;
-  float Mref[16] = {1, 0, 0, 0,  0, -1, 0, 0,  0, 0, 1, 0,  0, 2.0f * h, 0, 1};
-  float wv2[16]; mat_mul(g_wv, Mref, wv2);
-  float pr2[16]; memcpy(pr2, g_proj, sizeof(pr2));
-  float inv[16];
-  bool okc = false;
-  if (mat_inv4(wv2, inv)) {
-    const float Po[4] = {0, 1, 0, -h};   // sisi y_asli >= h dipertahankan
-    float Pe[4];
-    for (int i = 0; i < 4; i++) Pe[i] = inv[i * 4 + 0] * Po[0] + inv[i * 4 + 1] * Po[1] + inv[i * 4 + 2] * Po[2] + inv[i * 4 + 3] * Po[3];
-    if (Pe[3] < -1e-4f && fabsf(pr2[0]) > 1e-6f && fabsf(pr2[5]) > 1e-6f && fabsf(pr2[14]) > 1e-6f) okc = oblique_proj(pr2, Pe);
-  }
-  if (!okc) return false;   // tanpa bidang potong miring bagian bawah air ikut tergambar; air juga tidak terlihat bila kamera menengadah
-  SavedState st;
-  save_state(&st);
-  float clr[4] = {0, 0, 0, 0};
-  gx.GetFloatv(0x0C22, clr);
-  // simpan uniform semua program terrain yang dipakai frame ini
-  for (int i = 0; i < g_nwp; i++) {
-    WProg* p = &g_wp[i];
-    if (p->frame != g_frames || !p->usable) continue;
-    ProgStat* ps = prog_stat(p->id);
-    f_unifv(p->id, ps->loc_wv, p->wv); f_unifv(p->id, ps->loc_proj, p->pr);
-    p->org[0] = p->org[1] = p->org[2] = 0; p->org[3] = 1;
-    f_unifv(p->id, ps->loc_origin, p->org);
-    p->vp[0] = p->vp[1] = p->vp[2] = p->vp[3] = 0;
-    if (ps->loc_vp >= 0) f_unifv(p->id, ps->loc_vp, p->vp);
-  }
-  gx.BindFramebuffer(0x8D40, g_w_fbo);
-  gx.Viewport(0, 0, g_w_tw, g_w_th);
-  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x8037);
-  gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(1); gx.ColorMask(1, 1, 1, 1);
-  gx.ClearColor(0, 0, 0, 0); gx.ClearDepthf(1.0f); gx.Clear(0x4100);
-  gx.FrontFace(0x0900);   // cermin membalik arah putar segitiga
-  float rr2 = g_w_rr * g_w_rr;
-  unsigned drawn = 0, skipped = 0;
-  unsigned curpid = 0; ProgStat* cps = nullptr; WProg* cp = nullptr;
-  for (int i = 0; i < n && drawn < 1400; i++) {
-    const DrawRec& r = g_dl[cur][i];
-    float dx = r.o[0] + 8.0f, dz = r.o[2] + 8.0f;
-    if (dx * dx + dz * dz > rr2) { skipped++; continue; }
-    if (r.o[1] + 16.0f < h - 0.5f) { skipped++; continue; }   // seluruh chunk di bawah air
-    if (!cps || r.pid != curpid) {
-      curpid = r.pid; cps = nullptr; cp = wprog_find(curpid);
-      if (cp && cp->frame == g_frames && cp->usable) {
-        cps = prog_stat(curpid);
-        gx.UseProgram(curpid);
-        gx.UniformMatrix4fv(cps->loc_wv, 1, 0, wv2);
-        gx.UniformMatrix4fv(cps->loc_proj, 1, 0, pr2);
-        if (cps->loc_vp >= 0 && cps->vp_state == 1) gx.Uniform3f(cps->loc_vp, cps->vp_orig[0], cps->vp_orig[1], cps->vp_orig[2]);
-        for (int a = 0; a < 4; a++) if (cp->lay[a].ok) gx.EnableVertexAttribArray((unsigned)cp->lay[a].loc);
-      }
-    }
-    if (!cps) { skipped++; continue; }
-    gx.BindBuffer(0x8892, (unsigned)r.vbo);
-    gx.BindBuffer(0x8893, (unsigned)r.ibo);
-    int vs = 0, is = 0;
-    gx.GetBufferParameteriv(0x8892, 0x8764, &vs);
-    gx.GetBufferParameteriv(0x8893, 0x8764, &is);
-    if (vs != r.vsz || is != r.isz || vs <= 0 || is <= 0) { skipped++; continue; }
-    for (int a = 0; a < 4; a++) {
-      const WLay& L = cp->lay[a];
-      if (L.ok) gx.VertexAttribPointer((unsigned)L.loc, L.size, (unsigned)L.type, (unsigned char)L.norm, L.stride, (const void*)L.off);
-    }
-    gx.Uniform4f(cps->loc_origin, r.o[0], r.o[1], r.o[2], r.sc);
-    gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
-    drawn++;
-  }
-  gx.FrontFace(0x0901);
-  // pulihkan uniform program terrain
-  for (int i = 0; i < g_nwp; i++) {
-    WProg* p = &g_wp[i];
-    if (p->frame != g_frames || !p->usable) continue;
-    ProgStat* ps = prog_stat(p->id);
-    gx.UseProgram(p->id);
-    gx.UniformMatrix4fv(ps->loc_wv, 1, 0, p->wv);
-    gx.UniformMatrix4fv(ps->loc_proj, 1, 0, p->pr);
-    gx.Uniform4f(ps->loc_origin, p->org[0], p->org[1], p->org[2], p->org[3]);
-    if (ps->loc_vp >= 0) gx.Uniform3f(ps->loc_vp, p->vp[0], p->vp[1], p->vp[2]);
-  }
-  gx.ClearColor(clr[0], clr[1], clr[2], clr[3]);
-  restore_state(&st);
-  unsigned err = gx.GetError();
-  clear_gl_errors();
-  g_w_passes++; g_w_draws += drawn; g_w_ms += (mono_sec() - t0) * 1000.0;
-  if (g_w_logs < 3) {
-    g_w_logs++;
-    sh_log("air: pantulan frame %u h=%.3f camy=%.3f pemain_y=%.3f draw=%u lewati=%u err=0x%x\n", g_frames, h, g_w_camy, g_pl_y, drawn, skipped, err);
-  } else if (g_frames % 900 == 0 && g_w_logs < 12) {
-    g_w_logs++;
-    sh_log("air: frame %u pass=%u draw/pass=%.0f ms/pass=%.2f h=%.3f camy=%.3f ready=%d\n", g_frames, g_w_passes, g_w_passes ? (double)g_w_draws / g_w_passes : 0.0,
-           g_w_passes ? g_w_ms / g_w_passes : 0.0, h, g_w_camy, (int)g_w_ready);
-    g_w_passes = 0; g_w_draws = 0; g_w_ms = 0;
-  }
-  return true;
-}
-
-// dipanggil sebelum draw blend (air, kaca) bawaan game; membuat pantulan sekali per frame
-static void water_before_blend() {
-  if (g_w_pass_frame == g_frames) return;
-  g_w_pass_frame = g_frames;
-  g_w_ready = false;
-  if (g_w_stage < 1 || !g_gx_ok || !g_view_ok) return;
-  float h = 0;
-  if (!water_plane(&h)) return;
-  g_w_h = h;
-  int vp[4] = {0, 0, 0, 0};
-  f_geti(0x0BA2, vp);
-  if (vp[2] < 64 || vp[3] < 64) return;
-  int w = (int)(vp[2] * g_w_scale), hh = (int)(vp[3] * g_w_scale);
-  if (w < 64) w = 64;
-  if (hh < 64) hh = 64;
-  if (!g_w_armed && g_cfg_guard) { wguard_write(g_w_stage, 1); g_w_armed = true; }
-  if (!water_resources(w, hh)) { g_w_stage = 0; sh_log("air: framebuffer pantulan gagal, dimatikan\n"); return; }
-  if (!water_reflect_pass()) return;
-  g_w_okframes++;
-  if (g_w_armed && g_w_okframes >= 120) { wguard_write(g_w_stage, 0); g_w_armed = false; sh_log("air: stage %d lolos 120 frame pantulan tanpa crash\n", g_w_stage); }
-  if (g_w_stage >= 2) g_w_ready = true;
-}
-
-// dipanggil sesudah draw blend bawaan: gambar ulang geometri yang sama dengan warna pantulan di ketinggian permukaan air
-static void water_overlay(ProgStat* s, int count, unsigned type, const void* idx) {
-  if (!g_w_ready || s->loc_origin < 0) return;
-  float o[4] = {0, 0, 0, 1};
-  f_unifv(s->id, s->loc_origin, o);
-  if (o[1] > g_w_h + 0.3f || o[1] + 16.3f < g_w_h) return;   // hanya chunk yang dilewati bidang air
-  int posloc = f_getaloc(s->id, "POSITION");
-  if (posloc < 0) return;
-  if (!g_w_prog || g_w_prog_pos != posloc) {
-    if (!water_make_prog(posloc)) { g_w_ready = false; g_w_stage = 1; return; }
-    g_w_uni_frame = 0xFFFFFFFFu;
-  }
-  int act = 0x84C0, prev3 = 0, bsr = 0x302, bdr = 0x303, bsa = 1, bda = 0x303, dfunc = 0x0201;
-  unsigned char dmask = 1; float pf = 0, pu = 0; unsigned char poff = 0;
-  f_geti(0x84E0, &act);
-  f_geti(0x80C9, &bsr); f_geti(0x80C8, &bdr); f_geti(0x80CB, &bsa); f_geti(0x80CA, &bda);
-  f_geti(0x0B74, &dfunc); f_getb(0x0B72, &dmask); poff = f_isen(0x8037);
-  gx.GetFloatv(0x8038, &pf); gx.GetFloatv(0x2A00, &pu);
-  gx.UseProgram(g_w_prog);
-  if (g_w_uni_frame != g_frames) {
-    g_w_uni_frame = g_frames;
-    int vp[4] = {0, 0, 1, 1};
-    f_geti(0x0BA2, vp);
-    gx.UniformMatrix4fv(g_wu_wv, 1, 0, g_wv); gx.UniformMatrix4fv(g_wu_proj, 1, 0, g_proj);
-    gx.Uniform1i(g_wu_refl, 3);
-    gx.Uniform4f(g_wu_vp, (float)vp[0], (float)vp[1], (float)(vp[2] > 0 ? vp[2] : 1), (float)(vp[3] > 0 ? vp[3] : 1));
-    gx.Uniform1f(g_wu_plane, g_w_h);
-    gx.Uniform1f(g_wu_time, (float)fmod(mono_sec(), 6000.0));
-    gx.Uniform2f(g_wu_camxz, (float)g_cam_est[0], (float)g_cam_est[2]);
-    gx.Uniform3f(g_wu_skyh, g_w_fog[0], g_w_fog[1], g_w_fog[2]);
-    float zr = g_w_fog[0] * 0.62f, zg = g_w_fog[1] * 0.80f, zb = g_w_fog[2] * 1.10f;
-    gx.Uniform3f(g_wu_skyz, zr > 1 ? 1 : zr, zg > 1 ? 1 : zg, zb > 1 ? 1 : zb);
-    gx.Uniform1f(g_wu_str, g_w_str); gx.Uniform1f(g_wu_tol, g_w_tol); gx.Uniform1f(g_wu_lift, g_w_lift);
-  }
-  gx.Uniform4f(g_wu_org, o[0], o[1], o[2], o[3]);
-  gx.ActiveTexture(0x84C3); f_geti(0x8069, &prev3); gx.BindTexture(0x0DE1, g_w_tex);
-  gx.BlendFuncSeparate(0x0302, 0x0303, 0, 1);
-  gx.DepthMask(0); gx.DepthFunc(0x0203);
-  gx.Enable(0x8037); gx.PolygonOffset(-1.0f, -1.0f);
-  gx.DrawElements(4, count, type, idx);
-  gx.BindTexture(0x0DE1, (unsigned)prev3);
-  gx.ActiveTexture((unsigned)act);
-  gx.BlendFuncSeparate((unsigned)bsr, (unsigned)bdr, (unsigned)bsa, (unsigned)bda);
-  gx.DepthMask(dmask); gx.DepthFunc((unsigned)dfunc);
-  set_cap(0x8037, poff); gx.PolygonOffset(pf, pu);
-  gx.UseProgram(s->id);
-  g_w_draws++;
-}
-// =========================================================================================
 
 static void spy_use_program(GLuint_t p) {
   g_cur_prog = p;
@@ -1702,6 +1297,7 @@ static void spy_use_program(GLuint_t p) {
       s->loc_t2 = f_getuloc ? f_getuloc(p, "TEXTURE_2") : -1;
       s->vp_state = 0;
       s->loc_world = f_getuloc ? f_getuloc(p, "WORLD") : -1;
+      s->loc_vpos = f_getuloc ? f_getuloc(p, "VIEW_POS") : -1;   // posisi kamera di dunia (dipakai untuk mengenali orang pertama)
       if (s->kind == 2 && s->loc_world >= 0 && s->loc_wvp >= 0) s->kind = 3;   // program entity (mob, item, tangan): punya WORLD dan WORLDVIEWPROJ
     }
   }
@@ -1718,14 +1314,8 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
   if (s->kind == 1) u2 = terrain_draw(s, count, type, idx);
   else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
   else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
-  bool wblend = false;
-  if (s->kind == 1 && g_w_stage >= 1 && g_cur_fbo == 0 && g_tframe == g_frames && f_isen && f_isen(0x0BE2)) {
-    wblend = true;   // draw blend (air): buat pantulan sekali per frame sebelum draw bawaan
-    water_before_blend();
-  }
   o_drawel(mode, count, type, idx);
   if (u2) terrain_draw_post();
-  if (wblend && g_w_ready) water_overlay(s, count, type, idx);
 }
 static void spy_draw_arrays(unsigned mode, int first, int count) {
   ProgStat* s = prog_stat(g_cur_prog);
@@ -2345,11 +1935,15 @@ static void campfire_effects(void* level, void* entity) {
 }
 
 static void hook_level_animate_tick(void* level, void* entity) {
-  if (entity) {   // posisi pemain (dipakai pantulan air untuk tinggi kamera)
-    const float* pp = (const float*)((uint8_t*)entity + ENTITY_POS_OFF);
-    if (pp[1] > -64.0f && pp[1] < 512.0f) { g_pl_x = pp[0]; g_pl_y = pp[1]; g_pl_z = pp[2]; g_pl_frame = g_frames; g_pl_ok = true; }
-  }
   orig_level_anim(level, entity);   // sampling animateTick bawaan jalan dulu
+  if (entity) {   // posisi pemain (entity+8) untuk bayangan pemain; dibaca thread render
+    const float* pp = (const float*)((uint8_t*)entity + ENTITY_POS_OFF);
+    float x = pp[0], y = pp[1], z = pp[2];
+    if (x == x && y == y && z == z && fabsf(x) < 3.0e7f && fabsf(z) < 3.0e7f && y > -128.0f && y < 1024.0f) {
+      g_pl_pos[0] = x; g_pl_pos[1] = y; g_pl_pos[2] = z;
+      g_pl_time = mono_sec();
+    }
+  }
   if (g_fire_smoke && g_fire_cnt > 0 && g_lt_ids[3] >= 0 && level && entity) campfire_effects(level, entity);
 }
 
@@ -2419,7 +2013,6 @@ static void install_lantern_patch(uintptr_t base) {
   void** blocks = (void**)(g_base + OFF_MBLOCKS);
   if (blocks[1]) {   // initBlocks sudah selesai sebelum hook terpasang: blok baru tidak aman ditambah sekarang
     lantern_log("initBlocks sudah jalan sebelum hook terpasang; lentera dilewati (tutup game sepenuhnya lalu buka lagi)");
-    install_campfire_fx(base);   // tetap pasang hook animateTick (posisi pemain untuk pantulan air)
     return;
   }
   bool ok1 = install_hook_len(t1, (void*)hook_init_blocks, (void**)&orig_init_blocks, 10);
