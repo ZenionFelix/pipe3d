@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + BAYANGAN PEMAIN: model sederhana (kaki, badan, lengan, kepala) ikut peta bayangan di orang pertama; orang pertama dikenali dari tangan di layar atau kamera = posisi pemain (Level::animateTick + uniform VIEW_POS).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + DUNIA REALISTIS: depth/scale semua kelompok biome darat diganti (padang rumput bergelombang, bukit, pegunungan tajam, sungai jadi jurang dalam); realistic=0 di pipe3d_biome.txt kembali ke cara lama.
 // + API UNGGUN (tahap 1): blok baru "campfire" (id 213) ikut sistem lentera.
 // + LENTERA: blok baru "lantern" (item, gambar, inventory kreatif, bentuk kotak); aktif kalau pipe3d_lantern.txt berisi enabled=1.
 // Versi 11 + PENGINTAI GL (tahap 1 dan 2 shadow map: hanya mencatat panggilan OpenGL, tidak mengubah tampilan).
@@ -1534,6 +1535,56 @@ static float g_depth_mul = 1.0f, g_depth_add = 0.4f, g_scale_mul = 1.6f;
 static float g_depth_max = 2.5f, g_scale_max = 2.0f;
 static int g_biome_enabled = 1;
 
+// ---- PROFIL DUNIA REALISTIS ----
+// Tinggi dasar (depth) dan kekasaran (scale) tiap kelompok biome diganti supaya medan seperti di gambar acuan:
+// padang rumput bergelombang, hutan berbukit, bukit tinggi, pegunungan tajam, dan sungai yang menjadi jurang dalam.
+// Kelompok dikenali dari konstanta bawaan game (Biome::HEIGHTS_*), jadi tidak bergantung pada nomor biome.
+// Perkiraan tinggi permukaan di dunia 128 blok: y = 64 + 17 * depth (laut di y=63; batas atas dunia 127).
+// Biome laut, pantai, rawa, jamur tidak diubah. Hanya berlaku di chunk baru (dunia baru atau daerah yang belum pernah dimuat).
+static const uintptr_t OFF_H_DEFAULT = 0x1704BD8, OFF_H_RIVER = 0x1704BE0, OFF_H_LOWLANDS = 0x1704BF8, OFF_H_TAIGA = 0x1704C00;
+enum { K_PLAINS = 0, K_FOREST, K_TAIGA, K_HILLS, K_PEAKS, K_PLATEAU, K_RIVER, K_COUNT };
+static const uintptr_t K_OFF[K_COUNT] = {OFF_H_LOWLANDS, OFF_H_DEFAULT, OFF_H_TAIGA, OFF_HEIGHTS_MOUNTAINS, OFF_HEIGHTS_EXTREME, OFF_HEIGHTS_HIGHLANDS, OFF_H_RIVER};
+static const char* K_NAME[K_COUNT] = {"plains", "forest", "taiga", "hills", "peaks", "plateau", "river"};
+static int g_realistic = 1;
+static float g_kd[K_COUNT] = {0.22f, 0.30f, 0.40f, 0.85f, 1.80f, 1.50f, -1.20f};   // depth baru
+static float g_ks[K_COUNT] = {0.25f, 0.35f, 0.40f, 0.55f, 0.80f, 0.10f,  0.00f};   // scale baru
+static void* g_done_ptr[320];
+static int g_done_n = 0;
+static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_hlog_n = 0;
+
+static void bio_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void bio_log(const char* fmt, ...) {
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome_log.txt", "a");
+  if (!f) return;
+  va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+  fclose(f);
+}
+static bool done_has(void* p) {
+  bool r = false;
+  pthread_mutex_lock(&g_done_mu);
+  for (int i = 0; i < g_done_n; i++) if (g_done_ptr[i] == p) { r = true; break; }
+  pthread_mutex_unlock(&g_done_mu);
+  return r;
+}
+static void done_add(void* p) {
+  pthread_mutex_lock(&g_done_mu);
+  if (g_done_n < 320) g_done_ptr[g_done_n++] = p;
+  pthread_mutex_unlock(&g_done_mu);
+}
+// kelompok dari penunjuk konstanta (atau dari nilainya); -1 = tidak diubah
+static int height_kind(const float* h) {
+  for (int k = 0; k < K_COUNT; k++) {
+    const float* c = (const float*)(g_base + K_OFF[k]);
+    if (h == c) return k;
+  }
+  for (int k = 0; k < K_COUNT; k++) {
+    const float* c = (const float*)(g_base + K_OFF[k]);
+    if (h[0] == c[0] && h[1] == c[1]) return k;
+  }
+  return -1;
+}
+
 static void load_biome_config() {
   FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome.txt", "r");
   if (!f) return;
@@ -1547,6 +1598,15 @@ static void load_biome_config() {
     else if (!strcmp(key, "scale_mul")) g_scale_mul = v;
     else if (!strcmp(key, "depth_max")) g_depth_max = v;
     else if (!strcmp(key, "scale_max")) g_scale_max = v;
+    else if (!strcmp(key, "realistic")) g_realistic = (int)v;
+    else {
+      for (int k = 0; k < K_COUNT; k++) {
+        char kd[40], ks[40];
+        snprintf(kd, sizeof(kd), "%s_depth", K_NAME[k]); snprintf(ks, sizeof(ks), "%s_scale", K_NAME[k]);
+        if (!strcmp(key, kd)) g_kd[k] = v;
+        else if (!strcmp(key, ks)) g_ks[k] = v;
+      }
+    }
   }
   fclose(f);
 }
@@ -1572,6 +1632,19 @@ static void boost_biome(uint8_t* biome) {
 }
 
 static void hook_set_depth_scale(void* self, const float* h) {
+  if (g_biome_enabled && g_realistic) {
+    int k = height_kind(h);
+    if (g_hlog_n < 80) { g_hlog_n++; bio_log("hook: biome=%p depth=%.3f scale=%.3f kelompok=%s\n", self, h[0], h[1], k >= 0 ? K_NAME[k] : "(tetap)"); }
+    if (k >= 0) {
+      float tmp[2] = {g_kd[k], g_ks[k]};
+      orig_set_depth_scale(self, tmp);
+      done_add(self);
+      return;
+    }
+    orig_set_depth_scale(self, h);
+    done_add(self);
+    return;
+  }
   orig_set_depth_scale(self, h);
   if (g_biome_enabled && is_mountain_height(h[0], h[1])) boost_biome((uint8_t*)self);
 }
@@ -1585,15 +1658,20 @@ static void* biome_sweep(void*) {
     for (int i = 0; i < 256; i++) {
       uint8_t* b = *(uint8_t**)(g_base + OFF_BIOMES + i * 4);
       if (!b) continue;
-      float d = *(float*)(b + BIOME_DEPTH_OFF), s = *(float*)(b + BIOME_SCALE_OFF);
-      if (!logged) {
-        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome_log.txt", "a");
-        if (f) { fprintf(f, "biome id=%d depth=%f scale=%f gunung=%d\n", i, d, s, (int)is_mountain_height(d, s)); fclose(f); }
-      }
-      if (g_biome_enabled && is_mountain_height(d, s)) {
+      float* pd = (float*)(b + BIOME_DEPTH_OFF);
+      float* ps = (float*)(b + BIOME_SCALE_OFF);
+      float d = *pd, s = *ps;
+      if (!logged) bio_log("biome id=%d depth=%f scale=%f gunung=%d\n", i, d, s, (int)is_mountain_height(d, s));
+      if (!g_biome_enabled || done_has(b)) continue;
+      if (g_realistic) {
+        float cur[2] = {d, s};
+        int k = height_kind(cur);
+        done_add(b);   // setiap biome hanya diproses sekali
+        if (k >= 0) { *pd = g_kd[k]; *ps = g_ks[k]; bio_log("sweep: biome id=%d (%s) -> depth=%.2f scale=%.2f\n", i, K_NAME[k], g_kd[k], g_ks[k]); }
+      } else if (is_mountain_height(d, s)) {
         boost_biome(b);
-        FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_biome_log.txt", "a");
-        if (f) { fprintf(f, "sweep: biome id=%d dinaikkan\n", i); fclose(f); }
+        done_add(b);
+        bio_log("sweep: biome id=%d dinaikkan\n", i);
       }
     }
     logged = true;
@@ -1610,7 +1688,7 @@ static void install_biome_patch(uintptr_t base) {
     return;
   }
   if (install_hook(target & ~(uintptr_t)1, (void*)hook_set_depth_scale, (void**)&orig_set_depth_scale))
-    LOG("biome: hook setDepthAndScale terpasang (enabled=%d depth_add=%.2f scale_mul=%.2f)", g_biome_enabled, g_depth_add, g_scale_mul);
+    LOG("biome: hook setDepthAndScale terpasang (enabled=%d realistic=%d depth_add=%.2f scale_mul=%.2f)", g_biome_enabled, g_realistic, g_depth_add, g_scale_mul);
   else
     LOG("biome: hook gagal dipasang");
   pthread_t th;
