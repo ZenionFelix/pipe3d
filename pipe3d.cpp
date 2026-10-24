@@ -1,6 +1,8 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + SSR (v16): pantulan layar di lantai basah saat hujan (ssr=1, ssr_always=1 untuk selalu aktif).
+// + BAYANGAN OBOR + SINAR VOLUMETRIK (v15): lampu terdekat membuat peta kedalaman sendiri (TEXTURE_3 dan TEXTURE_4 di shader terrain); sinar volumetrik di piksel langit lewat program milik pipe3d; pengaturan: pipe3d_fx.txt.
 // + DUNIA REALISTIS: depth/scale semua kelompok biome darat diganti (padang rumput bergelombang, bukit, pegunungan tajam, sungai jadi jurang dalam); realistic=0 di pipe3d_biome.txt kembali ke cara lama.
 // + BAYANGAN PEMAIN: model sederhana (kaki, badan, lengan, kepala) ikut peta bayangan; orang pertama dikenali dari tangan di layar atau kamera = posisi pemain (Level::animateTick + uniform VIEW_POS).
 // + API UNGGUN (tahap 1): blok baru "campfire" (id 213) ikut sistem lentera.
@@ -284,7 +286,7 @@ static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
 struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
-  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; int loc_vpos; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; int loc_vpos; int loc_t3, loc_t4, t34_set; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -471,6 +473,7 @@ static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
 // (radius 56 dan bias dikunci di shader renderchunk.vertex/.fragment)
 #define GLX_LIST(X) \
   X(void, GenFramebuffers, (int, unsigned*)) \
+  X(void, CopyTexSubImage2D, (unsigned, int, int, int, int, int, int, int)) \
   X(void, BindFramebuffer, (unsigned, unsigned)) \
   X(void, FramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int)) \
   X(unsigned, CheckFramebufferStatus, (unsigned)) \
@@ -790,6 +793,43 @@ static bool g_vpos_ok = false;
 static bool g_pl_trust = false;            // posisi pemain terbukti cocok dengan kamera (dicek saat orang pertama)
 static float g_pl_eyeoff = 0.0f;           // 0 = posisi pemain setinggi mata, 1.62 = setinggi kaki
 static float g_dbg_hd = -1.0f; static int g_dbg_fp = 0, g_dbg_box = 0, g_dbg_rec = 0;
+
+// ===================== BAYANGAN OBOR + SINAR VOLUMETRIK (pengaturan: pipe3d_fx.txt) =====================
+// Bayangan obor: pencari lampu (obor, lentera, api unggun, glowstone, dll.) memindai blok di sekitar pemain tiap tick (thread game),
+// lampu terdekat dipilih tiap frame, lalu peta kedalaman paraboloid dibuat dari posisi lampu itu (hanya terrain, belahan yang
+// menghadap kamera). Shader terrain membaca peta itu lewat TEXTURE_3 (data lampu, 4 piksel) dan TEXTURE_4 (kedalaman).
+// Sinar volumetrik: satu segitiga layar penuh dengan program milik pipe3d, hanya menutupi piksel langit (kedalaman = 1.0),
+// menelusuri peta bayangan matahari yang sama seperti sinar di terrain.
+static int g_tl_on = 1, g_tl_size = 512;
+static float g_tl_R = 14.0f;
+static int g_vol_on = 1;
+static float g_vol_k = 1.0f;
+static int g_fx_cfg_done = 0;
+static int g_ssr_on = 1, g_ssr_always = 0;
+static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
+#define TL_MAX 24
+static int g_tl_found[TL_MAX][3];
+static int g_tl_nfound = 0;
+static pthread_mutex_t g_tl_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_tl_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
+static unsigned g_tl_dtex = 0, g_tl_tex = 0, g_tl_fbo = 0, g_tl_ctex = 0, g_tl_prog = 0;
+static int g_tlu_lp = -1, g_tlu_ax = -1, g_tlu_org = -1, g_tlu_rr = -1, g_tlu_tex = -1;
+static bool g_tl_sel_ok = false;
+static float g_tl_sel[3] = {0, 0, 0};          // posisi lampu terpilih (mutlak)
+static int g_tl_sel_blk[3] = {0, 0, 0}, g_tl_prev_blk[3] = {0, 0, 0};
+static bool g_tl_prev_ok = false;
+static unsigned g_tl_sel_frame = 0xFFFFFFFFu, g_tl_prep_frame = 0xFFFFFFFFu;
+static bool g_tl_map_valid = false;
+static float g_tl_map_pos[3] = {0, 0, 0}, g_tl_map_axis[3] = {0, 1, 0};   // lampu dan sumbu belahan saat peta dibuat
+static unsigned g_tl_map_frame = 0;
+static bool g_tl_bound = false;
+static int g_tl_prev3 = 0, g_tl_prev4 = 0, g_tl_prev_act = 0;
+static unsigned g_tl_passes = 0, g_tl_draws = 0, g_tl_logs = 0;
+static double g_tl_ms = 0;
+static unsigned g_vol_prog = 0;
+static int g_vol_state = 0;   // 0 belum, 1 siap, -1 gagal
+static int g_vu_ra = -1, g_vu_rb = -1, g_vu_rc = -1, g_vu_pr = -1, g_vu_sa = -1, g_vu_sb = -1, g_vu_shd = -1;
+static unsigned g_vol_frame = 0xFFFFFFFFu, g_vol_n = 0, g_vol_logs = 0;
 static float g_pl_x = 0, g_pl_y = 0, g_pl_z = 0;   // posisi pemain dari hook Level::animateTick
 static bool g_pl_ok = false;
 static unsigned g_pl_frame = 0;
@@ -882,6 +922,7 @@ static void sky_draw(ProgStat* s, unsigned mode, int count) {
 }
 
 static void water_frame_begin(ProgStat* s);    // bagian AIR: PANTULAN (di bawah)
+static void ssr_frame_begin(ProgStat* s);      // bagian SSR (di bawah)
 static void water_capture_prog(ProgStat* s);
 // dipanggil sebelum tiap draw terrain
 static int g_u2_prev = 0, g_act_prev = 0;
@@ -899,6 +940,7 @@ static bool terrain_draw(ProgStat* s, int count, unsigned type, const void* idx)
     } else g_delta_ok = false;
     if (!g_guard_done) guard_arm();
     water_frame_begin(s);
+    ssr_frame_begin(s);
     if (g_level >= 2 && g_sh_state == 1) {
       int act = 0x84C0; f_geti(0x84E0, &act);
       gx.ActiveTexture(0x84C0); f_geti(0x8069, &g_atlas_tex);
@@ -1261,6 +1303,7 @@ static void shadow_pass() {
 }
 
 // akhir frame: gambar peta bayangan lalu tukar daftar draw
+static void torch_pass();
 static void shadow_end_frame() {
   if (g_level < 1) return;
   bool had_terrain = (g_tframe + 1 == g_frames);   // g_frames sudah naik di awal spy_swap
@@ -1282,6 +1325,7 @@ static void shadow_end_frame() {
   g_st_frames++;
   if (g_delta_exact) g_st_delta_ok++;
   else if (g_delta_ok) { g_cam_est[0] += g_delta[0]; g_cam_est[1] += g_delta[1]; g_cam_est[2] += g_delta[2]; }   // tidak ada chunk cocok: pakai dugaan
+  torch_pass();
   shadow_pass();
   g_dcur = 1 - g_dcur;
   g_dn[g_dcur] = 0;
@@ -1755,6 +1799,681 @@ static void water_overlay(ProgStat* s, int count, unsigned type, const void* idx
 }
 // =========================================================================================
 
+
+// ===================== BAYANGAN OBOR =====================
+static void fx_cfg_load() {
+  if (g_fx_cfg_done) return;
+  g_fx_cfg_done = 1;
+  FILE* f = fopen("/sdcard/games/com.mojang/pipe3d_fx.txt", "r");
+  if (!f) return;
+  char line[128];
+  while (fgets(line, sizeof(line), f)) {
+    int iv; float fv;
+    if (sscanf(line, "torch=%d", &iv) == 1) g_tl_on = iv;
+    else if (sscanf(line, "torch_size=%d", &iv) == 1) g_tl_size = (iv < 128) ? 128 : (iv > 1024 ? 1024 : iv);
+    else if (sscanf(line, "torch_radius=%f", &fv) == 1) g_tl_R = (fv < 6.0f) ? 6.0f : (fv > 24.0f ? 24.0f : fv);
+    else if (sscanf(line, "vol=%d", &iv) == 1) g_vol_on = iv;
+    else if (sscanf(line, "vol_strength=%f", &fv) == 1) g_vol_k = (fv < 0.0f) ? 0.0f : (fv > 4.0f ? 4.0f : fv);
+    else if (sscanf(line, "ssr=%d", &iv) == 1) g_ssr_on = iv;
+    else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
+    else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
+    else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
+  }
+  fclose(f);
+  sh_log("fx: torch=%d size=%d radius=%.1f vol=%d vol_strength=%.2f ssr=%d always=%d strength=%.2f scale=%.2f\n", g_tl_on, g_tl_size, g_tl_R, g_vol_on, g_vol_k, g_ssr_on, g_ssr_always, g_ssr_k, g_ssr_scale);
+}
+
+// program kedalaman paraboloid: tiap titik dipetakan dari arah lampu (sumbu belahan = AX, menghadap kamera)
+static const char* TL_VS =
+  "attribute vec3 POSITION;\n"
+  "attribute vec2 TEXCOORD_0;\n"
+  "uniform vec3 LP;\n"
+  "uniform vec3 AX;\n"
+  "uniform vec3 ORG;\n"
+  "uniform float RR;\n"
+  "varying vec2 vuv;\n"
+  "void main() {\n"
+  "  vuv = TEXCOORD_0;\n"
+  "  vec3 p = POSITION + ORG - LP;\n"
+  "  float dist = length(p);\n"
+  "  vec3 xa = cross(vec3(0.0, 1.0, 0.0), AX);\n"
+  "  float xl = length(xa);\n"
+  "  if (xl > 0.001) xa = xa / xl; else xa = vec3(1.0, 0.0, 0.0);\n"
+  "  vec3 ya = cross(AX, xa);\n"
+  "  vec3 v = p / max(dist, 0.0001);\n"
+  "  float lz = dot(v, AX);\n"
+  "  vec2 q = vec2(dot(v, xa), dot(v, ya)) / (1.0 + lz);\n"
+  "  float dn = clamp(dist / RR, 0.0, 1.0);\n"
+  "  gl_Position = vec4(q, dn * 2.0 - 1.0, 1.0);\n"
+  "  if (lz < -0.05) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);\n"
+  "}\n";
+static const char* TL_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 vuv;\n"
+  "uniform sampler2D TEX;\n"
+  "void main() {\n"
+  "  if (texture2D(TEX, vuv).a < 0.5) discard;\n"
+  "  gl_FragColor = vec4(1.0);\n"
+  "}\n";
+
+static void torch_init() {
+  g_tl_state = -1;
+  fx_cfg_load();
+  if (!g_tl_on) { sh_log("obor: dimatikan lewat pengaturan (torch=0)\n"); return; }
+  if (!g_gx_ok || !f_geti) { sh_log("obor: fungsi GL tidak lengkap\n"); return; }
+  clear_gl_errors();
+  int prev_fbo = 0, prev_tex = 0, prev_act = 0;
+  f_geti(0x8CA6, &prev_fbo); f_geti(0x84E0, &prev_act); f_geti(0x8069, &prev_tex);
+  // tekstur data lampu 4x1 RGBA8
+  gx.GenTextures(1, &g_tl_dtex);
+  gx.BindTexture(0x0DE1, g_tl_dtex);
+  static const unsigned char zero16[16] = {0};
+  gx.TexImage2D(0x0DE1, 0, 0x1908, 4, 1, 0, 0x1908, 0x1401, zero16);
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  // peta kedalaman
+  gx.GenTextures(1, &g_tl_tex);
+  gx.BindTexture(0x0DE1, g_tl_tex);
+  gx.TexImage2D(0x0DE1, 0, 0x81A6, g_tl_size, g_tl_size, 0, 0x1902, 0x1405, nullptr);   // DEPTH_COMPONENT24
+  unsigned err = gx.GetError();
+  if (err != 0) {
+    gx.TexImage2D(0x0DE1, 0, 0x81A5, g_tl_size, g_tl_size, 0, 0x1902, 0x1403, nullptr); // DEPTH_COMPONENT16
+    err = gx.GetError();
+    sh_log("obor: depth24 gagal, mencoba depth16 (err=0x%x)\n", err);
+  }
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  gx.GenFramebuffers(1, &g_tl_fbo);
+  gx.BindFramebuffer(0x8D40, g_tl_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8D00, 0x0DE1, g_tl_tex, 0);
+  if (gx_drawbuffers) { unsigned none = 0; gx_drawbuffers(1, &none); }
+  if (gx_readbuffer) gx_readbuffer(0);
+  unsigned status = gx.CheckFramebufferStatus(0x8D40);
+  if (status != 0x8CD5) {   // cadangan: tambah lampiran warna
+    gx.GenTextures(1, &g_tl_ctex);
+    gx.BindTexture(0x0DE1, g_tl_ctex);
+    gx.TexImage2D(0x0DE1, 0, 0x1908, g_tl_size, g_tl_size, 0, 0x1908, 0x1401, nullptr);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_tl_ctex, 0);
+    if (gx_drawbuffers) { unsigned c0 = 0x8CE0; gx_drawbuffers(1, &c0); }
+    status = gx.CheckFramebufferStatus(0x8D40);
+  }
+  gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
+  gx.BindTexture(0x0DE1, (unsigned)prev_tex);
+  if (status != 0x8CD5) { sh_log("obor: framebuffer tidak lengkap (0x%x), dimatikan\n", status); return; }
+  unsigned vs = sh_compile(0x8B31, TL_VS), fs = sh_compile(0x8B30, TL_FS);
+  if (!vs || !fs) { sh_log("obor: shader kedalaman gagal dikompilasi, dimatikan\n"); return; }
+  g_tl_prog = gx.CreateProgram();
+  gx.AttachShader(g_tl_prog, vs); gx.AttachShader(g_tl_prog, fs);
+  gx.BindAttribLocation(g_tl_prog, 0, "POSITION");
+  gx.BindAttribLocation(g_tl_prog, 1, "TEXCOORD_0");
+  gx.LinkProgram(g_tl_prog);
+  int linked = 0; gx.GetProgramiv(g_tl_prog, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(g_tl_prog, 511, &n, buf); sh_log("obor: link gagal: %s\n", buf); g_tl_prog = 0; return; }
+  g_tlu_lp = f_getuloc(g_tl_prog, "LP"); g_tlu_ax = f_getuloc(g_tl_prog, "AX"); g_tlu_org = f_getuloc(g_tl_prog, "ORG");
+  g_tlu_rr = f_getuloc(g_tl_prog, "RR"); g_tlu_tex = f_getuloc(g_tl_prog, "TEX");
+  gx.ActiveTexture((unsigned)prev_act);
+  clear_gl_errors();
+  g_tl_state = 1;
+  sh_log("obor: siap. peta=%d radius=%.1f\n", g_tl_size, g_tl_R);
+}
+
+static bool tl_is_light(int id) {
+  if (id == 50 || id == 62 || id == 89 || id == 91 || id == 124 || id == 169) return true;   // obor, tungku menyala, glowstone, labu menyala, lampu redstone, sea lantern
+  for (int k = 0; k < 4; k++) if (g_lt_ids[k] >= 0 && id == g_lt_ids[k]) return true;      // lentera dan api unggun buatan
+  return false;
+}
+
+// lampu terdekat ke kamera; dipilih sekali per frame
+static void torch_select() {
+  g_tl_sel_ok = false;
+  if (!g_vpos_ok) return;
+  int cnt = 0; int pos[TL_MAX][3];
+  pthread_mutex_lock(&g_tl_mu);
+  cnt = g_tl_nfound; memcpy(pos, g_tl_found, sizeof(pos));
+  pthread_mutex_unlock(&g_tl_mu);
+  float best = 1e9f; int bi = -1;
+  for (int i = 0; i < cnt; i++) {
+    float dx = pos[i][0] + 0.5f - g_cam_abs[0], dy = pos[i][1] + 0.6f - g_cam_abs[1], dz = pos[i][2] + 0.5f - g_cam_abs[2];
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (g_tl_prev_ok && pos[i][0] == g_tl_prev_blk[0] && pos[i][1] == g_tl_prev_blk[1] && pos[i][2] == g_tl_prev_blk[2]) d -= 2.0f;   // jangan gonta-ganti lampu
+    if (d < best) { best = d; bi = i; }
+  }
+  if (bi < 0 || best > 18.0f) { g_tl_prev_ok = false; return; }
+  g_tl_sel_blk[0] = pos[bi][0]; g_tl_sel_blk[1] = pos[bi][1]; g_tl_sel_blk[2] = pos[bi][2];
+  g_tl_sel[0] = pos[bi][0] + 0.5f; g_tl_sel[1] = pos[bi][1] + 0.6f; g_tl_sel[2] = pos[bi][2] + 0.5f;
+  g_tl_prev_blk[0] = g_tl_sel_blk[0]; g_tl_prev_blk[1] = g_tl_sel_blk[1]; g_tl_prev_blk[2] = g_tl_sel_blk[2]; g_tl_prev_ok = true;
+  g_tl_sel_ok = true;
+  g_tl_sel_frame = g_frames;
+}
+
+static void tl_put16(unsigned char* p, float u) {
+  if (u < 0.0f) u = 0.0f;
+  if (u > 1.0f) u = 1.0f;
+  unsigned v = (unsigned)(u * 65535.0f + 0.5f);
+  p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)(v & 255);
+}
+
+// sekali per frame, di draw terrain pertama: pilih lampu, isi tekstur data, pasang tekstur di unit 3 dan 4
+static void torch_prepare_frame() {
+  g_tl_prep_frame = g_frames;
+  torch_select();
+  unsigned char d[16] = {0};   // tanda 0xA5 0x5A hanya diisi kalau peta sah
+  bool valid = g_tl_map_valid && (g_frames - g_tl_map_frame) <= 3 && g_vpos_ok;
+  if (valid) {
+    float rel[3] = {g_tl_map_pos[0] - g_cam_abs[0], g_tl_map_pos[1] - g_cam_abs[1], g_tl_map_pos[2] - g_cam_abs[2]};
+    if (fabsf(rel[0]) > 31.0f || fabsf(rel[1]) > 31.0f || fabsf(rel[2]) > 31.0f) valid = false;
+    else {
+      tl_put16(d + 0, (rel[0] + 32.0f) / 64.0f); tl_put16(d + 2, (rel[1] + 32.0f) / 64.0f);
+      tl_put16(d + 4, (rel[2] + 32.0f) / 64.0f); tl_put16(d + 6, (g_tl_map_axis[0] + 1.0f) * 0.5f);
+      tl_put16(d + 8, (g_tl_map_axis[1] + 1.0f) * 0.5f); tl_put16(d + 10, (g_tl_map_axis[2] + 1.0f) * 0.5f);
+      d[12] = 0xA5; d[13] = 0x5A; d[14] = (unsigned char)(g_tl_R * 8.0f + 0.5f); d[15] = 255;
+    }
+  }
+  if (!g_tl_bound) { f_geti(0x84E0, &g_tl_prev_act); }
+  gx.ActiveTexture(0x84C3);
+  if (!g_tl_bound) f_geti(0x8069, &g_tl_prev3);
+  gx.BindTexture(0x0DE1, g_tl_dtex);
+  gx.TexImage2D(0x0DE1, 0, 0x1908, 4, 1, 0, 0x1908, 0x1401, d);
+  gx.ActiveTexture(0x84C4);
+  if (!g_tl_bound) f_geti(0x8069, &g_tl_prev4);
+  gx.BindTexture(0x0DE1, g_tl_tex);
+  gx.ActiveTexture((unsigned)g_tl_prev_act);
+  g_tl_bound = true;
+}
+static void torch_pre(ProgStat* s) {
+  if (g_tl_state != 1 || s->loc_t3 < 0 || s->loc_t4 < 0 || g_cur_fbo != 0) return;
+  if (g_tl_prep_frame != g_frames) torch_prepare_frame();
+  if (!s->t34_set) { gx.Uniform1i(s->loc_t3, 3); gx.Uniform1i(s->loc_t4, 4); s->t34_set = 1; }
+}
+static void torch_unbind() {
+  if (!g_tl_bound) return;
+  gx.ActiveTexture(0x84C3); gx.BindTexture(0x0DE1, (unsigned)g_tl_prev3);
+  gx.ActiveTexture(0x84C4); gx.BindTexture(0x0DE1, (unsigned)g_tl_prev4);
+  gx.ActiveTexture((unsigned)g_tl_prev_act);
+  g_tl_bound = false;
+}
+
+// akhir frame: buat peta kedalaman dari lampu terpilih (sebelum pass matahari memakai daftar draw yang sama)
+static void torch_pass() {
+  torch_unbind();
+  if (g_tl_state == 0) torch_init();
+  if (g_tl_state != 1 || !g_tl_on) return;
+  if (!g_tl_sel_ok || g_tl_sel_frame + 1 != g_frames || !g_vpos_ok) { g_tl_map_valid = false; return; }
+  int cur = g_dcur, n = g_dn[cur];
+  if (n == 0) { g_tl_map_valid = false; return; }
+  float rel[3] = {g_tl_sel[0] - g_cam_abs[0], g_tl_sel[1] - g_cam_abs[1], g_tl_sel[2] - g_cam_abs[2]};
+  float rl = sqrtf(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+  if (rl > 30.0f) { g_tl_map_valid = false; return; }
+  float ax[3] = {0, 1, 0};
+  if (rl > 0.3f) { ax[0] = -rel[0] / rl; ax[1] = -rel[1] / rl; ax[2] = -rel[2] / rl; }   // dari lampu ke kamera
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  gx.BindFramebuffer(0x8D40, g_tl_fbo);
+  gx.Viewport(0, 0, g_tl_size, g_tl_size);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0201); gx.DepthMask(1); gx.ColorMask(0, 0, 0, 0);
+  gx.Enable(0x8037); gx.PolygonOffset(1.5f, 2.0f);
+  gx.ClearDepthf(1.0f); gx.Clear(0x100);
+  gx.UseProgram(g_tl_prog);
+  gx.Uniform3f(g_tlu_lp, rel[0], rel[1], rel[2]);
+  gx.Uniform3f(g_tlu_ax, ax[0], ax[1], ax[2]);
+  gx.Uniform1f(g_tlu_rr, g_tl_R);
+  gx.Uniform1i(g_tlu_tex, 0);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)g_atlas_tex);
+  for (int i = 0; i < 4; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.EnableVertexAttribArray(0); gx.EnableVertexAttribArray(1);
+  float lim = g_tl_R + 14.5f;
+  unsigned drawn = 0;
+  for (int i = 0; i < n && drawn < 400; i++) {
+    const DrawRec& r = g_dl[cur][i];
+    float dx = r.o[0] + 8.0f - rel[0], dy = r.o[1] + 8.0f - rel[1], dz = r.o[2] + 8.0f - rel[2];
+    if (dx * dx + dy * dy + dz * dz > lim * lim) continue;
+    gx.BindBuffer(0x8892, (unsigned)r.vbo);
+    gx.BindBuffer(0x8893, (unsigned)r.ibo);
+    int vs = 0, is = 0;
+    gx.GetBufferParameteriv(0x8892, 0x8764, &vs);
+    gx.GetBufferParameteriv(0x8893, 0x8764, &is);
+    if (vs != r.vsz || is != r.isz || vs <= 0 || is <= 0) continue;
+    gx.VertexAttribPointer(0, 3, 0x1406, 0, 24, (const void*)0);
+    gx.VertexAttribPointer(1, 2, 0x1403, 1, 24, (const void*)20);
+    gx.Uniform3f(g_tlu_org, r.o[0], r.o[1], r.o[2]);
+    gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
+    drawn++;
+  }
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_tl_map_valid = true;
+  g_tl_map_pos[0] = g_tl_sel[0]; g_tl_map_pos[1] = g_tl_sel[1]; g_tl_map_pos[2] = g_tl_sel[2];
+  g_tl_map_axis[0] = ax[0]; g_tl_map_axis[1] = ax[1]; g_tl_map_axis[2] = ax[2];
+  g_tl_map_frame = g_frames;
+  g_tl_passes++; g_tl_draws += drawn; g_tl_ms += (mono_sec() - t0) * 1000.0;
+  if (g_tl_logs < 3) {
+    g_tl_logs++;
+    sh_log("obor: pass frame %u lampu=(%.1f %.1f %.1f) jarak=%.1f draw=%u err=0x%x\n", g_frames, g_tl_sel[0], g_tl_sel[1], g_tl_sel[2], rl, drawn, err);
+  } else if (g_frames % 900 == 0 && g_tl_logs < 12) {
+    g_tl_logs++;
+    sh_log("obor: frame %u pass=%u draw/pass=%.0f ms/pass=%.2f lampu_terdeteksi=%d\n", g_frames, g_tl_passes, g_tl_passes ? (double)g_tl_draws / g_tl_passes : 0.0,
+           g_tl_passes ? g_tl_ms / g_tl_passes : 0.0, g_tl_nfound);
+    g_tl_passes = 0; g_tl_draws = 0; g_tl_ms = 0;
+  }
+}
+
+// ===================== SINAR VOLUMETRIK DI LANGIT =====================
+// Segitiga layar penuh tepat sesudah kotak matahari/bulan digambar (game ini menggambar langit SESUDAH terrain opaque, jadi bidang langit
+// sudah ada di layar dan tidak menimpa hasil kita). Kedalaman diuji LEQUAL pada z = 0.99999, jadi hanya piksel langit (kedalaman 1.0) yang terkena. Sinar kamera ditelusuri di peta bayangan matahari yang sama dengan terrain.
+static const char* VOL_VS =
+  "attribute vec2 P;\n"
+  "uniform vec3 RA;\n"
+  "uniform vec3 RB;\n"
+  "uniform vec3 RC;\n"
+  "uniform vec2 PR;\n"
+  "varying vec3 rd;\n"
+  "void main() {\n"
+  "  gl_Position = vec4(P, 0.99999, 1.0);\n"
+  "  vec3 c = vec3(P.x / PR.x, P.y / PR.y, -1.0);\n"
+  "  rd = RA * c.x + RB * c.y + RC * c.z;\n"
+  "}\n";
+static const char* VOL_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec3 rd;\n"
+  "uniform sampler2D SHD;\n"
+  "uniform vec4 SA;\n"   // Ly, Lz, oz, kekuatan
+  "uniform vec4 SB;\n"   // ox, oy, siang, senja
+  "void main() {\n"
+  "  vec3 d = normalize(rd);\n"
+  "  float Ly = SA.x, Lz = SA.y;\n"
+  "  vec3 Lr = vec3(0.0, Ly, Lz);\n"
+  "  vec3 sx = vec3(0.0, -Lz, Ly);\n"
+  "  vec3 fx = vec3(0.0, -Ly, -Lz);\n"
+  "  vec3 q0 = vec3(SB.x / 112.0 + 0.5, SB.y / 112.0 + 0.5, (SA.z + 159.0) / 319.0);\n"
+  "  vec3 dq = vec3(dot(sx, d) / 112.0, d.x / 112.0, dot(fx, d) / 319.0) * 48.0;\n"
+  "  float jit = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
+  "  float sum = 0.0;\n"
+  "  for (int i = 0; i < 14; i++) {\n"
+  "    float s = (float(i) + jit) / 14.0;\n"
+  "    vec3 q = q0 + dq * s;\n"
+  "    vec2 e = abs(q.xy - 0.5) * 2.0;\n"
+  "    float inMap = (1.0 - step(0.98, max(e.x, e.y))) * step(0.0, q.z) * (1.0 - step(1.0, q.z));\n"
+  "    float lit = step(q.z - 0.0025, texture2D(SHD, q.xy).r);\n"
+  "    sum += mix(1.0, lit, inMap);\n"
+  "  }\n"
+  "  float lit = sum / 14.0;\n"
+  "  float cosT = max(dot(d, Lr), 0.0);\n"
+  "  float phase = 0.25 + 1.8 * pow(cosT, 8.0);\n"
+  "  float sunUp = smoothstep(-0.04, 0.14, Ly);\n"
+  "  float dens = mix(0.0075, 0.014, SB.w);\n"
+  "  float amount = 1.0 - exp(-dens * 48.0);\n"
+  "  vec3 tint = mix(vec3(1.0, 0.92, 0.77), vec3(1.0, 0.47, 0.15), SB.w);\n"
+  "  vec3 col = tint * mix(3.2, 2.1, SB.w) * sunUp * SB.z * amount * phase * SA.w * lit * lit * lit;\n"
+  "  gl_FragColor = vec4(col, 1.0);\n"
+  "}\n";
+
+static bool vol_make_prog() {
+  unsigned vs = sh_compile(0x8B31, VOL_VS), fs = sh_compile(0x8B30, VOL_FS);
+  if (!vs || !fs) return false;
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("vol: link gagal: %s\n", buf); return false; }
+  g_vol_prog = p;
+  g_vu_ra = f_getuloc(p, "RA"); g_vu_rb = f_getuloc(p, "RB"); g_vu_rc = f_getuloc(p, "RC"); g_vu_pr = f_getuloc(p, "PR");
+  g_vu_sa = f_getuloc(p, "SA"); g_vu_sb = f_getuloc(p, "SB"); g_vu_shd = f_getuloc(p, "SHD");
+  return true;
+}
+
+static void vol_pass() {
+  if (g_vol_state < 0 || !g_vol_on || !g_gx_ok) return;
+  if (g_level < 3 || g_sh_state != 1 || g_cur_fbo != 0 || !g_view_ok || !g_lvp_valid || !g_delta_ok || !sun_enabled()) return;
+  if (g_gen_Ly < -0.04f) return;
+  if (g_vol_state == 0) {
+    clear_gl_errors();
+    if (!vol_make_prog()) { g_vol_state = -1; sh_log("vol: program gagal, sinar volumetrik dimatikan\n"); return; }
+    g_vol_state = 1;
+    sh_log("vol: program siap\n");
+  }
+  float ox = g_ox0 + g_bs[0] * g_delta[0] + g_bs[1] * g_delta[1] + g_bs[2] * g_delta[2];
+  float oy = g_oy0 + g_bu[0] * g_delta[0] + g_bu[1] * g_delta[1] + g_bu[2] * g_delta[2];
+  float oz = g_bf[0] * g_delta[0] + g_bf[1] * g_delta[1] + g_bf[2] * g_delta[2];
+  float lum = 0.299f * g_w_fog[0] + 0.587f * g_w_fog[1] + 0.114f * g_w_fog[2];
+  float t = (lum - 0.05f) / 0.45f; t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  float day = t * t * (3.0f - 2.0f * t);
+  float sunset = (g_w_fog[0] - g_w_fog[2]) * 3.5f; sunset = sunset < 0 ? 0 : (sunset > 1 ? 1 : sunset);
+  if (day < 0.02f || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
+  SavedState st;
+  save_state(&st);
+  int prev5 = 0;
+  gx.ActiveTexture(0x84C5); f_geti(0x8069, &prev5);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0B44); gx.Disable(0x8037);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(1, 1, 0, 1);
+  gx.UseProgram(g_vol_prog);
+  gx.Uniform3f(g_vu_ra, g_wv[0], g_wv[4], g_wv[8]);
+  gx.Uniform3f(g_vu_rb, g_wv[1], g_wv[5], g_wv[9]);
+  gx.Uniform3f(g_vu_rc, g_wv[2], g_wv[6], g_wv[10]);
+  gx.Uniform2f(g_vu_pr, g_proj[0], g_proj[5]);
+  gx.Uniform4f(g_vu_sa, g_gen_Ly, g_gen_Lz, oz, g_vol_k);
+  gx.Uniform4f(g_vu_sb, ox, oy, day, sunset);
+  gx.Uniform1i(g_vu_shd, 5);
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, g_sh_tex);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, (unsigned)prev5);
+  restore_state(&st);
+  clear_gl_errors();
+  g_vol_n++;
+  if (g_vol_logs < 3) {
+    g_vol_logs++;
+    sh_log("vol: frame %u Ly=%.3f Lz=%.3f ox=%.2f oy=%.2f oz=%.2f siang=%.2f senja=%.2f\n", g_frames, g_gen_Ly, g_gen_Lz, ox, oy, oz, day, sunset);
+  }
+}
+
+// ===================== SSR: pantulan layar di lantai basah (saat hujan) =====================
+// Alur (semua milik pipe3d, tidak ada uniform/sampler baru di shader game):
+//  1. Sesudah langit tergambar (di kotak matahari/bulan, sama seperti sinar volumetrik) terrain yang terekam digambar ulang
+//     dari sudut pandang kamera ke tekstur kedalaman setengah resolusi.
+//  2. Layar disalin ke tekstur warna.
+//  3. Segitiga layar penuh: tiap piksel permukaan datar menghadap ke atas dihitung normalnya dari kedalaman, sinar pantul
+//     ditelusuri di ruang layar, warna yang kena dibaca dari salinan layar (kalau tidak kena: warna langit). Hasilnya dicampur
+//     ke layar dengan sedikit penggelapan (permukaan basah tampak lebih gelap dan mengilap).
+//  Berlaku hanya saat hujan (ssr_always=1 di pipe3d_fx.txt untuk selalu aktif). Tidak berlaku di air, kaca, dan benda lain.
+static bool g_ssr_rain = false;
+static int g_ssr_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_ssr_dtex = 0, g_ssr_dfbo = 0, g_ssr_dcol = 0, g_ssr_ctex = 0, g_ssr_dprog = 0, g_ssr_prog = 0;
+static int g_ssr_dw = 0, g_ssr_dh = 0, g_ssr_cw = 0, g_ssr_ch = 0;
+static int g_sd_wv = -1, g_sd_proj = -1, g_sd_org = -1, g_sd_tex = -1;
+static int g_ss_dep = -1, g_ss_col = -1, g_ss_prj = -1, g_ss_pz = -1, g_ss_ra = -1, g_ss_rb = -1, g_ss_rc = -1, g_ss_sky = -1, g_ss_k = -1, g_ss_tx = -1;
+static unsigned g_ssr_frame = 0xFFFFFFFFu, g_ssr_n = 0, g_ssr_logs = 0, g_ssr_draws = 0;
+static double g_ssr_ms = 0;
+
+static void ssr_frame_begin(ProgStat* s) {   // dipanggil di draw terrain pertama tiap frame: baca apakah sedang hujan (FOG_CONTROL.x antara 0.10 dan 0.55)
+  g_ssr_rain = false;
+  if (!f_getuloc || !f_unifv) return;
+  int fl = f_getuloc(s->id, "FOG_CONTROL");
+  if (fl < 0) return;
+  float v[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+  f_unifv(s->id, fl, v);
+  g_ssr_rain = (v[0] < 0.55f && v[0] > 0.10f);
+}
+
+static const char* SSR_DVS =
+  "attribute vec3 POSITION;\n"
+  "attribute vec2 TEXCOORD_0;\n"
+  "uniform mat4 WV;\n"
+  "uniform mat4 PROJ;\n"
+  "uniform vec4 ORG;\n"
+  "varying vec2 vuv;\n"
+  "void main() {\n"
+  "  vuv = TEXCOORD_0;\n"
+  "  gl_Position = PROJ * (WV * vec4(POSITION * ORG.w + ORG.xyz, 1.0));\n"
+  "}\n";
+static const char* SSR_DFS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 vuv;\n"
+  "uniform sampler2D TEX;\n"
+  "void main() {\n"
+  "  if (texture2D(TEX, vuv).a < 0.5) discard;\n"
+  "  gl_FragColor = vec4(1.0);\n"
+  "}\n";
+static const char* SSR_VS =
+  "attribute vec2 P;\n"
+  "varying vec2 uv;\n"
+  "void main() {\n"
+  "  gl_Position = vec4(P, 0.0, 1.0);\n"
+  "  uv = P * 0.5 + 0.5;\n"
+  "}\n";
+static const char* SSR_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 uv;\n"
+  "uniform sampler2D DEP;\n"
+  "uniform sampler2D COL;\n"
+  "uniform vec2 PRJ;\n"   // P00, P11
+  "uniform vec2 PZ;\n"    // P22, P32
+  "uniform vec3 RA;\n"
+  "uniform vec3 RB;\n"
+  "uniform vec3 RC;\n"
+  "uniform vec3 SKY;\n"
+  "uniform float K;\n"
+  "uniform vec2 TX;\n"
+  "vec3 viewPos(vec2 c) {\n"
+  "  float d = texture2D(DEP, c).r;\n"
+  "  float z = -PZ.y / ((d * 2.0 - 1.0) + PZ.x);\n"
+  "  vec2 ndc = c * 2.0 - 1.0;\n"
+  "  return vec3(ndc.x * (-z) / PRJ.x, ndc.y * (-z) / PRJ.y, z);\n"
+  "}\n"
+  "void main() {\n"
+  "  float d0 = texture2D(DEP, uv).r;\n"
+  "  if (d0 > 0.99995) discard;\n"
+  "  vec3 p0 = viewPos(uv);\n"
+  "  vec3 pr = viewPos(uv + vec2(TX.x, 0.0));\n"
+  "  vec3 pl = viewPos(uv - vec2(TX.x, 0.0));\n"
+  "  vec3 pu = viewPos(uv + vec2(0.0, TX.y));\n"
+  "  vec3 pd = viewPos(uv - vec2(0.0, TX.y));\n"
+  "  vec3 dx = (abs(pr.z - p0.z) < abs(pl.z - p0.z)) ? (pr - p0) : (p0 - pl);\n"
+  "  vec3 dy = (abs(pu.z - p0.z) < abs(pd.z - p0.z)) ? (pu - p0) : (p0 - pd);\n"
+  "  vec3 n = cross(dx, dy);\n"
+  "  float nl = length(n);\n"
+  "  if (nl < 1e-8) discard;\n"
+  "  n = n / nl;\n"
+  "  if (n.z < 0.0) n = -n;\n"
+  "  float ny = dot(n, vec3(RA.y, RB.y, RC.y));\n"
+  "  float mask = smoothstep(0.80, 0.95, ny);\n"
+  "  if (mask <= 0.0) discard;\n"
+  "  vec3 v = normalize(p0);\n"
+  "  vec3 r = reflect(v, n);\n"
+  "  float ry = dot(r, vec3(RA.y, RB.y, RC.y));\n"
+  "  vec3 p = p0 + n * 0.04;\n"
+  "  float stepLen = 0.22;\n"
+  "  float hit = 0.0;\n"
+  "  vec2 huv = uv;\n"
+  "  for (int i = 0; i < 22; i++) {\n"
+  "    p += r * stepLen;\n"
+  "    stepLen *= 1.17;\n"
+  "    if (p.z > -0.1) break;\n"
+  "    vec2 suv = vec2(PRJ.x * p.x, PRJ.y * p.y) / (-p.z) * 0.5 + 0.5;\n"
+  "    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;\n"
+  "    float ds = texture2D(DEP, suv).r;\n"
+  "    if (ds > 0.99995) continue;\n"
+  "    float zs = -PZ.y / ((ds * 2.0 - 1.0) + PZ.x);\n"
+  "    float diff = zs - p.z;\n"   // positif: titik sinar ada di belakang permukaan layar
+  "    if (diff > 0.0 && diff < stepLen * 1.6 + 0.15) { hit = 1.0; huv = suv; break; }\n"
+  "  }\n"
+  "  float ef = smoothstep(0.0, 0.08, min(huv.x, 1.0 - huv.x)) * smoothstep(0.0, 0.08, min(huv.y, 1.0 - huv.y));\n"
+  "  vec3 sceneC = texture2D(COL, huv).rgb;\n"
+  "  vec3 skyC = SKY * smoothstep(-0.05, 0.25, ry);\n"
+  "  vec3 rc = mix(skyC, sceneC, hit * ef);\n"
+  "  float fr = 0.04 + 0.96 * pow(1.0 - max(dot(n, -v), 0.0), 5.0);\n"
+  "  float refl = (0.12 + 0.88 * fr) * K * mask;\n"
+  "  gl_FragColor = vec4(rc * refl * 0.7, mask * 0.22);\n"
+  "}\n";
+
+static bool ssr_init() {
+  g_ssr_state = -1;
+  clear_gl_errors();
+  unsigned vs = sh_compile(0x8B31, SSR_DVS), fs = sh_compile(0x8B30, SSR_DFS);
+  if (!vs || !fs) return false;
+  g_ssr_dprog = gx.CreateProgram();
+  gx.AttachShader(g_ssr_dprog, vs); gx.AttachShader(g_ssr_dprog, fs);
+  gx.BindAttribLocation(g_ssr_dprog, 0, "POSITION"); gx.BindAttribLocation(g_ssr_dprog, 1, "TEXCOORD_0");
+  gx.LinkProgram(g_ssr_dprog);
+  int linked = 0; gx.GetProgramiv(g_ssr_dprog, 0x8B82, &linked);
+  if (!linked) { sh_log("ssr: link program kedalaman gagal\n"); return false; }
+  g_sd_wv = f_getuloc(g_ssr_dprog, "WV"); g_sd_proj = f_getuloc(g_ssr_dprog, "PROJ"); g_sd_org = f_getuloc(g_ssr_dprog, "ORG"); g_sd_tex = f_getuloc(g_ssr_dprog, "TEX");
+  unsigned vs2 = sh_compile(0x8B31, SSR_VS), fs2 = sh_compile(0x8B30, SSR_FS);
+  if (!vs2 || !fs2) return false;
+  g_ssr_prog = gx.CreateProgram();
+  gx.AttachShader(g_ssr_prog, vs2); gx.AttachShader(g_ssr_prog, fs2);
+  gx.BindAttribLocation(g_ssr_prog, 0, "P");
+  gx.LinkProgram(g_ssr_prog);
+  linked = 0; gx.GetProgramiv(g_ssr_prog, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(g_ssr_prog, 511, &n, buf); sh_log("ssr: link program SSR gagal: %s\n", buf); return false; }
+  g_ss_dep = f_getuloc(g_ssr_prog, "DEP"); g_ss_col = f_getuloc(g_ssr_prog, "COL"); g_ss_prj = f_getuloc(g_ssr_prog, "PRJ"); g_ss_pz = f_getuloc(g_ssr_prog, "PZ");
+  g_ss_ra = f_getuloc(g_ssr_prog, "RA"); g_ss_rb = f_getuloc(g_ssr_prog, "RB"); g_ss_rc = f_getuloc(g_ssr_prog, "RC");
+  g_ss_sky = f_getuloc(g_ssr_prog, "SKY"); g_ss_k = f_getuloc(g_ssr_prog, "K"); g_ss_tx = f_getuloc(g_ssr_prog, "TX");
+  g_ssr_state = 1;
+  sh_log("ssr: program siap (scale=%.2f strength=%.2f always=%d)\n", g_ssr_scale, g_ssr_k, g_ssr_always);
+  return true;
+}
+
+// tekstur kedalaman setengah resolusi + framebuffer, dan tekstur warna ukuran layar; dibuat ulang kalau ukuran berubah
+static bool ssr_resources(int w, int h) {
+  int dw = (int)(w * g_ssr_scale), dh = (int)(h * g_ssr_scale);
+  if (dw < 64) dw = 64;
+  if (dh < 64) dh = 64;
+  if (g_ssr_dtex && dw == g_ssr_dw && dh == g_ssr_dh && g_ssr_cw == w && g_ssr_ch == h) return true;
+  clear_gl_errors();
+  int prev_fbo = 0, prev_tex = 0, prev_act = 0;
+  f_geti(0x8CA6, &prev_fbo); f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev_tex);
+  if (!g_ssr_dtex) { gx.GenTextures(1, &g_ssr_dtex); gx.GenFramebuffers(1, &g_ssr_dfbo); gx.GenTextures(1, &g_ssr_ctex); }
+  gx.BindTexture(0x0DE1, g_ssr_dtex);
+  gx.TexImage2D(0x0DE1, 0, 0x81A6, dw, dh, 0, 0x1902, 0x1405, nullptr);
+  if (gx.GetError() != 0) { gx.TexImage2D(0x0DE1, 0, 0x81A5, dw, dh, 0, 0x1902, 0x1403, nullptr); clear_gl_errors(); }
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  gx.BindFramebuffer(0x8D40, g_ssr_dfbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8D00, 0x0DE1, g_ssr_dtex, 0);
+  if (gx_drawbuffers) { unsigned none = 0; gx_drawbuffers(1, &none); }
+  if (gx_readbuffer) gx_readbuffer(0);
+  unsigned status = gx.CheckFramebufferStatus(0x8D40);
+  if (status != 0x8CD5) {
+    if (!g_ssr_dcol) gx.GenTextures(1, &g_ssr_dcol);
+    gx.BindTexture(0x0DE1, g_ssr_dcol);
+    gx.TexImage2D(0x0DE1, 0, 0x1908, dw, dh, 0, 0x1908, 0x1401, nullptr);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_ssr_dcol, 0);
+    if (gx_drawbuffers) { unsigned c0 = 0x8CE0; gx_drawbuffers(1, &c0); }
+    status = gx.CheckFramebufferStatus(0x8D40);
+  }
+  gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
+  gx.BindTexture(0x0DE1, g_ssr_ctex);
+  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2601); gx.TexParameteri(0x0DE1, 0x2800, 0x2601);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  gx.BindTexture(0x0DE1, (unsigned)prev_tex);
+  gx.ActiveTexture((unsigned)prev_act);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  if (status != 0x8CD5 || err != 0) { sh_log("ssr: framebuffer kedalaman gagal (status=0x%x err=0x%x), dimatikan\n", status, err); g_ssr_state = -1; return false; }
+  g_ssr_dw = dw; g_ssr_dh = dh; g_ssr_cw = w; g_ssr_ch = h;
+  sh_log("ssr: sumber daya %dx%d (kedalaman) %dx%d (warna)\n", dw, dh, w, h);
+  return true;
+}
+
+static void ssr_pass() {
+  if (!g_ssr_on || g_ssr_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0) return;
+  if (!g_ssr_always && !g_ssr_rain) return;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_ssr_state == 0 && !ssr_init()) { sh_log("ssr: init gagal, dimatikan\n"); return; }
+  if (!ssr_resources(vp[2], vp[3])) return;
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  // 1. kedalaman terrain dari sudut pandang kamera
+  gx.BindFramebuffer(0x8D40, g_ssr_dfbo);
+  gx.Viewport(0, 0, g_ssr_dw, g_ssr_dh);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x8037);
+  gx.Enable(0x0B44); gx.CullFace(0x0405);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(1); gx.ColorMask(0, 0, 0, 0);
+  gx.ClearDepthf(1.0f); gx.Clear(0x100);
+  gx.UseProgram(g_ssr_dprog);
+  gx.UniformMatrix4fv(g_sd_wv, 1, 0, g_wv);
+  gx.UniformMatrix4fv(g_sd_proj, 1, 0, g_proj);
+  gx.Uniform1i(g_sd_tex, 0);
+  gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)g_atlas_tex);
+  for (int i = 0; i < 4; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.EnableVertexAttribArray(0); gx.EnableVertexAttribArray(1);
+  gx.Disable(0x0B44);   // arah putar tidak dijamin sama dengan game: tanpa pembuangan sisi belakang
+  unsigned drawn = 0;
+  for (int i = 0; i < n && drawn < 1800; i++) {
+    const DrawRec& r = g_dl[cur][i];
+    float dx = r.o[0] + 8.0f, dz = r.o[2] + 8.0f;
+    if (dx * dx + dz * dz > 120.0f * 120.0f) continue;
+    gx.BindBuffer(0x8892, (unsigned)r.vbo);
+    gx.BindBuffer(0x8893, (unsigned)r.ibo);
+    int vs = 0, is = 0;
+    gx.GetBufferParameteriv(0x8892, 0x8764, &vs);
+    gx.GetBufferParameteriv(0x8893, 0x8764, &is);
+    if (vs != r.vsz || is != r.isz || vs <= 0 || is <= 0) continue;
+    gx.VertexAttribPointer(0, 3, 0x1406, 0, 24, (const void*)0);
+    gx.VertexAttribPointer(1, 2, 0x1403, 1, 24, (const void*)20);
+    gx.Uniform4f(g_sd_org, r.o[0], r.o[1], r.o[2], r.sc);
+    gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
+    drawn++;
+  }
+  // 2. salin layar ke tekstur warna
+  gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+  gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+  gx.ColorMask(1, 1, 1, 1);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_ssr_ctex);
+  gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  // 3. pantulan
+  gx.Disable(0x0B71); gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(1, 0x0303, 0, 1);   // hasil + layar * (1 - alpha)
+  gx.UseProgram(g_ssr_prog);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, g_ssr_dtex);
+  gx.Uniform1i(g_ss_dep, 6); gx.Uniform1i(g_ss_col, 7);
+  gx.Uniform2f(g_ss_prj, g_proj[0], g_proj[5]);
+  gx.Uniform2f(g_ss_pz, g_proj[10], g_proj[14]);
+  gx.Uniform3f(g_ss_ra, g_wv[0], g_wv[4], g_wv[8]);
+  gx.Uniform3f(g_ss_rb, g_wv[1], g_wv[5], g_wv[9]);
+  gx.Uniform3f(g_ss_rc, g_wv[2], g_wv[6], g_wv[10]);
+  gx.Uniform3f(g_ss_sky, g_w_fog[0] * 0.85f, g_w_fog[1] * 0.85f, g_w_fog[2] * 0.9f);
+  gx.Uniform1f(g_ss_k, g_ssr_k);
+  gx.Uniform2f(g_ss_tx, 1.0f / (float)g_ssr_dw, 1.0f / (float)g_ssr_dh);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_ssr_n++; g_ssr_draws += drawn; g_ssr_ms += (mono_sec() - t0) * 1000.0;
+  if (g_ssr_logs < 3) {
+    g_ssr_logs++;
+    sh_log("ssr: pass frame %u draw=%u err=0x%x hujan=%d\n", g_frames, drawn, err, (int)g_ssr_rain);
+  } else if (g_frames % 900 == 0 && g_ssr_logs < 12) {
+    g_ssr_logs++;
+    sh_log("ssr: frame %u pass=%u draw/pass=%.0f ms/pass=%.2f\n", g_frames, g_ssr_n, g_ssr_n ? (double)g_ssr_draws / g_ssr_n : 0.0, g_ssr_n ? g_ssr_ms / g_ssr_n : 0.0);
+    g_ssr_n = 0; g_ssr_draws = 0; g_ssr_ms = 0;
+  }
+}
+
 static void spy_use_program(GLuint_t p) {
   g_cur_prog = p;
   if (p) {
@@ -1773,6 +2492,9 @@ static void spy_use_program(GLuint_t p) {
       s->vp_state = 0;
       s->loc_world = f_getuloc ? f_getuloc(p, "WORLD") : -1;
       s->loc_vpos = f_getuloc ? f_getuloc(p, "VIEW_POS") : -1;   // posisi kamera di dunia (dipakai untuk mengenali orang pertama)
+      s->loc_t3 = f_getuloc ? f_getuloc(p, "TEXTURE_3") : -1;     // data lampu obor (hanya ada di shader terrain)
+      s->loc_t4 = f_getuloc ? f_getuloc(p, "TEXTURE_4") : -1;     // peta kedalaman obor
+      s->t34_set = 0;
       if (s->kind == 2 && s->loc_world >= 0 && s->loc_wvp >= 0) s->kind = 3;   // program entity (mob, item, tangan): punya WORLD dan WORLDVIEWPROJ
     }
   }
@@ -1786,7 +2508,7 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     if (s->kind == 1) capture_draw(s, mode, count, type, idx);
   }
   bool u2 = false;
-  if (s->kind == 1) u2 = terrain_draw(s, count, type, idx);
+  if (s->kind == 1) { u2 = terrain_draw(s, count, type, idx); torch_pre(s); }
   else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
   else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
   bool wblend = false;
@@ -1795,6 +2517,13 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     water_before_blend();
   }
   o_drawel(mode, count, type, idx);
+  if (s->kind == 2 && count == 6 && (int)s->id == g_sun_prog && g_tframe == g_frames && g_vol_frame != g_frames && g_cur_fbo == 0) {
+    // kotak matahari/bulan: langit (bidang langit) sudah tergambar di atas terrain; tambahkan pantulan layar (hujan) dan sinar volumetrik di piksel langit
+    g_vol_frame = g_frames;
+    fx_cfg_load();
+    ssr_pass();
+    vol_pass();
+  }
   if (u2) terrain_draw_post();
   if (wblend && g_w_ready) water_overlay(s, count, type, idx);
 }
@@ -2492,6 +3221,40 @@ static void campfire_effects(void* level, void* entity) {
   pthread_mutex_unlock(&g_fire_mu);
 }
 
+// ---- pencari lampu untuk bayangan obor (jalan di thread game, dicicil beberapa tick) ----
+static const int TL_W = 25, TL_H = 15, TL_TOTAL = 25 * 25 * 15, TL_PER_TICK = 900;
+static int g_tl_cur = 0, g_tl_bx = 0, g_tl_by = 0, g_tl_bz = 0, g_tl_ntmp = 0;
+static int g_tl_tmp[TL_MAX][3];
+static void torch_scan(void* entity) {
+  if (!g_tl_on) return;
+  uint8_t* e = (uint8_t*)entity;
+  void* region = *(void**)(e + ENTITY_REGION_OFF);
+  if (!region) return;
+  const float* pp = (const float*)(e + ENTITY_POS_OFF);
+  if (!(pp[1] > -64.0f && pp[1] < 512.0f)) return;
+  GetBlockIdXYZFn get_id = (GetBlockIdXYZFn)(g_base + OFF_BS_GET_BLOCK_ID_XYZ);
+  if (g_tl_cur == 0) {   // mulai putaran baru di sekitar posisi pemain sekarang
+    g_tl_bx = (int)floorf(pp[0]); g_tl_by = (int)floorf(pp[1]); g_tl_bz = (int)floorf(pp[2]);
+    g_tl_ntmp = 0;
+  }
+  for (int k = 0; k < TL_PER_TICK && g_tl_cur < TL_TOTAL; k++, g_tl_cur++) {
+    int i = g_tl_cur;
+    int x = g_tl_bx + (i % TL_W) - 12, z = g_tl_bz + ((i / TL_W) % TL_W) - 12, y = g_tl_by + (i / (TL_W * TL_W)) - 8;
+    if (y < 0 || y > 127) continue;
+    alignas(8) uint8_t bid[8] = {0};
+    get_id(bid, region, x, y, z);
+    if (bid[0] != 0 && tl_is_light(bid[0]) && g_tl_ntmp < TL_MAX) {
+      g_tl_tmp[g_tl_ntmp][0] = x; g_tl_tmp[g_tl_ntmp][1] = y; g_tl_tmp[g_tl_ntmp][2] = z; g_tl_ntmp++;
+    }
+  }
+  if (g_tl_cur >= TL_TOTAL) {   // putaran selesai: serahkan hasilnya ke thread render
+    pthread_mutex_lock(&g_tl_mu);
+    g_tl_nfound = g_tl_ntmp; memcpy(g_tl_found, g_tl_tmp, sizeof(g_tl_tmp));
+    pthread_mutex_unlock(&g_tl_mu);
+    g_tl_cur = 0;
+  }
+}
+
 static void hook_level_animate_tick(void* level, void* entity) {
   if (entity) {   // posisi pemain (dipakai pantulan air untuk tinggi kamera)
     const float* pp = (const float*)((uint8_t*)entity + ENTITY_POS_OFF);
@@ -2499,6 +3262,7 @@ static void hook_level_animate_tick(void* level, void* entity) {
   }
   orig_level_anim(level, entity);   // sampling animateTick bawaan jalan dulu
   if (g_fire_smoke && g_fire_cnt > 0 && g_lt_ids[3] >= 0 && level && entity) campfire_effects(level, entity);
+  if (entity) torch_scan(entity);
 }
 
 static void install_campfire_fx(uintptr_t base) {
