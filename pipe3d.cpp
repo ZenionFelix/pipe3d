@@ -2067,7 +2067,7 @@ static void torch_pass() {
 
 // ===================== SINAR VOLUMETRIK DI LANGIT =====================
 // Segitiga layar penuh tepat sesudah kotak matahari/bulan digambar (game ini menggambar langit SESUDAH terrain opaque, jadi bidang langit
-// sudah ada di layar dan tidak menimpa hasil kita). Kedalaman diuji LEQUAL pada z = 0.99999, jadi hanya piksel langit (kedalaman 1.0) yang terkena. Sinar kamera ditelusuri di peta bayangan matahari yang sama dengan terrain.
+// sudah ada di layar dan tidak menimpa hasil kita). Kedalaman diuji LEQUAL pada z = 0.99999, jadi hanya piksel langit (kedalaman 1.0) yang terkena. Sinar kamera ditelusuri di peta bayangan matahari yang sama dengan terrain; hasilnya pengali yang menggelapkan udara yang terhalang daun atau tebing (tidak pernah menambah cahaya, jadi tidak bisa memutihkan langit).
 static const char* VOL_VS =
   "attribute vec2 P;\n"
   "uniform vec3 RA;\n"
@@ -2110,13 +2110,11 @@ static const char* VOL_FS =
   "  }\n"
   "  float lit = sum / 14.0;\n"
   "  float cosT = max(dot(d, Lr), 0.0);\n"
-  "  float phase = 0.25 + 1.8 * pow(cosT, 8.0);\n"
   "  float sunUp = smoothstep(-0.04, 0.14, Ly);\n"
   "  float dens = mix(0.0075, 0.014, SB.w);\n"
   "  float amount = 1.0 - exp(-dens * 48.0);\n"
-  "  vec3 tint = mix(vec3(1.0, 0.92, 0.77), vec3(1.0, 0.47, 0.15), SB.w);\n"
-  "  vec3 col = tint * mix(3.2, 2.1, SB.w) * sunUp * SB.z * amount * phase * SA.w * lit * lit * lit;\n"
-  "  gl_FragColor = vec4(col, 1.0);\n"
+  "  float shade = (1.0 - lit * lit * lit) * amount * 0.35 * (0.4 + 0.6 * pow(cosT, 4.0)) * sunUp * SB.z * SA.w;\n"
+  "  gl_FragColor = vec4(vec3(1.0 - clamp(shade, 0.0, 0.25)), 1.0);\n"
   "}\n";
 
 static bool vol_make_prog() {
@@ -2158,7 +2156,7 @@ static void vol_pass() {
   gx.ActiveTexture(0x84C5); f_geti(0x8069, &prev5);
   gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0B44); gx.Disable(0x8037);
   gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
-  gx.Enable(0x0BE2); gx.BlendFuncSeparate(1, 1, 0, 1);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(0, 0x0300, 0, 1);   // dikali (ZERO, SRC_COLOR): hanya menggelapkan bagian udara yang terhalang, langit terbuka tidak berubah
   gx.UseProgram(g_vol_prog);
   gx.Uniform3f(g_vu_ra, g_wv[0], g_wv[4], g_wv[8]);
   gx.Uniform3f(g_vu_rb, g_wv[1], g_wv[5], g_wv[9]);
