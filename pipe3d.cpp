@@ -1056,11 +1056,14 @@ static void entity_draw(ProgStat* s, unsigned mode, int first, int count, unsign
 // ---- simpan / pulihkan status GL ----
 struct SavedState {
   int fbo, prog, arr, ele, act, tex0, vp[4], dfunc, cullmode;
+  int bsrc, bdst, bsa, bda;   // fungsi blend (SRC/DST untuk RGB dan alpha); tanpa ini blend pass kita bocor ke draw berikutnya (kotak hitam di matahari)
   unsigned char dmask, cmask[4], depth, cull, blend, scissor, poff, stencil;
   float cleard, pofF, pofU;
   struct VA { int en, size, type, norm, stride, buf; void* ptr; } va[8];
 };
 static void save_state(SavedState* s) {
+  s->bsrc = 1; s->bdst = 0; s->bsa = 1; s->bda = 0;
+  f_geti(0x80C9, &s->bsrc); f_geti(0x80C8, &s->bdst); f_geti(0x80CB, &s->bsa); f_geti(0x80CA, &s->bda);
   f_geti(0x8CA6, &s->fbo); f_geti(0x8B8D, &s->prog); f_geti(0x8894, &s->arr); f_geti(0x8895, &s->ele);
   f_geti(0x84E0, &s->act); f_geti(0x0BA2, s->vp); f_geti(0x0B74, &s->dfunc); f_geti(0x0B45, &s->cullmode);
   f_getb(0x0B72, &s->dmask); f_getb(0x0C23, s->cmask);
@@ -1097,6 +1100,7 @@ static void restore_state(const SavedState* s) {
   set_cap(0x0C11, s->scissor); set_cap(0x8037, s->poff); set_cap(0x0B90, s->stencil);
   gx.DepthMask(s->dmask); gx.ColorMask(s->cmask[0], s->cmask[1], s->cmask[2], s->cmask[3]);
   gx.DepthFunc((unsigned)s->dfunc); gx.CullFace((unsigned)s->cullmode);
+  gx.BlendFuncSeparate((unsigned)s->bsrc, (unsigned)s->bdst, (unsigned)s->bsa, (unsigned)s->bda);
   gx.PolygonOffset(s->pofF, s->pofU); gx.ClearDepthf(s->cleard);
 }
 
