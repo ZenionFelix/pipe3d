@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + HEIGHTMAP POM (v17): atlas tinggi dibuat saat game jalan dari atlas terrain asli (dihaluskan, relatif terhadap sekitarnya) dan dipasang di TEXTURE_5 untuk POM di shader; pengaturan: pipe3d_fx.txt (hmap=...). Kalau gagal, shader memakai POM dari kecerahan tekstur.
 // + SSR (v16): pantulan layar di lantai basah saat hujan (ssr=1, ssr_always=1 untuk selalu aktif).
 // + BAYANGAN OBOR + SINAR VOLUMETRIK (v15): lampu terdekat membuat peta kedalaman sendiri (TEXTURE_3 dan TEXTURE_4 di shader terrain); sinar volumetrik di piksel langit lewat program milik pipe3d; pengaturan: pipe3d_fx.txt.
 // + DUNIA REALISTIS: depth/scale semua kelompok biome darat diganti (padang rumput bergelombang, bukit, pegunungan tajam, sungai jadi jurang dalam); realistic=0 di pipe3d_biome.txt kembali ke cara lama.
@@ -286,7 +287,7 @@ static fn_viewport_t o_viewport = nullptr;
 static fn_swap_t o_swap = nullptr;
 
 struct ProgStat { unsigned id; unsigned draws; unsigned verts; unsigned mode; unsigned type; bool described; int kind;
-  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; int loc_vpos; int loc_t3, loc_t4, t34_set; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
+  int loc_origin, loc_wv, loc_proj, loc_wvp, loc_cc, loc_vp, loc_t2; float vp_orig[3]; int vp_state; int loc_world; int loc_vpos; int loc_t3, loc_t4, t34_set; int loc_t5, t5_set; };   // kind: 0 belum dicek, 1 terrain, 2 bukan
 static ProgStat g_prog[48];
 static int g_np = 0;
 static unsigned g_cur_prog = 0, g_cur_fbo = 0;
@@ -807,6 +808,8 @@ static float g_vol_k = 1.0f;
 static int g_fx_cfg_done = 0;
 static int g_ssr_on = 1, g_ssr_always = 0;
 static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
+static int g_hm_on = 1;                                   // heightmap POM (TEXTURE_5)
+static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
 #define TL_MAX 24
 static int g_tl_found[TL_MAX][3];
 static int g_tl_nfound = 0;
@@ -1822,6 +1825,9 @@ static void fx_cfg_load() {
     else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
     else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
     else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "hmap=%d", &iv) == 1) g_hm_on = iv;
+    else if (sscanf(line, "hmap_contrast=%f", &fv) == 1) g_hm_contrast = (fv < 0.5f) ? 0.5f : (fv > 8.0f ? 8.0f : fv);
+    else if (sscanf(line, "hmap_base=%f", &fv) == 1) g_hm_base = (fv < 0.4f) ? 0.4f : (fv > 1.0f ? 1.0f : fv);
   }
   fclose(f);
   sh_log("fx: torch=%d size=%d radius=%.1f vol=%d vol_strength=%.2f ssr=%d always=%d strength=%.2f scale=%.2f\n", g_tl_on, g_tl_size, g_tl_R, g_vol_on, g_vol_k, g_ssr_on, g_ssr_always, g_ssr_k, g_ssr_scale);
@@ -2476,6 +2482,216 @@ static void ssr_pass() {
   }
 }
 
+// ===================== HEIGHTMAP POM (TEXTURE_5) =====================
+// Atlas terrain dirakit game saat dijalankan (dari terrain_texture.json), jadi tidak ada file atlas jadi untuk diolah dari luar.
+// Karena itu atlas tinggi dibuat di sini, di GPU, sekali saja setelah atlas stabil: tiap texel diberi tinggi dari kecerahan yang
+// sudah dihaluskan (3x3) dikurangi rata-rata sekitarnya (7x7, berbobot), jadi celah, alur, dan lekukan jadi dalam tanpa perlu tahu
+// letak tile. Hasil (RGBA8, ukuran sama dengan atlas): R = tinggi (1.0 = permukaan), G = kekuatan relief lokal (tile datar ~ 0),
+// A = 253 (tanda "atlas tinggi sah" yang dicek shader). Dipasang di unit tekstur 5 saat draw terrain; kalau belum siap yang terpasang
+// hanya tekstur 1x1 dengan A = 0 sehingga shader otomatis memakai POM dari kecerahan tekstur.
+// Ukuran atlas diketahui dari hook glTexImage2D (level 0 saja); cadangan: glGetTexLevelParameteriv bila ada (GLES 3.1).
+typedef void (*fn_teximage_t)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*);
+static fn_teximage_t o_teximage = nullptr;
+struct TexSz { unsigned id; int w, h; unsigned gen; };
+static TexSz g_texsz[64];
+static int g_ntexsz = 0, g_texsz_rr = 0;
+static void cap_init();
+static void spy_tex_image(unsigned target, int level, int ifmt, int w, int h, int border, unsigned fmt, unsigned type, const void* data) {
+  o_teximage(target, level, ifmt, w, h, border, fmt, type, data);
+  if (target != 0x0DE1 || level != 0 || w < 128 || h < 128) return;
+  cap_init();
+  if (!f_geti) return;
+  int id = 0; f_geti(0x8069, &id);   // GL_TEXTURE_BINDING_2D pada unit aktif = tekstur yang baru diisi
+  if (id <= 0) return;
+  for (int i = 0; i < g_ntexsz; i++) {
+    if (g_texsz[i].id == (unsigned)id) { g_texsz[i].w = w; g_texsz[i].h = h; g_texsz[i].gen++; return; }
+  }
+  TexSz* t;
+  if (g_ntexsz < 64) t = &g_texsz[g_ntexsz++];
+  else { t = &g_texsz[g_texsz_rr]; g_texsz_rr = (g_texsz_rr + 1) % 64; }
+  t->id = (unsigned)id; t->w = w; t->h = h; t->gen = 1;
+}
+
+static const char* HM_VS =
+  "attribute vec2 P;\n"
+  "void main() { gl_Position = vec4(P, 0.0, 1.0); }\n";
+static const char* HM_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "uniform sampler2D TEX;\n"
+  "uniform vec2 TS;\n"    // 1 / ukuran atlas
+  "uniform vec2 KC;\n"    // x = kontras, y = tinggi dasar
+  "float lm(vec2 uv) { return dot(texture2D(TEX, uv).rgb, vec3(0.299, 0.587, 0.114)); }\n"
+  "void main() {\n"
+  "  vec2 uv = gl_FragCoord.xy * TS;\n"
+  "  float s = 0.0;\n"
+  "  for (int y = -1; y <= 1; y++) {\n"
+  "    for (int x = -1; x <= 1; x++) {\n"
+  "      s += lm(uv + vec2(float(x), float(y)) * TS);\n"
+  "    }\n"
+  "  }\n"
+  "  s = s / 9.0;\n"
+  "  float m = 0.0;\n"
+  "  float w = 0.0;\n"
+  "  float q = 0.0;\n"
+  "  for (int y = -3; y <= 3; y++) {\n"
+  "    for (int x = -3; x <= 3; x++) {\n"
+  "      float ww = exp(-float(x * x + y * y) * 0.12);\n"
+  "      float l = lm(uv + vec2(float(x), float(y)) * TS);\n"
+  "      m += l * ww;\n"
+  "      q += l * l * ww;\n"
+  "      w += ww;\n"
+  "    }\n"
+  "  }\n"
+  "  m = m / w;\n"
+  "  q = max(q / w - m * m, 0.0);\n"
+  "  float h = clamp(KC.y + (s - m) * KC.x, 0.0, 1.0);\n"
+  "  float relief = clamp(sqrt(q) * 7.0, 0.0, 1.0);\n"
+  "  gl_FragColor = vec4(h, relief, 0.0, 253.0 / 255.0);\n"
+  "}\n";
+
+typedef void (*gl_texlevel_t)(unsigned, int, unsigned, int*);
+static gl_texlevel_t g_gltexlevel = nullptr;
+static int g_hm_state = 0;            // 0 belum, 1 siap dipakai, -1 mati
+static unsigned g_hm_prog = 0, g_hm_tex = 0, g_hm_fbo = 0, g_hm_dummy = 0;
+static int g_hmu_tex = -1, g_hmu_ts = -1, g_hmu_kc = -1;
+static bool g_hm_ready = false;       // atlas tinggi sudah dibuat dan sah
+static unsigned g_hm_frame = 0xFFFFFFFFu;
+static int g_hm_cid = 0, g_hm_cw = 0, g_hm_ch = 0, g_hm_stable = 0, g_hm_tries = 0;   // atlas yang sedang diamati
+static unsigned g_hm_cgen = 0;
+static int g_hm_bid = 0, g_hm_bw = 0, g_hm_bh = 0;                                     // atlas yang sudah di-bake
+static unsigned g_hm_bgen = 0;
+static bool g_hm_bound = false;
+static int g_hm_prev5 = 0, g_hm_prev_act = 0;
+
+static void hmap_init() {
+  g_hm_state = -1;
+  fx_cfg_load();
+  if (!g_hm_on) { sh_log("hmap: dimatikan lewat pengaturan (hmap=0)\n"); return; }
+  cap_init();
+  if (!g_gx_ok) gx_init();
+  if (!g_gx_ok || !f_geti || !f_getuloc) { sh_log("hmap: fungsi GL tidak lengkap\n"); return; }
+  clear_gl_errors();
+  unsigned vs = sh_compile(0x8B31, HM_VS), fs = sh_compile(0x8B30, HM_FS);
+  if (!vs || !fs) { sh_log("hmap: shader gagal dikompilasi, dimatikan\n"); return; }
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("hmap: link gagal: %s\n", buf); return; }
+  g_hm_prog = p;
+  g_hmu_tex = f_getuloc(p, "TEX"); g_hmu_ts = f_getuloc(p, "TS"); g_hmu_kc = f_getuloc(p, "KC");
+  void* L = glib();
+  if (L) g_gltexlevel = (gl_texlevel_t)dlsym(L, "glGetTexLevelParameteriv");
+  // tekstur 1x1 "kosong" (A = 0): terpasang selama atlas tinggi belum siap
+  int prev_act = 0x84C0, prev0 = 0;
+  f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C0); f_geti(0x8069, &prev0);
+  gx.GenTextures(1, &g_hm_dummy);
+  gx.BindTexture(0x0DE1, g_hm_dummy);
+  static const unsigned char zero4[4] = {0, 0, 0, 0};
+  gx.TexImage2D(0x0DE1, 0, 0x1908, 1, 1, 0, 0x1908, 0x1401, zero4);
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  gx.BindTexture(0x0DE1, (unsigned)prev0);
+  gx.ActiveTexture((unsigned)prev_act);
+  clear_gl_errors();
+  g_hm_state = 1;
+  sh_log("hmap: siap (kontras=%.2f dasar=%.2f, glGetTexLevelParameteriv=%d)\n", g_hm_contrast, g_hm_base, g_gltexlevel != nullptr);
+}
+
+static bool hmap_bake(int atlas, int w, int h) {
+  int mx = 2048; f_geti(0x0D33, &mx);   // GL_MAX_TEXTURE_SIZE
+  if (w > mx || h > mx || (long)w * (long)h > 4096L * 4096L) { sh_log("hmap: atlas %dx%d terlalu besar (maks tekstur %d)\n", w, h, mx); return false; }
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  clear_gl_errors();
+  gx.ActiveTexture(0x84C0);
+  if (!g_hm_tex) gx.GenTextures(1, &g_hm_tex);
+  gx.BindTexture(0x0DE1, g_hm_tex);
+  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2601); gx.TexParameteri(0x0DE1, 0x2800, 0x2601);   // LINEAR, tanpa mipmap (shader memakai LOD 0)
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  if (!g_hm_fbo) gx.GenFramebuffers(1, &g_hm_fbo);
+  gx.BindFramebuffer(0x8D40, g_hm_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_hm_tex, 0);
+  unsigned status = gx.CheckFramebufferStatus(0x8D40);
+  bool ok = (status == 0x8CD5) && gx.GetError() == 0;
+  if (ok) {
+    gx.Viewport(0, 0, w, h);
+    gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+    gx.ColorMask(1, 1, 1, 1);
+    gx.UseProgram(g_hm_prog);
+    gx.Uniform1i(g_hmu_tex, 0);
+    gx.Uniform2f(g_hmu_ts, 1.0f / (float)w, 1.0f / (float)h);
+    gx.Uniform2f(g_hmu_kc, g_hm_contrast, g_hm_base);
+    gx.ActiveTexture(0x84C0); gx.BindTexture(0x0DE1, (unsigned)atlas);
+    static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+    for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+    gx.BindBuffer(0x8892, 0);
+    gx.EnableVertexAttribArray(0);
+    gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+    gx.DrawArrays(4, 0, 3);
+  }
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  sh_log("hmap: bake atlas=%d %dx%d status=0x%x err=0x%x %.1f ms %s\n", atlas, w, h, status, err, (mono_sec() - t0) * 1000.0, (ok && err == 0) ? "OK" : "GAGAL");
+  return ok && err == 0;
+}
+
+// sekali per frame, di draw terrain pertama: kenali atlas, bake bila perlu, pasang tekstur di unit 5
+static void hmap_prepare_frame() {
+  g_hm_frame = g_frames;
+  if (g_hm_state == 0) hmap_init();
+  if (g_hm_state < 0) return;
+  int prev_act = 0x84C0; f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C0);
+  int atlas = 0; f_geti(0x8069, &atlas);
+  int w = 0, h = 0; unsigned gen = 0;
+  if (atlas > 0) {
+    for (int i = 0; i < g_ntexsz; i++) if (g_texsz[i].id == (unsigned)atlas) { w = g_texsz[i].w; h = g_texsz[i].h; gen = g_texsz[i].gen; break; }
+    if (w == 0 && g_gltexlevel) { g_gltexlevel(0x0DE1, 0, 0x1000, &w); g_gltexlevel(0x0DE1, 0, 0x1001, &h); gen = 1; if (w < 0 || h < 0) { w = 0; h = 0; } }
+  }
+  gx.ActiveTexture((unsigned)prev_act);
+  if (atlas > 0 && w > 0 && h > 0) {
+    if (atlas == g_hm_cid && w == g_hm_cw && h == g_hm_ch && gen == g_hm_cgen) { if (g_hm_stable < 1000000) g_hm_stable++; }
+    else { g_hm_cid = atlas; g_hm_cw = w; g_hm_ch = h; g_hm_cgen = gen; g_hm_stable = 0; g_hm_tries = 0; }
+    bool done = g_hm_ready && g_hm_bid == atlas && g_hm_bw == w && g_hm_bh == h && g_hm_bgen == gen;
+    if (!done && g_hm_stable >= 60 && g_hm_tries < 3) {   // atlas stabil 60 frame berturut-turut (game selesai memuat)
+      g_hm_tries++;
+      if (hmap_bake(atlas, w, h)) { g_hm_ready = true; g_hm_bid = atlas; g_hm_bw = w; g_hm_bh = h; g_hm_bgen = gen; }
+      else if (g_hm_tries >= 3) { g_hm_ready = false; sh_log("hmap: bake gagal 3 kali, shader memakai POM dari kecerahan tekstur\n"); }
+    }
+  } else if (g_hm_stable == 0 && g_hm_tries == 0 && g_frames % 600 == 0) {
+    sh_log("hmap: ukuran atlas belum diketahui (atlas=%d), menunggu\n", atlas);
+  }
+  if (!g_hm_bound) f_geti(0x84E0, &g_hm_prev_act);
+  gx.ActiveTexture(0x84C5);
+  if (!g_hm_bound) f_geti(0x8069, &g_hm_prev5);
+  gx.BindTexture(0x0DE1, g_hm_ready ? g_hm_tex : g_hm_dummy);
+  gx.ActiveTexture((unsigned)(g_hm_bound ? prev_act : g_hm_prev_act));
+  g_hm_bound = true;
+}
+static void hmap_pre(ProgStat* s) {
+  if (g_hm_state < 0 || s->loc_t5 < 0 || g_cur_fbo != 0) return;
+  if (g_hm_frame != g_frames) hmap_prepare_frame();
+  if (g_hm_state < 0 || !g_hm_bound) return;
+  if (!s->t5_set) { gx.Uniform1i(s->loc_t5, 5); s->t5_set = 1; }
+}
+static void hmap_end_frame() {
+  if (!g_hm_bound) return;
+  int act = 0x84C0; f_geti(0x84E0, &act);
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, (unsigned)g_hm_prev5);
+  gx.ActiveTexture((unsigned)act);
+  g_hm_bound = false;
+}
+
 static void spy_use_program(GLuint_t p) {
   g_cur_prog = p;
   if (p) {
@@ -2497,6 +2713,8 @@ static void spy_use_program(GLuint_t p) {
       s->loc_t3 = f_getuloc ? f_getuloc(p, "TEXTURE_3") : -1;     // data lampu obor (hanya ada di shader terrain)
       s->loc_t4 = f_getuloc ? f_getuloc(p, "TEXTURE_4") : -1;     // peta kedalaman obor
       s->t34_set = 0;
+      s->loc_t5 = f_getuloc ? f_getuloc(p, "TEXTURE_5") : -1;     // atlas tinggi untuk POM (hanya ada di shader terrain varian opaque)
+      s->t5_set = 0;
       if (s->kind == 2 && s->loc_world >= 0 && s->loc_wvp >= 0) s->kind = 3;   // program entity (mob, item, tangan): punya WORLD dan WORLDVIEWPROJ
     }
   }
@@ -2510,7 +2728,7 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     if (s->kind == 1) capture_draw(s, mode, count, type, idx);
   }
   bool u2 = false;
-  if (s->kind == 1) { u2 = terrain_draw(s, count, type, idx); torch_pre(s); }
+  if (s->kind == 1) { u2 = terrain_draw(s, count, type, idx); torch_pre(s); hmap_pre(s); }
   else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
   else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
   bool wblend = false;
@@ -2636,6 +2854,7 @@ static unsigned spy_swap(void* dpy, void* surf) {
     g_fbo_binds = 0; g_vp_calls = 0;
     for (int i = 0; i < g_nvp; i++) g_vp_n[i] = 0;
   }
+  hmap_end_frame();
   shadow_end_frame();
   return o_swap(dpy, surf);
 }
@@ -2644,6 +2863,7 @@ struct GotHook { const char* name; void* hook; void** orig; bool found; };
 static GotHook g_got_hooks[] = {
   {"glUseProgram", (void*)spy_use_program, (void**)&o_useprog, false},
   {"glDrawElements", (void*)spy_draw_elements, (void**)&o_drawel, false},
+  {"glTexImage2D", (void*)spy_tex_image, (void**)&o_teximage, false},
   {"glDrawArrays", (void*)spy_draw_arrays, (void**)&o_drawar, false},
   {"glBindFramebuffer", (void*)spy_bind_fb, (void**)&o_bindfb, false},
   {"glViewport", (void*)spy_viewport, (void**)&o_viewport, false},
