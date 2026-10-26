@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + BLOOM (v18): cahaya menyebar di benda terang (matahari, lava, glowstone, obor). Pass pasca-proses di resolusi 1/4 dan 1/8, dipicu sesudah langit digambar; pengaturan: pipe3d_fx.txt (bloom=...).
 // + HEIGHTMAP POM (v17): atlas tinggi dibuat saat game jalan dari atlas terrain asli (dihaluskan, relatif terhadap sekitarnya) dan dipasang di TEXTURE_5 untuk POM di shader; pengaturan: pipe3d_fx.txt (hmap=...). Kalau gagal, shader memakai POM dari kecerahan tekstur.
 // + SSR (v16): pantulan layar di lantai basah saat hujan (ssr=1, ssr_always=1 untuk selalu aktif).
 // + BAYANGAN OBOR + SINAR VOLUMETRIK (v15): lampu terdekat membuat peta kedalaman sendiri (TEXTURE_3 dan TEXTURE_4 di shader terrain); sinar volumetrik di piksel langit lewat program milik pipe3d; pengaturan: pipe3d_fx.txt.
@@ -808,6 +809,8 @@ static float g_vol_k = 1.0f;
 static int g_fx_cfg_done = 0;
 static int g_ssr_on = 1, g_ssr_always = 0;
 static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
+static int g_bl_on = 1, g_bl_when = 0;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama
+static float g_bl_k = 0.8f, g_bl_thr = 0.80f;             // kekuatan dan ambang kecerahan bloom
 static int g_hm_on = 1;                                   // heightmap POM (TEXTURE_5)
 static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
 #define TL_MAX 24
@@ -1825,6 +1828,10 @@ static void fx_cfg_load() {
     else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
     else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
     else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "bloom=%d", &iv) == 1) g_bl_on = iv;
+    else if (sscanf(line, "bloom_strength=%f", &fv) == 1) g_bl_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
+    else if (sscanf(line, "bloom_threshold=%f", &fv) == 1) g_bl_thr = (fv < 0.5f) ? 0.5f : (fv > 0.98f ? 0.98f : fv);
+    else if (sscanf(line, "bloom_when=%d", &iv) == 1) g_bl_when = (iv != 0) ? 1 : 0;
     else if (sscanf(line, "hmap=%d", &iv) == 1) g_hm_on = iv;
     else if (sscanf(line, "hmap_contrast=%f", &fv) == 1) g_hm_contrast = (fv < 0.5f) ? 0.5f : (fv > 8.0f ? 8.0f : fv);
     else if (sscanf(line, "hmap_base=%f", &fv) == 1) g_hm_base = (fv < 0.4f) ? 0.4f : (fv > 1.0f ? 1.0f : fv);
@@ -2482,6 +2489,223 @@ static void ssr_pass() {
   }
 }
 
+// ===================== BLOOM =====================
+// Alur (semua milik pipe3d, tidak ada uniform/sampler baru di shader game):
+//  1. Layar disalin ke tekstur penuh (A).
+//  2. Bagian terang (di atas ambang, dengan transisi halus) diambil sambil diperkecil 1/4 (B1), lalu diburamkan mendatar dan tegak (B2 -> B1).
+//  3. B1 diperkecil lagi jadi 1/8 (D1) dan diburamkan juga (D2 -> D1) untuk cahaya yang lebih lebar.
+//  4. B1 dan D1 ditambahkan ke layar (blend penjumlahan), jadi bloom hanya bisa menambah cahaya.
+// Dipicu sekali per frame sesudah langit tergambar (sama dengan SSR), atau (bloom_when=1) tepat sebelum draw transparan pertama.
+static int g_bl_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_bl_fbo = 0, g_bl_a = 0, g_bl_b1 = 0, g_bl_b2 = 0, g_bl_d1 = 0, g_bl_d2 = 0;
+static int g_bl_vw = 0, g_bl_vh = 0, g_bl_bw = 0, g_bl_bh = 0, g_bl_dw = 0, g_bl_dh = 0;
+static unsigned g_bl_prog[4] = {0, 0, 0, 0};   // 0 ambil bagian terang, 1 blur, 2 perkecil, 3 gabung ke layar
+static int g_blu_tex[4] = {-1, -1, -1, -1}, g_blu_ts[4] = {-1, -1, -1, -1}, g_blu_pa[4] = {-1, -1, -1, -1}, g_blu_tex2 = -1;
+static unsigned g_bl_frame = 0xFFFFFFFFu, g_bl_n = 0, g_bl_logs = 0;
+static bool g_bl_checked = false;
+static double g_bl_ms = 0;
+
+static const char* BL_VS =
+  "attribute vec2 P;\n"
+  "varying vec2 uv;\n"
+  "void main() {\n"
+  "  gl_Position = vec4(P, 0.0, 1.0);\n"
+  "  uv = P * 0.5 + 0.5;\n"
+  "}\n";
+#define BL_FS_HEAD \
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" \
+  "precision highp float;\n" \
+  "#else\n" \
+  "precision mediump float;\n" \
+  "#endif\n" \
+  "varying vec2 uv;\n" \
+  "uniform sampler2D TEX;\n" \
+  "uniform vec2 TS;\n" \
+  "uniform vec4 PA;\n"
+static const char* BL_FS_BRIGHT =
+  BL_FS_HEAD
+  "vec3 tap(vec2 o) {\n"
+  "  vec3 c = texture2D(TEX, uv + o * TS).rgb;\n"
+  "  float br = max(c.r, max(c.g, c.b));\n"
+  "  return c * smoothstep(PA.x, 1.0, br);\n"
+  "}\n"
+  "void main() {\n"
+  "  vec3 s = tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0));\n"
+  "  gl_FragColor = vec4(s * 0.25, 1.0);\n"
+  "}\n";
+static const char* BL_FS_BLUR =
+  BL_FS_HEAD
+  "void main() {\n"
+  "  vec2 d = PA.xy * TS * PA.z;\n"
+  "  vec3 c = texture2D(TEX, uv).rgb * 0.227027;\n"
+  "  c += (texture2D(TEX, uv + d).rgb + texture2D(TEX, uv - d).rgb) * 0.1945946;\n"
+  "  c += (texture2D(TEX, uv + d * 2.0).rgb + texture2D(TEX, uv - d * 2.0).rgb) * 0.1216216;\n"
+  "  c += (texture2D(TEX, uv + d * 3.0).rgb + texture2D(TEX, uv - d * 3.0).rgb) * 0.054054;\n"
+  "  c += (texture2D(TEX, uv + d * 4.0).rgb + texture2D(TEX, uv - d * 4.0).rgb) * 0.016216;\n"
+  "  gl_FragColor = vec4(c, 1.0);\n"
+  "}\n";
+static const char* BL_FS_DOWN =
+  BL_FS_HEAD
+  "void main() {\n"
+  "  vec3 c = texture2D(TEX, uv + vec2(-0.5, -0.5) * TS).rgb + texture2D(TEX, uv + vec2(0.5, -0.5) * TS).rgb\n"
+  "         + texture2D(TEX, uv + vec2(-0.5, 0.5) * TS).rgb + texture2D(TEX, uv + vec2(0.5, 0.5) * TS).rgb;\n"
+  "  gl_FragColor = vec4(c * 0.25, 1.0);\n"
+  "}\n";
+static const char* BL_FS_COMP =
+  BL_FS_HEAD
+  "uniform sampler2D TEX2;\n"
+  "void main() {\n"
+  "  vec3 b = texture2D(TEX, uv).rgb * PA.y + texture2D(TEX2, uv).rgb * PA.z;\n"
+  "  gl_FragColor = vec4(b * PA.x, 0.0);\n"
+  "}\n";
+
+static bool bl_make_prog(int i, const char* fs_src) {
+  unsigned vs = sh_compile(0x8B31, BL_VS), fs = sh_compile(0x8B30, fs_src);
+  if (!vs || !fs) return false;
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("bloom: link gagal (program %d): %s\n", i, buf); return false; }
+  g_bl_prog[i] = p;
+  g_blu_tex[i] = f_getuloc(p, "TEX"); g_blu_ts[i] = f_getuloc(p, "TS"); g_blu_pa[i] = f_getuloc(p, "PA");
+  if (i == 3) g_blu_tex2 = f_getuloc(p, "TEX2");
+  return true;
+}
+
+static bool bloom_init() {
+  g_bl_state = -1;
+  fx_cfg_load();
+  if (!g_bl_on) { sh_log("bloom: dimatikan lewat pengaturan (bloom=0)\n"); return false; }
+  cap_init();
+  if (!g_gx_ok) gx_init();
+  if (!g_gx_ok || !f_geti || !f_getuloc) { sh_log("bloom: fungsi GL tidak lengkap\n"); return false; }
+  clear_gl_errors();
+  if (!bl_make_prog(0, BL_FS_BRIGHT) || !bl_make_prog(1, BL_FS_BLUR) || !bl_make_prog(2, BL_FS_DOWN) || !bl_make_prog(3, BL_FS_COMP)) {
+    sh_log("bloom: shader gagal dibuat, dimatikan\n");
+    return false;
+  }
+  gx.GenFramebuffers(1, &g_bl_fbo);
+  g_bl_state = 1;
+  sh_log("bloom: siap (kekuatan=%.2f ambang=%.2f pemicu=%d)\n", g_bl_k, g_bl_thr, g_bl_when);
+  return true;
+}
+
+static void bl_tex_alloc(unsigned* tex, int w, int h) {
+  if (!*tex) gx.GenTextures(1, tex);
+  gx.BindTexture(0x0DE1, *tex);
+  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
+  gx.TexParameteri(0x0DE1, 0x2801, 0x2601); gx.TexParameteri(0x0DE1, 0x2800, 0x2601);
+  gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+}
+static bool bloom_resources(int w, int h) {
+  if (g_bl_vw == w && g_bl_vh == h) return true;
+  int prev_act = 0x84C0, prev7 = 0;
+  f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  g_bl_vw = w; g_bl_vh = h;
+  g_bl_bw = w / 4 < 16 ? 16 : w / 4; g_bl_bh = h / 4 < 16 ? 16 : h / 4;
+  g_bl_dw = w / 8 < 8 ? 8 : w / 8;   g_bl_dh = h / 8 < 8 ? 8 : h / 8;
+  clear_gl_errors();
+  bl_tex_alloc(&g_bl_a, w, h);
+  bl_tex_alloc(&g_bl_b1, g_bl_bw, g_bl_bh); bl_tex_alloc(&g_bl_b2, g_bl_bw, g_bl_bh);
+  bl_tex_alloc(&g_bl_d1, g_bl_dw, g_bl_dh); bl_tex_alloc(&g_bl_d2, g_bl_dw, g_bl_dh);
+  gx.BindTexture(0x0DE1, (unsigned)prev7);
+  gx.ActiveTexture((unsigned)prev_act);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  sh_log("bloom: tekstur dibuat layar=%dx%d 1/4=%dx%d 1/8=%dx%d err=0x%x\n", w, h, g_bl_bw, g_bl_bh, g_bl_dw, g_bl_dh, err);
+  if (err != 0) { g_bl_state = -1; return false; }
+  return true;
+}
+
+// satu pass layar penuh: src (unit 7) -> dst, ukuran sumber dipakai untuk TS
+static void bl_run(int pi, unsigned dst, int dw, int dh, unsigned src, int sw, int sh_, float a, float b, float c, float d) {
+  gx.UseProgram(g_bl_prog[pi]);
+  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, dst, 0);
+  gx.Viewport(0, 0, dw, dh);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, src);
+  gx.Uniform1i(g_blu_tex[pi], 7);
+  if (g_blu_ts[pi] >= 0) gx.Uniform2f(g_blu_ts[pi], 1.0f / (float)sw, 1.0f / (float)sh_);
+  if (g_blu_pa[pi] >= 0) gx.Uniform4f(g_blu_pa[pi], a, b, c, d);
+  gx.DrawArrays(4, 0, 3);
+}
+
+static void bloom_pass() {
+  if (!g_bl_on || g_bl_state < 0 || !g_gx_ok || g_cur_fbo != 0 || g_bl_frame == g_frames || g_tframe != g_frames) return;
+  g_bl_frame = g_frames;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_bl_state == 0 && !bloom_init()) return;
+  if (!bloom_resources(vp[2], vp[3])) return;
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  // 1. salin layar (framebuffer baca masih milik game)
+  gx.BindTexture(0x0DE1, g_bl_a);
+  gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  // 2. pass kecil ke tekstur sendiri
+  gx.BindFramebuffer(0x8D40, g_bl_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_bl_b1, 0);
+  if (!g_bl_checked) {
+    g_bl_checked = true;
+    unsigned status = gx.CheckFramebufferStatus(0x8D40);
+    if (status != 0x8CD5) {
+      sh_log("bloom: framebuffer tidak lengkap (0x%x), dimatikan\n", status);
+      g_bl_state = -1;
+      gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+      gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+      restore_state(&st);
+      clear_gl_errors();
+      return;
+    }
+  }
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+  gx.DepthMask(0); gx.ColorMask(1, 1, 1, 1);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  bl_run(0, g_bl_b1, g_bl_bw, g_bl_bh, g_bl_a, g_bl_vw, g_bl_vh, g_bl_thr, 0, 0, 0);          // bagian terang, 1/4
+  bl_run(1, g_bl_b2, g_bl_bw, g_bl_bh, g_bl_b1, g_bl_bw, g_bl_bh, 1.0f, 0.0f, 1.6f, 0);       // blur mendatar
+  bl_run(1, g_bl_b1, g_bl_bw, g_bl_bh, g_bl_b2, g_bl_bw, g_bl_bh, 0.0f, 1.0f, 1.6f, 0);       // blur tegak
+  bl_run(2, g_bl_d1, g_bl_dw, g_bl_dh, g_bl_b1, g_bl_bw, g_bl_bh, 0, 0, 0, 0);                // perkecil ke 1/8
+  bl_run(1, g_bl_d2, g_bl_dw, g_bl_dh, g_bl_d1, g_bl_dw, g_bl_dh, 1.0f, 0.0f, 1.8f, 0);
+  bl_run(1, g_bl_d1, g_bl_dw, g_bl_dh, g_bl_d2, g_bl_dw, g_bl_dh, 0.0f, 1.0f, 1.8f, 0);
+  // 3. tambahkan ke layar
+  gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+  gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+  gx.ColorMask(1, 1, 1, 0);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(1, 1, 0, 1);   // ONE, ONE: hanya menambah cahaya
+  gx.UseProgram(g_bl_prog[3]);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, g_bl_d1);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_bl_b1);
+  gx.Uniform1i(g_blu_tex[3], 7);
+  if (g_blu_tex2 >= 0) gx.Uniform1i(g_blu_tex2, 6);
+  if (g_blu_pa[3] >= 0) gx.Uniform4f(g_blu_pa[3], g_bl_k, 0.7f, 0.8f, 0.0f);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_bl_n++; g_bl_ms += (mono_sec() - t0) * 1000.0;
+  if (g_bl_logs < 3) {
+    g_bl_logs++;
+    sh_log("bloom: pass frame %u err=0x%x\n", g_frames, err);
+  } else if (g_frames % 900 == 0 && g_bl_logs < 12) {
+    g_bl_logs++;
+    sh_log("bloom: frame %u pass=%u ms/pass=%.2f\n", g_frames, g_bl_n, g_bl_n ? g_bl_ms / g_bl_n : 0.0);
+    g_bl_n = 0; g_bl_ms = 0;
+  }
+}
+
 // ===================== HEIGHTMAP POM (TEXTURE_5) =====================
 // Atlas terrain dirakit game saat dijalankan (dari terrain_texture.json), jadi tidak ada file atlas jadi untuk diolah dari luar.
 // Karena itu atlas tinggi dibuat di sini, di GPU, sekali saja setelah atlas stabil: tiap texel diberi tinggi dari kecerahan yang
@@ -2731,6 +2955,7 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
   if (s->kind == 1) { u2 = terrain_draw(s, count, type, idx); torch_pre(s); hmap_pre(s); }
   else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
   else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
+  if (g_bl_when == 1 && g_bl_on && s->kind == 1 && g_cur_fbo == 0 && g_bl_frame != g_frames && g_tframe == g_frames && f_isen && f_isen(0x0BE2)) bloom_pass();
   bool wblend = false;
   if (s->kind == 1 && g_w_stage >= 1 && g_cur_fbo == 0 && g_tframe == g_frames && f_isen && f_isen(0x0BE2)) {
     wblend = true;   // draw blend (air): buat pantulan sekali per frame sebelum draw bawaan
@@ -2743,6 +2968,7 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     fx_cfg_load();
     ssr_pass();
     vol_pass();
+    if (g_bl_when == 0) bloom_pass();
   }
   if (u2) terrain_draw_post();
   if (wblend && g_w_ready) water_overlay(s, count, type, idx);
