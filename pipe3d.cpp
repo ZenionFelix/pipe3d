@@ -477,6 +477,7 @@ static void capture_other(ProgStat* s, unsigned mode, int count, bool detail) {
 #define GLX_LIST(X) \
   X(void, GenFramebuffers, (int, unsigned*)) \
   X(void, CopyTexSubImage2D, (unsigned, int, int, int, int, int, int, int)) \
+  X(void, ReadPixels, (int, int, int, int, unsigned, unsigned, void*)) \
   X(void, BindFramebuffer, (unsigned, unsigned)) \
   X(void, FramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int)) \
   X(unsigned, CheckFramebufferStatus, (unsigned)) \
@@ -2371,6 +2372,38 @@ static bool ssr_init() {
   return true;
 }
 
+// Tekstur tujuan CopyTexSubImage2D tidak boleh punya komponen yang tidak ada di framebuffer: framebuffer tanpa alpha + tekstur RGBA
+// = INVALID_OPERATION dan isi salinan kosong (hitam). Karena itu format salinan mengikuti jumlah bit alpha framebuffer.
+static int g_fb_alpha = -1;
+static unsigned copy_fmt() {
+  if (g_fb_alpha < 0) {
+    int bits = 0;
+    if (f_geti) f_geti(0x0D55, &bits);   // GL_ALPHA_BITS
+    if (g_cur_fbo != 0) return bits >= 8 ? 0x1908u : 0x1907u;   // jangan simpan hasil dari framebuffer lain
+    g_fb_alpha = bits;
+    sh_log("fb: alpha_bits=%d, format salinan layar=%s\n", bits, bits >= 8 ? "RGBA" : "RGB");
+  }
+  return g_fb_alpha >= 8 ? 0x1908u : 0x1907u;
+}
+// Bandingkan piksel tengah layar dengan piksel tengah tekstur salinan (dibaca lewat FBO sementara).
+// 1 = cocok, 0 = salinan rusak (layar tidak hitam tapi salinan hitam), -1 = belum bisa dipastikan. Framebuffer baca harus framebuffer layar.
+static unsigned g_cc_fbo = 0;
+static int copy_check(unsigned tex, const int vp[4]) {
+  unsigned char a[4] = {0, 0, 0, 0}, b[4] = {0, 0, 0, 0};
+  gx.ReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, 0x1908, 0x1401, a);
+  if (!g_cc_fbo) gx.GenFramebuffers(1, &g_cc_fbo);
+  gx.BindFramebuffer(0x8D40, g_cc_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, tex, 0);
+  int r = -1;
+  if (gx.CheckFramebufferStatus(0x8D40) == 0x8CD5) {
+    gx.ReadPixels(vp[2] / 2, vp[3] / 2, 1, 1, 0x1908, 0x1401, b);
+    int sa = a[0] + a[1] + a[2], sb = b[0] + b[1] + b[2];
+    if (sa > 48) r = (sb * 2 > sa) ? 1 : 0;
+  }
+  clear_gl_errors();
+  return r;
+}
+
 // tekstur kedalaman setengah resolusi + framebuffer, dan tekstur warna ukuran layar; dibuat ulang kalau ukuran berubah
 static bool ssr_resources(int w, int h) {
   int dw = (int)(w * g_ssr_scale), dh = (int)(h * g_ssr_scale);
@@ -2403,7 +2436,7 @@ static bool ssr_resources(int w, int h) {
   }
   gx.BindFramebuffer(0x8D40, (unsigned)prev_fbo);
   gx.BindTexture(0x0DE1, g_ssr_ctex);
-  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
+  { unsigned cf = copy_fmt(); gx.TexImage2D(0x0DE1, 0, (int)cf, w, h, 0, cf, 0x1401, nullptr); }
   gx.TexParameteri(0x0DE1, 0x2801, 0x2601); gx.TexParameteri(0x0DE1, 0x2800, 0x2601);
   gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
   gx.BindTexture(0x0DE1, (unsigned)prev_tex);
@@ -2619,10 +2652,10 @@ static bool bloom_init() {
   return true;
 }
 
-static void bl_tex_alloc(unsigned* tex, int w, int h) {
+static void bl_tex_alloc(unsigned* tex, int w, int h, unsigned fmt = 0x1908) {
   if (!*tex) gx.GenTextures(1, tex);
   gx.BindTexture(0x0DE1, *tex);
-  gx.TexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, nullptr);
+  gx.TexImage2D(0x0DE1, 0, (int)fmt, w, h, 0, fmt, 0x1401, nullptr);
   gx.TexParameteri(0x0DE1, 0x2801, 0x2601); gx.TexParameteri(0x0DE1, 0x2800, 0x2601);
   gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
 }
@@ -2635,7 +2668,7 @@ static bool bloom_resources(int w, int h) {
   g_bl_bw = w / 4 < 16 ? 16 : w / 4; g_bl_bh = h / 4 < 16 ? 16 : h / 4;
   g_bl_dw = w / 8 < 8 ? 8 : w / 8;   g_bl_dh = h / 8 < 8 ? 8 : h / 8;
   clear_gl_errors();
-  bl_tex_alloc(&g_bl_a, w, h);
+  bl_tex_alloc(&g_bl_a, w, h, copy_fmt());
   bl_tex_alloc(&g_bl_b1, g_bl_bw, g_bl_bh); bl_tex_alloc(&g_bl_b2, g_bl_bw, g_bl_bh);
   bl_tex_alloc(&g_bl_d1, g_bl_dw, g_bl_dh); bl_tex_alloc(&g_bl_d2, g_bl_dw, g_bl_dh);
   gx.BindTexture(0x0DE1, (unsigned)prev7);
@@ -2675,7 +2708,18 @@ static void bloom_pass() {
   gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
   // 1. salin layar (framebuffer baca masih milik game)
   gx.BindTexture(0x0DE1, g_bl_a);
+  clear_gl_errors();
   gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  { unsigned cerr = gx.GetError();
+    if (cerr != 0) {
+      sh_log("bloom: salin layar gagal (err=0x%x), dimatikan\n", cerr);
+      g_bl_state = -1;
+      gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+      gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+      restore_state(&st);
+      clear_gl_errors();
+      return;
+    } }
   // 2. pass kecil ke tekstur sendiri
   gx.BindFramebuffer(0x8D40, g_bl_fbo);
   gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_bl_b1, 0);
@@ -2797,6 +2841,7 @@ static const char* AO_FS =
   "  }\n"
   "  occ = occ / 12.0;\n"
   "  float ao = 1.0 - clamp(occ * AP.y * 2.2, 0.0, 0.85) * fade;\n"
+  "  ao = clamp(ao, 0.15, 1.0);\n"
   "  gl_FragColor = vec4(vec3(ao), 1.0);\n"
   "}\n";
 
@@ -2877,7 +2922,7 @@ static void ssao_pass() {
 // pernah berhasil dalam 180 frame terrain, grading dijalankan di akhir frame (GUI ikut terkena) dan hal ini dicatat di log.
 static int g_gr_state = 0;   // 0 belum, 1 siap, -1 gagal
 static unsigned g_gr_prog = 0, g_gr_tex = 0;
-static int g_gr_vw = 0, g_gr_vh = 0;
+static int g_gr_vw = 0, g_gr_vh = 0, g_gr_ok = 0, g_gr_tests = 0;   // g_gr_ok: berapa kali salinan terbukti cocok; g_gr_tests: jumlah pemeriksaan
 static int g_gru_tex = -1, g_gru_g1 = -1, g_gru_g2 = -1;
 static unsigned g_gr_frame = 0xFFFFFFFFu, g_gr_n = 0, g_gr_logs = 0;
 static double g_gr_ms = 0;
@@ -2954,14 +2999,29 @@ static void grade_pass() {
   if (!g_gr_tex) gx.GenTextures(1, &g_gr_tex);
   gx.BindTexture(0x0DE1, g_gr_tex);
   if (g_gr_vw != vp[2] || g_gr_vh != vp[3]) {
-    gx.TexImage2D(0x0DE1, 0, 0x1908, vp[2], vp[3], 0, 0x1908, 0x1401, nullptr);
+    unsigned cf = copy_fmt();
+    gx.TexImage2D(0x0DE1, 0, (int)cf, vp[2], vp[3], 0, cf, 0x1401, nullptr);
     gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
     gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
     g_gr_vw = vp[2]; g_gr_vh = vp[3];
+    g_gr_ok = 0;
     sh_log("grade: tekstur salinan %dx%d err=0x%x\n", vp[2], vp[3], gx.GetError());
     clear_gl_errors();
   }
   gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  unsigned cerr = gx.GetError();
+  int chk = -1;
+  if (cerr == 0 && g_gr_ok < 3 && g_gr_tests < 240) { g_gr_tests++; chk = copy_check(g_gr_tex, vp); gx.BindFramebuffer(0x8D40, (unsigned)st.fbo); }
+  if (cerr != 0 || chk == 0) {
+    // salinan layar tidak sah: JANGAN menggambar apa pun (kalau digambar, dunia jadi hitam)
+    sh_log("grade: salinan layar tidak sah (err=0x%x cek=%d), grading dimatikan agar layar tidak hitam\n", cerr, chk);
+    g_gr_state = -1;
+    gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+    restore_state(&st);
+    clear_gl_errors();
+    return;
+  }
+  if (chk == 1) g_gr_ok++;
   gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
   gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
   gx.UseProgram(g_gr_prog);
