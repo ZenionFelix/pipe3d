@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// CATATAN v21: bloom, SSAO, SSGI, dan tonemapping/grading MATI secara bawaan (nilai bawaan 0 di kode dan di pipe3d_fx.txt); nyalakan satu per satu dengan bloom=1, ssao=1, ssgi=1, grade=1.
 // + SSGI (v20): pantulan cahaya tidak langsung di ruang layar (warna dari permukaan terang menyebar ke sekitarnya), dibersihkan dengan blur sadar-kedalaman; pengaturan: pipe3d_fx.txt (ssgi=...).
 // + SSAO + TONEMAPPING/COLOR GRADING (v19): SSAO memakai ulang peta kedalaman SSR; tonemapping dan grading dijalankan sekali di akhir adegan 3D (sebelum GUI, dideteksi dari draw pertama dengan proyeksi ortografis); pengaturan: pipe3d_fx.txt (ssao=..., grade=...).
 // + BLOOM (v18): cahaya menyebar di benda terang (matahari, lava, glowstone, obor). Pass pasca-proses di resolusi 1/4 dan 1/8, dipicu sesudah langit digambar; pengaturan: pipe3d_fx.txt (bloom=...).
@@ -812,13 +813,13 @@ static float g_vol_k = 1.0f;
 static int g_fx_cfg_done = 0;
 static int g_ssr_on = 1, g_ssr_always = 0;
 static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
-static int g_bl_on = 1, g_bl_when = 2;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama, 2 = di akhir adegan 3D (otomatis, sebelum GUI)
+static int g_bl_on = 0, g_bl_when = 2;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama, 2 = di akhir adegan 3D (otomatis, sebelum GUI)
 static float g_bl_k = 0.7f, g_bl_thr = 0.80f, g_bl_sky = 0.15f;   // kekuatan, ambang, dan faktor bloom di langit/awan (inti matahari tetap penuh)             // kekuatan dan ambang kecerahan bloom
-static int g_gi_on = 1, g_gi_rays = 6;                    // SSGI: jumlah sinar per piksel (2 sampai 16)
+static int g_gi_on = 0, g_gi_rays = 6;                    // SSGI: jumlah sinar per piksel (2 sampai 16)
 static float g_gi_k = 0.6f, g_gi_r = 10.0f, g_gi_scale = 0.5f;   // kekuatan, jangkauan (blok), skala resolusi terhadap layar
-static int g_ao_on = 1;                                   // SSAO
+static int g_ao_on = 0;                                   // SSAO (mati secara bawaan; ssao=1 di pipe3d_fx.txt untuk menyalakan)
 static float g_ao_k = 0.8f, g_ao_r = 0.8f, g_ao_bias = 0.12f;
-static int g_gr_on = 1, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
+static int g_gr_on = 0, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
 static float g_gr_exp = 1.10f, g_gr_tone = 0.60f, g_gr_sat = 1.10f, g_gr_con = 1.05f, g_gr_warm = 0.05f, g_gr_vig = 0.25f;
 static int g_hm_on = 1;                                   // heightmap POM (TEXTURE_5)
 static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
