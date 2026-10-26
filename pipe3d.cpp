@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + SSAO + TONEMAPPING/COLOR GRADING (v19): SSAO memakai ulang peta kedalaman SSR; tonemapping dan grading dijalankan sekali di akhir adegan 3D (sebelum GUI, dideteksi dari draw pertama dengan proyeksi ortografis); pengaturan: pipe3d_fx.txt (ssao=..., grade=...).
 // + BLOOM (v18): cahaya menyebar di benda terang (matahari, lava, glowstone, obor). Pass pasca-proses di resolusi 1/4 dan 1/8, dipicu sesudah langit digambar; pengaturan: pipe3d_fx.txt (bloom=...).
 // + HEIGHTMAP POM (v17): atlas tinggi dibuat saat game jalan dari atlas terrain asli (dihaluskan, relatif terhadap sekitarnya) dan dipasang di TEXTURE_5 untuk POM di shader; pengaturan: pipe3d_fx.txt (hmap=...). Kalau gagal, shader memakai POM dari kecerahan tekstur.
 // + SSR (v16): pantulan layar di lantai basah saat hujan (ssr=1, ssr_always=1 untuk selalu aktif).
@@ -809,8 +810,12 @@ static float g_vol_k = 1.0f;
 static int g_fx_cfg_done = 0;
 static int g_ssr_on = 1, g_ssr_always = 0;
 static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
-static int g_bl_on = 1, g_bl_when = 0;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama
+static int g_bl_on = 1, g_bl_when = 2;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama, 2 = di akhir adegan 3D (otomatis, sebelum GUI)
 static float g_bl_k = 0.8f, g_bl_thr = 0.80f;             // kekuatan dan ambang kecerahan bloom
+static int g_ao_on = 1;                                   // SSAO
+static float g_ao_k = 0.8f, g_ao_r = 0.8f, g_ao_bias = 0.12f;
+static int g_gr_on = 1, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
+static float g_gr_exp = 1.10f, g_gr_tone = 0.60f, g_gr_sat = 1.10f, g_gr_con = 1.05f, g_gr_warm = 0.05f, g_gr_vig = 0.25f;
 static int g_hm_on = 1;                                   // heightmap POM (TEXTURE_5)
 static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
 #define TL_MAX 24
@@ -1828,10 +1833,22 @@ static void fx_cfg_load() {
     else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
     else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
     else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "ssao=%d", &iv) == 1) g_ao_on = iv;
+    else if (sscanf(line, "ssao_strength=%f", &fv) == 1) g_ao_k = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "ssao_radius=%f", &fv) == 1) g_ao_r = (fv < 0.2f) ? 0.2f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "ssao_bias=%f", &fv) == 1) g_ao_bias = (fv < 0.0f) ? 0.0f : (fv > 0.5f ? 0.5f : fv);
+    else if (sscanf(line, "grade=%d", &iv) == 1) g_gr_on = iv;
+    else if (sscanf(line, "grade_when=%d", &iv) == 1) g_gr_when = (iv != 0) ? 1 : 0;
+    else if (sscanf(line, "grade_exposure=%f", &fv) == 1) g_gr_exp = (fv < 0.5f) ? 0.5f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "grade_tonemap=%f", &fv) == 1) g_gr_tone = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "grade_saturation=%f", &fv) == 1) g_gr_sat = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "grade_contrast=%f", &fv) == 1) g_gr_con = (fv < 0.5f) ? 0.5f : (fv > 1.5f ? 1.5f : fv);
+    else if (sscanf(line, "grade_warmth=%f", &fv) == 1) g_gr_warm = (fv < -1.0f) ? -1.0f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "grade_vignette=%f", &fv) == 1) g_gr_vig = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
     else if (sscanf(line, "bloom=%d", &iv) == 1) g_bl_on = iv;
     else if (sscanf(line, "bloom_strength=%f", &fv) == 1) g_bl_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
     else if (sscanf(line, "bloom_threshold=%f", &fv) == 1) g_bl_thr = (fv < 0.5f) ? 0.5f : (fv > 0.98f ? 0.98f : fv);
-    else if (sscanf(line, "bloom_when=%d", &iv) == 1) g_bl_when = (iv != 0) ? 1 : 0;
+    else if (sscanf(line, "bloom_when=%d", &iv) == 1) g_bl_when = (iv < 0) ? 0 : (iv > 2 ? 2 : iv);
     else if (sscanf(line, "hmap=%d", &iv) == 1) g_hm_on = iv;
     else if (sscanf(line, "hmap_contrast=%f", &fv) == 1) g_hm_contrast = (fv < 0.5f) ? 0.5f : (fv > 8.0f ? 8.0f : fv);
     else if (sscanf(line, "hmap_base=%f", &fv) == 1) g_hm_base = (fv < 0.4f) ? 0.4f : (fv > 1.0f ? 1.0f : fv);
@@ -2399,23 +2416,11 @@ static bool ssr_resources(int w, int h) {
   return true;
 }
 
-static void ssr_pass() {
-  if (!g_ssr_on || g_ssr_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0) return;
-  if (!g_ssr_always && !g_ssr_rain) return;
+// kedalaman terrain dari sudut pandang kamera ke tekstur setengah resolusi. Dipanggil di dalam save_state/restore_state milik pemanggil.
+// Dipakai bersama oleh SSR dan SSAO, jadi hanya digambar sekali per frame (g_dp_frame).
+static unsigned g_dp_frame = 0xFFFFFFFFu, g_dp_drawn = 0;
+static void ssr_depth_pass(const SavedState& st) {
   int cur = g_dcur, n = g_dn[cur];
-  if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
-  int vp[4] = {0, 0, 0, 0};
-  f_geti(0x0BA2, vp);
-  if (vp[2] < 64 || vp[3] < 64) return;
-  if (g_ssr_state == 0 && !ssr_init()) { sh_log("ssr: init gagal, dimatikan\n"); return; }
-  if (!ssr_resources(vp[2], vp[3])) return;
-  double t0 = mono_sec();
-  SavedState st;
-  save_state(&st);
-  int prev6 = 0, prev7 = 0;
-  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
-  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
-  // 1. kedalaman terrain dari sudut pandang kamera
   gx.BindFramebuffer(0x8D40, g_ssr_dfbo);
   gx.Viewport(0, 0, g_ssr_dw, g_ssr_dh);
   gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x8037);
@@ -2447,6 +2452,28 @@ static void ssr_pass() {
     gx.DrawElements(4, r.count, r.type, (const void*)r.idx);
     drawn++;
   }
+  g_dp_frame = g_frames; g_dp_drawn = drawn;
+}
+
+static void ssr_pass() {
+  if (!g_ssr_on || g_ssr_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0) return;
+  if (!g_ssr_always && !g_ssr_rain) return;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_ssr_state == 0 && !ssr_init()) { sh_log("ssr: init gagal, dimatikan\n"); return; }
+  if (!ssr_resources(vp[2], vp[3])) return;
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  // 1. kedalaman terrain dari sudut pandang kamera (dipakai bersama SSAO; hanya digambar sekali per frame)
+  if (g_dp_frame != g_frames) ssr_depth_pass(st);
+  unsigned drawn = g_dp_drawn;
   // 2. salin layar ke tekstur warna
   gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
   gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
@@ -2706,6 +2733,291 @@ static void bloom_pass() {
   }
 }
 
+// ===================== SSAO =====================
+// Memakai peta kedalaman setengah resolusi milik SSR (digambar sekali per frame, dibagi dengan SSR). Tiap piksel: normal dari kedalaman
+// tetangga, lalu 12 titik acak spiral di sekitarnya (radius dalam blok) dibandingkan; titik yang menonjol di atas permukaan menggelapkan.
+// Hasilnya (abu-abu) dikalikan ke layar (blend DST_COLOR, ZERO), jadi hanya bisa menggelapkan. Langit dan jarak jauh tidak terkena.
+static int g_ao_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_ao_prog = 0;
+static int g_aou_dep = -1, g_aou_prj = -1, g_aou_pz = -1, g_aou_tx = -1, g_aou_ap = -1;
+static unsigned g_ao_n = 0, g_ao_logs = 0;
+static double g_ao_ms = 0;
+static const char* AO_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 uv;\n"
+  "uniform sampler2D DEP;\n"
+  "uniform vec2 PRJ;\n"
+  "uniform vec2 PZ;\n"
+  "uniform vec2 TX;\n"
+  "uniform vec4 AP;\n"   // x = radius (blok), y = kekuatan, z = bias
+  "vec3 viewPos(vec2 c) {\n"
+  "  float d = texture2D(DEP, c).r;\n"
+  "  float z = -PZ.y / ((d * 2.0 - 1.0) + PZ.x);\n"
+  "  vec2 ndc = c * 2.0 - 1.0;\n"
+  "  return vec3(ndc.x * (-z) / PRJ.x, ndc.y * (-z) / PRJ.y, z);\n"
+  "}\n"
+  "void main() {\n"
+  "  float d0 = texture2D(DEP, uv).r;\n"
+  "  if (d0 > 0.99995) discard;\n"
+  "  vec3 p0 = viewPos(uv);\n"
+  "  float fade = 1.0 - smoothstep(24.0, 64.0, -p0.z);\n"
+  "  if (fade <= 0.0) discard;\n"
+  "  vec3 pr = viewPos(uv + vec2(TX.x, 0.0));\n"
+  "  vec3 pl = viewPos(uv - vec2(TX.x, 0.0));\n"
+  "  vec3 pu = viewPos(uv + vec2(0.0, TX.y));\n"
+  "  vec3 pd = viewPos(uv - vec2(0.0, TX.y));\n"
+  "  vec3 dx = (abs(pr.z - p0.z) < abs(pl.z - p0.z)) ? (pr - p0) : (p0 - pl);\n"
+  "  vec3 dy = (abs(pu.z - p0.z) < abs(pd.z - p0.z)) ? (pu - p0) : (p0 - pd);\n"
+  "  vec3 n = cross(dx, dy);\n"
+  "  float nl = length(n);\n"
+  "  if (nl < 1e-8) discard;\n"
+  "  n = n / nl;\n"
+  "  if (n.z < 0.0) n = -n;\n"
+  "  vec2 rad = vec2(AP.x * PRJ.x, AP.x * PRJ.y) / (-p0.z) * 0.5;\n"
+  "  rad = min(rad, vec2(0.07, 0.07));\n"
+  "  float occ = 0.0;\n"
+  "  for (int i = 0; i < 12; i++) {\n"
+  "    float fi = float(i);\n"
+  "    float a = fi * 2.3999632;\n"
+  "    float r = sqrt((fi + 0.5) / 12.0);\n"
+  "    vec2 suv = uv + vec2(cos(a), sin(a)) * r * rad;\n"
+  "    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;\n"
+  "    float ds = texture2D(DEP, suv).r;\n"
+  "    if (ds > 0.99995) continue;\n"
+  "    vec3 v = viewPos(suv) - p0;\n"
+  "    float dist = length(v);\n"
+  "    if (dist < 0.0001) continue;\n"
+  "    float nd = dot(n, v) / dist;\n"
+  "    float range = clamp(1.0 - dist / (AP.x * 1.8), 0.0, 1.0);\n"
+  "    occ += max(nd - AP.z, 0.0) * range;\n"
+  "  }\n"
+  "  occ = occ / 12.0;\n"
+  "  float ao = 1.0 - clamp(occ * AP.y * 2.2, 0.0, 0.85) * fade;\n"
+  "  gl_FragColor = vec4(vec3(ao), 1.0);\n"
+  "}\n";
+
+static bool ssao_init() {
+  g_ao_state = -1;
+  fx_cfg_load();
+  if (!g_ao_on) { sh_log("ssao: dimatikan lewat pengaturan (ssao=0)\n"); return false; }
+  clear_gl_errors();
+  unsigned vs = sh_compile(0x8B31, BL_VS), fs = sh_compile(0x8B30, AO_FS);
+  if (!vs || !fs) { sh_log("ssao: shader gagal dikompilasi, dimatikan\n"); return false; }
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("ssao: link gagal: %s\n", buf); return false; }
+  g_ao_prog = p;
+  g_aou_dep = f_getuloc(p, "DEP"); g_aou_prj = f_getuloc(p, "PRJ"); g_aou_pz = f_getuloc(p, "PZ"); g_aou_tx = f_getuloc(p, "TX"); g_aou_ap = f_getuloc(p, "AP");
+  g_ao_state = 1;
+  sh_log("ssao: siap (kekuatan=%.2f radius=%.2f bias=%.2f)\n", g_ao_k, g_ao_r, g_ao_bias);
+  return true;
+}
+
+static void ssao_pass() {
+  if (!g_ao_on || g_ao_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0 || g_tframe != g_frames) return;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f || g_atlas_tex <= 0) return;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_ssr_state == 0 && !ssr_init()) { sh_log("ssao: program kedalaman (milik SSR) gagal, dimatikan\n"); g_ao_state = -1; return; }
+  if (g_ssr_state < 0) { g_ao_state = -1; return; }
+  if (g_ao_state == 0 && !ssao_init()) return;
+  if (!ssr_resources(vp[2], vp[3])) { g_ao_state = -1; return; }
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev6 = 0;
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  if (g_dp_frame != g_frames) ssr_depth_pass(st);
+  gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+  gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+  gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(0x0306, 0, 0, 1);   // DST_COLOR, ZERO: hasil dikalikan ke layar
+  gx.UseProgram(g_ao_prog);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, g_ssr_dtex);
+  gx.Uniform1i(g_aou_dep, 6);
+  gx.Uniform2f(g_aou_prj, g_proj[0], g_proj[5]);
+  gx.Uniform2f(g_aou_pz, g_proj[10], g_proj[14]);
+  gx.Uniform2f(g_aou_tx, 1.0f / (float)g_ssr_dw, 1.0f / (float)g_ssr_dh);
+  gx.Uniform4f(g_aou_ap, g_ao_r, g_ao_k, g_ao_bias, 0.0f);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_ao_n++; g_ao_ms += (mono_sec() - t0) * 1000.0;
+  if (g_ao_logs < 3) {
+    g_ao_logs++;
+    sh_log("ssao: pass frame %u err=0x%x\n", g_frames, err);
+  } else if (g_frames % 900 == 0 && g_ao_logs < 12) {
+    g_ao_logs++;
+    sh_log("ssao: frame %u pass=%u ms/pass=%.2f\n", g_frames, g_ao_n, g_ao_n ? g_ao_ms / g_ao_n : 0.0);
+    g_ao_n = 0; g_ao_ms = 0;
+  }
+}
+
+// ===================== TONEMAPPING + COLOR GRADING =====================
+// Satu pass layar penuh di akhir adegan 3D: layar disalin ke tekstur, lalu digambar ulang dengan eksposur, kurva filmik (ACES, dicampur
+// sesuai grade_tonemap), saturasi, kontras, kehangatan warna, vignette, dan dither halus (mencegah garis pita di langit).
+// Titik akhir adegan dikenali dari draw pertama sesudah terrain yang memakai proyeksi ORTOGRAFIS (UI/GUI). Kalau pengenalan itu tidak
+// pernah berhasil dalam 180 frame terrain, grading dijalankan di akhir frame (GUI ikut terkena) dan hal ini dicatat di log.
+static int g_gr_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_gr_prog = 0, g_gr_tex = 0;
+static int g_gr_vw = 0, g_gr_vh = 0;
+static int g_gru_tex = -1, g_gru_g1 = -1, g_gru_g2 = -1;
+static unsigned g_gr_frame = 0xFFFFFFFFu, g_gr_n = 0, g_gr_logs = 0;
+static double g_gr_ms = 0;
+static unsigned g_ui_frame = 0xFFFFFFFFu, g_ui_ok = 0, g_tf_n = 0;
+static bool g_ui_fail = false;
+static const char* GR_FS =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 uv;\n"
+  "uniform sampler2D TEX;\n"
+  "uniform vec4 G1;\n"   // eksposur, jumlah tonemap, saturasi, kontras
+  "uniform vec4 G2;\n"   // kehangatan, vignette, rasio layar
+  "vec3 aces(vec3 x) {\n"
+  "  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);\n"
+  "}\n"
+  "void main() {\n"
+  "  vec3 c = texture2D(TEX, uv).rgb;\n"
+  "  vec3 lin = pow(c, vec3(2.2)) * G1.x;\n"
+  "  vec3 base = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));\n"
+  "  vec3 tm = pow(aces(lin * 1.12), vec3(1.0 / 2.2));\n"
+  "  vec3 o = mix(base, tm, G1.y);\n"
+  "  float l = dot(o, vec3(0.2126, 0.7152, 0.0722));\n"
+  "  o = mix(vec3(l), o, G1.z);\n"
+  "  o = (o - 0.5) * G1.w + 0.5;\n"
+  "  o.r *= 1.0 + G2.x * 0.5;\n"
+  "  o.b *= 1.0 - G2.x * 0.5;\n"
+  "  vec2 q = (uv - 0.5) * vec2(G2.z, 1.0);\n"
+  "  float v = smoothstep(0.35, 1.05, length(q) * 1.25);\n"
+  "  o *= 1.0 - G2.y * v * v;\n"
+  "  float nz = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
+  "  o += (nz - 0.5) / 255.0;\n"
+  "  gl_FragColor = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
+  "}\n";
+
+static bool grade_init() {
+  g_gr_state = -1;
+  fx_cfg_load();
+  if (!g_gr_on) { sh_log("grade: dimatikan lewat pengaturan (grade=0)\n"); return false; }
+  cap_init();
+  if (!g_gx_ok) gx_init();
+  if (!g_gx_ok || !f_geti || !f_getuloc) { sh_log("grade: fungsi GL tidak lengkap\n"); return false; }
+  clear_gl_errors();
+  unsigned vs = sh_compile(0x8B31, BL_VS), fs = sh_compile(0x8B30, GR_FS);
+  if (!vs || !fs) { sh_log("grade: shader gagal dikompilasi, dimatikan\n"); return false; }
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("grade: link gagal: %s\n", buf); return false; }
+  g_gr_prog = p;
+  g_gru_tex = f_getuloc(p, "TEX"); g_gru_g1 = f_getuloc(p, "G1"); g_gru_g2 = f_getuloc(p, "G2");
+  g_gr_state = 1;
+  sh_log("grade: siap (eksposur=%.2f tonemap=%.2f saturasi=%.2f kontras=%.2f hangat=%.2f vignette=%.2f pemicu=%d)\n", g_gr_exp, g_gr_tone, g_gr_sat, g_gr_con, g_gr_warm, g_gr_vig, g_gr_when);
+  return true;
+}
+
+static void grade_pass() {
+  if (!g_gr_on || g_gr_state < 0 || !g_gx_ok || g_cur_fbo != 0 || g_gr_frame == g_frames || g_tframe != g_frames) return;
+  g_gr_frame = g_frames;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_gr_state == 0 && !grade_init()) return;
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev7 = 0;
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  clear_gl_errors();
+  if (!g_gr_tex) gx.GenTextures(1, &g_gr_tex);
+  gx.BindTexture(0x0DE1, g_gr_tex);
+  if (g_gr_vw != vp[2] || g_gr_vh != vp[3]) {
+    gx.TexImage2D(0x0DE1, 0, 0x1908, vp[2], vp[3], 0, 0x1908, 0x1401, nullptr);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+    g_gr_vw = vp[2]; g_gr_vh = vp[3];
+    sh_log("grade: tekstur salinan %dx%d err=0x%x\n", vp[2], vp[3], gx.GetError());
+    clear_gl_errors();
+  }
+  gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+  gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
+  gx.UseProgram(g_gr_prog);
+  gx.Uniform1i(g_gru_tex, 7);
+  gx.Uniform4f(g_gru_g1, g_gr_exp, g_gr_tone, g_gr_sat, g_gr_con);
+  gx.Uniform4f(g_gru_g2, g_gr_warm, g_gr_vig, (float)vp[2] / (float)vp[3], 0.0f);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_gr_n++; g_gr_ms += (mono_sec() - t0) * 1000.0;
+  if (g_gr_logs < 3) {
+    g_gr_logs++;
+    sh_log("grade: pass frame %u err=0x%x pemicu=%s\n", g_frames, err, g_ui_frame == g_frames ? "ui" : "akhir-frame");
+  } else if (g_frames % 900 == 0 && g_gr_logs < 12) {
+    g_gr_logs++;
+    sh_log("grade: frame %u pass=%u ms/pass=%.2f ui_terdeteksi=%u\n", g_frames, g_gr_n, g_gr_n ? g_gr_ms / g_gr_n : 0.0, g_ui_ok);
+    g_gr_n = 0; g_gr_ms = 0;
+  }
+}
+
+// akhir adegan 3D: bloom (mode 2) lalu grading
+static void end_scene_pass() {
+  if (g_bl_when == 2 && !g_ui_fail) bloom_pass();
+  if (g_gr_when == 0 && !g_ui_fail) grade_pass();
+}
+// dipanggil pada draw program non-terrain, non-entity: draw pertama dengan matriks WORLDVIEWPROJ ortografis sesudah terrain = awal GUI
+static void ui_scan(ProgStat* s) {
+  if (g_tframe != g_frames || g_ui_frame == g_frames || g_cur_fbo != 0 || s->loc_wvp < 0 || !f_unifv) return;
+  float m[16];
+  f_unifv(s->id, s->loc_wvp, m);
+  if (fabsf(m[15] - 1.0f) < 1e-3f && fabsf(m[3]) < 1e-3f && fabsf(m[7]) < 1e-3f && fabsf(m[11]) < 1e-3f) {
+    g_ui_frame = g_frames;
+    g_ui_ok++;
+    if (g_ui_fail) { g_ui_fail = false; sh_log("ui: pengenalan awal GUI berhasil (frame %u), kembali ke pemicu otomatis\n", g_frames); }
+    else if (g_ui_ok == 1) sh_log("ui: awal GUI dikenali (frame %u, program %u)\n", g_frames, s->id);
+    end_scene_pass();
+  }
+}
+// dipanggil di akhir tiap frame (spy_swap): hitung frame terrain, tentukan apakah pengenalan GUI gagal, dan jalankan cadangan
+static void scene_frame_end() {
+  if (g_tframe != g_frames) return;
+  g_tf_n++;
+  if (!g_ui_fail && g_ui_ok == 0 && g_tf_n >= 180) {
+    g_ui_fail = true;
+    sh_log("ui: awal GUI tidak pernah dikenali dalam %u frame; bloom_when=2 dijalankan seperti 0 dan grading dijalankan di akhir frame (GUI ikut terkena)\n", g_tf_n);
+  }
+  if (g_gr_frame != g_frames && (g_gr_when == 1 || g_ui_fail)) grade_pass();
+}
+
 // ===================== HEIGHTMAP POM (TEXTURE_5) =====================
 // Atlas terrain dirakit game saat dijalankan (dari terrain_texture.json), jadi tidak ada file atlas jadi untuk diolah dari luar.
 // Karena itu atlas tinggi dibuat di sini, di GPU, sekali saja setelah atlas stabil: tiap texel diberi tinggi dari kecerahan yang
@@ -2952,6 +3264,7 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     if (s->kind == 1) capture_draw(s, mode, count, type, idx);
   }
   bool u2 = false;
+  if (s->kind == 2) ui_scan(s);
   if (s->kind == 1) { u2 = terrain_draw(s, count, type, idx); torch_pre(s); hmap_pre(s); }
   else if (s->kind == 2 && count == 6 && g_level >= 1 && g_tframe == g_frames) sky_draw(s, mode, count);
   else if (s->kind == 3) entity_draw(s, mode, 0, count, type, idx, true);
@@ -2966,9 +3279,10 @@ static void spy_draw_elements(unsigned mode, int count, unsigned type, const voi
     // kotak matahari/bulan: langit (bidang langit) sudah tergambar di atas terrain; tambahkan pantulan layar (hujan) dan sinar volumetrik di piksel langit
     g_vol_frame = g_frames;
     fx_cfg_load();
+    ssao_pass();
     ssr_pass();
     vol_pass();
-    if (g_bl_when == 0) bloom_pass();
+    if (g_bl_when == 0 || (g_bl_when == 2 && g_ui_fail)) bloom_pass();
   }
   if (u2) terrain_draw_post();
   if (wblend && g_w_ready) water_overlay(s, count, type, idx);
@@ -2978,6 +3292,7 @@ static void spy_draw_arrays(unsigned mode, int first, int count) {
   s->draws++; s->verts += (unsigned)count; s->mode = mode; s->type = 0;
   if (g_capturing) capture_other(s, mode, count, s->kind != 1);
   if (s->kind == 3) entity_draw(s, mode, first, count, 0, nullptr, false);
+  else if (s->kind == 2) ui_scan(s);
   o_drawar(mode, first, count);
 }
 static void spy_bind_fb(unsigned target, GLuint_t fb) { g_cur_fbo = fb; g_fbo_binds++; o_bindfb(target, fb); }
@@ -3080,6 +3395,7 @@ static unsigned spy_swap(void* dpy, void* surf) {
     g_fbo_binds = 0; g_vp_calls = 0;
     for (int i = 0; i < g_nvp; i++) g_vp_n[i] = 0;
   }
+  scene_frame_end();
   hmap_end_frame();
   shadow_end_frame();
   return o_swap(dpy, surf);
