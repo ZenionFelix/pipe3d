@@ -1,6 +1,7 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// CATATAN v22: pengaman crash bisa pulih sendiri (2 peluncuran bersih berturut-turut = naik satu level; file status menyimpan good=N); hmap juga MATI secara bawaan.
 // CATATAN v21: bloom, SSAO, SSGI, dan tonemapping/grading MATI secara bawaan (nilai bawaan 0 di kode dan di pipe3d_fx.txt); nyalakan satu per satu dengan bloom=1, ssao=1, ssgi=1, grade=1.
 // + SSGI (v20): pantulan cahaya tidak langsung di ruang layar (warna dari permukaan terang menyebar ke sekitarnya), dibersihkan dengan blur sadar-kedalaman; pengaturan: pipe3d_fx.txt (ssgi=...).
 // + SSAO + TONEMAPPING/COLOR GRADING (v19): SSAO memakai ulang peta kedalaman SSR; tonemapping dan grading dijalankan sekali di akhir adegan 3D (sebelum GUI, dideteksi dari draw pertama dengan proyeksi ortografis); pengaturan: pipe3d_fx.txt (ssao=..., grade=...).
@@ -604,26 +605,33 @@ static bool g_level_inited = false, g_guard_done = false, g_guard_armed = false;
 static unsigned g_guard_frames = 0;
 static int g_bc = 0;
 static void bc(const char* m) { if (g_bc < 40) { g_bc++; sh_log("langkah: %s (frame %u)\n", m, g_frames); } }
+static int g_guard_good = 0;   // jumlah peluncuran bersih berturut-turut pada level yang sedang dipakai (dipakai untuk naik level lagi)
 static void guard_write(int lvl, int armed) {
   FILE* f = fopen(GUARD_FILE, "w");
-  if (f) { fprintf(f, "lvl=%d\narmed=%d\n", lvl, armed); fclose(f); }
+  if (f) { fprintf(f, "lvl=%d\narmed=%d\ngood=%d\n", lvl, armed, g_guard_good); fclose(f); }
 }
 static void level_init() {
   g_level_inited = true;
   cfg_load();
-  int lvl = 4, armed = 0; bool have = false;
+  int lvl = 4, armed = 0, good = 0; bool have = false;
   FILE* f = fopen(GUARD_FILE, "r");
   if (f) {
     char line[64]; int v;
     while (fgets(line, sizeof(line), f)) {
       if (sscanf(line, "lvl=%d", &v) == 1) { lvl = v; have = true; }
       else if (sscanf(line, "armed=%d", &v) == 1) armed = v;
+      else if (sscanf(line, "good=%d", &v) == 1) good = v;
     }
     fclose(f);
   }
   if (g_cfg_level >= 0) { lvl = g_cfg_level; armed = 0; sh_log("pipe3d: level dipaksa lewat pengaturan = %d\n", lvl); }
   else if (!g_cfg_guard) { sh_log("pipe3d: pengaman crash dimatikan (guard=0); level selalu 4, level lama di file status (%d) diabaikan\n", have ? lvl : 4); lvl = 4; armed = 0; }
-  else if (have && armed) { sh_log("pipe3d: peluncuran sebelumnya tidak lolos 90 frame terrain pada level %d, turun ke level %d\n", lvl, lvl > 0 ? lvl - 1 : 0); lvl = lvl > 0 ? lvl - 1 : 0; }
+  else if (have && armed) { sh_log("pipe3d: peluncuran sebelumnya tidak lolos 90 frame terrain pada level %d, turun ke level %d\n", lvl, lvl > 0 ? lvl - 1 : 0); lvl = lvl > 0 ? lvl - 1 : 0; good = 0; }
+  else if (have && lvl < 4 && good >= 2) {   // pulih sendiri: 2 peluncuran bersih berturut-turut -> naik satu level (bayangan tidak tertinggal di level rendah selamanya)
+    sh_log("pipe3d: level %d lolos %d peluncuran berturut-turut tanpa crash, naik ke level %d\n", lvl, good, lvl + 1);
+    lvl++; good = 0;
+  }
+  g_guard_good = good;
   if (lvl < 0) lvl = 0;
   if (lvl > 4) lvl = 4;
   if (!g_cfg_on) lvl = 0;
@@ -821,7 +829,7 @@ static int g_ao_on = 0;                                   // SSAO (mati secara b
 static float g_ao_k = 0.8f, g_ao_r = 0.8f, g_ao_bias = 0.12f;
 static int g_gr_on = 0, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
 static float g_gr_exp = 1.10f, g_gr_tone = 0.60f, g_gr_sat = 1.10f, g_gr_con = 1.05f, g_gr_warm = 0.05f, g_gr_vig = 0.25f;
-static int g_hm_on = 1;                                   // heightmap POM (TEXTURE_5)
+static int g_hm_on = 0;                                   // heightmap POM (TEXTURE_5); MATI secara bawaan (hmap=1 untuk menyalakan): POM memakai kecerahan tekstur
 static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
 #define TL_MAX 24
 static int g_tl_found[TL_MAX][3];
@@ -1330,8 +1338,9 @@ static void shadow_end_frame() {
   if (had_terrain) {
     g_guard_frames++;
     if (g_guard_armed && g_guard_frames >= 90) {
+      if (g_guard_good < 100) g_guard_good++;
       guard_write(g_level, 0); g_guard_armed = false;
-      sh_log("pipe3d: level %d lolos 90 frame terrain tanpa crash\n", g_level);
+      sh_log("pipe3d: level %d lolos 90 frame terrain tanpa crash (bersih berturut-turut: %d)\n", g_level, g_guard_good);
     }
   }
   if (g_level < 2 || !had_terrain) return;
@@ -3445,7 +3454,7 @@ static int g_ntexsz = 0, g_texsz_rr = 0;
 static void cap_init();
 static void spy_tex_image(unsigned target, int level, int ifmt, int w, int h, int border, unsigned fmt, unsigned type, const void* data) {
   o_teximage(target, level, ifmt, w, h, border, fmt, type, data);
-  if (target != 0x0DE1 || level != 0 || w < 128 || h < 128) return;
+  if (!g_hm_on || target != 0x0DE1 || level != 0 || w < 128 || h < 128) return;   // hmap mati: tidak mencatat apa pun
   cap_init();
   if (!f_geti) return;
   int id = 0; f_geti(0x8069, &id);   // GL_TEXTURE_BINDING_2D pada unit aktif = tekstur yang baru diisi
