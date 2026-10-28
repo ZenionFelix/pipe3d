@@ -181,8 +181,8 @@ static bool draw_leaf_planes(void* self, void* block, void* pos, int data) {
 }
 
 // Lentera, rantai, lentera gantung: id diisi saat pendaftaran blok, -1 = belum ada
-#define LT_COUNT 4
-static int g_lt_ids[LT_COUNT] = {-1, -1, -1, -1};
+#define LT_COUNT 8   // 0 lentera, 1 rantai, 2 lentera gantung, 3 api unggun, 4..7 obor merah, hijau, biru, cyan
+static int g_lt_ids[LT_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1};
 static int g_lantern_shape = 0;
 // Model tiap blok dalam kotak (satuan 1/16 blok): x0,y0,z0,x1,y1,z1
 struct LtModel { int n; float b[6][6]; };
@@ -193,14 +193,18 @@ static const LtModel LT_MODELS[LT_COUNT] = {
   {5, {{0, 0, 2, 16, 4, 6}, {0, 0, 10, 16, 4, 14},                               // api unggun: dua kayu searah X (bawah)
        {2, 4, 0, 6, 7, 16}, {10, 4, 0, 14, 7, 16},                               //   dua kayu searah Z (atas, menyilang)
        {5, 0, 5, 11, 3, 11}}},                                                   //   dasar bara di tengah
+  {1, {{7, 0, 7, 9, 10, 9}}}, {1, {{7, 0, 7, 9, 10, 9}}},                       // obor RGB: satu tiang 2x2 piksel setinggi 10 (tekstur torch berwarna)
+  {1, {{7, 0, 7, 9, 10, 9}}}, {1, {{7, 0, 7, 9, 10, 9}}},
 };
 
 static void fire_record(int x, int y, int z);   // daftar posisi api unggun untuk efek asap (lihat bagian API UNGGUN)
 static void fire_trace(const char* tag, int a, int b, int c);   // jejak diagnosa crash unggun (maks 60 baris)
 
+static void iron_uv_probe(void* self);   // diisi sesudah OFF_MBLOCKS dikenal (lihat bagian LENTERA)
 static int hook_tess_block(void* self, void* block, void* pos, int data) {
   int id = *((uint8_t*)block + BLOCK_ID_OFF);
   log_block(id, block);
+  iron_uv_probe(self);
   if (id == ID_FURNACE || id == ID_FURNACE_LIT) {
     *(int*)((uint8_t*)block + LAYER_OFF) = LAYER_ALPHATEST;
     *((uint8_t*)block + FLAG_OFF) = 1;
@@ -872,6 +876,13 @@ static float g_vol_k = 1.0f;
 static int g_fx_cfg_done = 0;
 static int g_ssr_on = 1, g_ssr_always = 0;
 static float g_ssr_k = 1.0f, g_ssr_scale = 0.5f;
+// Pantulan blok besi (cermin): memakai pass SSR di bawah, tapi hanya piksel yang teksturnya iron_block (topeng dari pass kedalaman).
+static int g_ir_on = 1;                                   // iron=0 di pipe3d_fx.txt untuk mematikan
+static float g_ir_k = 1.0f;                               // iron_strength (0 sampai 2)
+static float g_ir_uv[4] = {2.0f, 2.0f, 3.0f, 3.0f};       // kotak UV tile iron_block di atlas; di luar 0..1 = belum diketahui
+static bool g_ir_uv_ok = false;
+static int g_ir_tries = 0;
+static int g_rgb_on = 1;                                  // cahaya obor berwarna (rgb_light=0 untuk mematikan)
 static int g_bl_on = 0, g_bl_when = 2;                   // bloom; when: 0 = sesudah langit digambar, 1 = sebelum draw transparan (air, kaca) pertama, 2 = di akhir adegan 3D (otomatis, sebelum GUI)
 static float g_bl_k = 0.7f, g_bl_thr = 0.80f, g_bl_sky = 0.15f;   // kekuatan, ambang, dan faktor bloom di langit/awan (inti matahari tetap penuh)             // kekuatan dan ambang kecerahan bloom
 static int g_gi_on = 0, g_gi_rays = 6;                    // SSGI: jumlah sinar per piksel (2 sampai 16)
@@ -889,8 +900,11 @@ static int g_gr_on = 0, g_gr_when = 0;                    // tonemapping + color
 static float g_gr_exp = 1.10f, g_gr_tone = 0.60f, g_gr_sat = 1.10f, g_gr_con = 1.05f, g_gr_warm = 0.05f, g_gr_vig = 0.25f;
 static int g_hm_on = 0;                                   // heightmap POM (TEXTURE_5); MATI secara bawaan (hmap=1 untuk menyalakan): POM memakai kecerahan tekstur
 static float g_hm_contrast = 2.6f, g_hm_base = 0.78f;     // kontras relief dan tinggi dasar (1.0 = permukaan datar)
-#define TL_MAX 24
+#define TL_MAX 64
+#define RGB_N 4                      // jumlah lampu berwarna (obor RGB) terdekat yang dikirim ke shader tiap frame
+#define TL_TEXW (4 + 2 * RGB_N)      // lebar tekstur data lampu: 4 piksel bayangan + 2 piksel per lampu berwarna
 static int g_tl_found[TL_MAX][3];
+static int g_tl_foundid[TL_MAX];
 static int g_tl_nfound = 0;
 static pthread_mutex_t g_tl_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_tl_state = 0;   // 0 belum diinisialisasi, 1 siap, -1 gagal/nonaktif
@@ -1905,6 +1919,9 @@ static void fx_cfg_load() {
     else if (sscanf(line, "ssr=%d", &iv) == 1) g_ssr_on = iv;
     else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
     else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
+    else if (sscanf(line, "iron=%d", &iv) == 1) g_ir_on = iv;
+    else if (sscanf(line, "iron_strength=%f", &fv) == 1) g_ir_k = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "rgb_light=%d", &iv) == 1) g_rgb_on = iv;
     else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
     else if (sscanf(line, "dof=%d", &iv) == 1) g_dof_on = iv;
     else if (sscanf(line, "dof_strength=%f", &fv) == 1) g_dof_k = (fv < 0.0f) ? 0.0f : (fv > 4.0f ? 4.0f : fv);
@@ -2005,11 +2022,11 @@ static void torch_init() {
   clear_gl_errors();
   int prev_fbo = 0, prev_tex = 0, prev_act = 0;
   f_geti(0x8CA6, &prev_fbo); f_geti(0x84E0, &prev_act); f_geti(0x8069, &prev_tex);
-  // tekstur data lampu 4x1 RGBA8
+  // tekstur data lampu TL_TEXW x 1 RGBA8
   gx.GenTextures(1, &g_tl_dtex);
   gx.BindTexture(0x0DE1, g_tl_dtex);
-  static const unsigned char zero16[16] = {0};
-  gx.TexImage2D(0x0DE1, 0, 0x1908, 4, 1, 0, 0x1908, 0x1401, zero16);
+  static const unsigned char zero16[TL_TEXW * 4] = {0};
+  gx.TexImage2D(0x0DE1, 0, 0x1908, TL_TEXW, 1, 0, 0x1908, 0x1401, zero16);
   gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
   gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
   // peta kedalaman
@@ -2059,9 +2076,15 @@ static void torch_init() {
   sh_log("obor: siap. peta=%d radius=%.1f\n", g_tl_size, g_tl_R);
 }
 
+// indeks warna obor RGB (0 merah, 1 hijau, 2 biru, 3 cyan); -1 = bukan obor berwarna
+static int rgb_color_of(int id) {
+  for (int c = 0; c < 4; c++) if (g_lt_ids[4 + c] >= 0 && id == g_lt_ids[4 + c]) return c;
+  return -1;
+}
+
 static bool tl_is_light(int id) {
   if (id == 50 || id == 62 || id == 89 || id == 91 || id == 124 || id == 169) return true;   // obor, tungku menyala, glowstone, labu menyala, lampu redstone, sea lantern
-  for (int k = 0; k < 4; k++) if (g_lt_ids[k] >= 0 && id == g_lt_ids[k]) return true;      // lentera dan api unggun buatan
+  for (int k = 0; k < LT_COUNT; k++) if (g_lt_ids[k] >= 0 && id == g_lt_ids[k]) return true;   // lentera, api unggun, dan obor RGB buatan
   return false;
 }
 
@@ -2099,7 +2122,7 @@ static void tl_put16(unsigned char* p, float u) {
 static void torch_prepare_frame() {
   g_tl_prep_frame = g_frames;
   torch_select();
-  unsigned char d[16] = {0};   // tanda 0xA5 0x5A hanya diisi kalau peta sah
+  unsigned char d[TL_TEXW * 4] = {0};   // 4 piksel pertama: bayangan (tanda 0xA5 0x5A hanya diisi kalau peta sah); sisanya lampu berwarna
   bool valid = g_tl_map_valid && (g_frames - g_tl_map_frame) <= 3 && g_vpos_ok;
   if (valid) {
     float rel[3] = {g_tl_map_pos[0] - g_cam_abs[0], g_tl_map_pos[1] - g_cam_abs[1], g_tl_map_pos[2] - g_cam_abs[2]};
@@ -2111,11 +2134,43 @@ static void torch_prepare_frame() {
       d[12] = 0xA5; d[13] = 0x5A; d[14] = (unsigned char)(g_tl_R * 8.0f + 0.5f); d[15] = 255;
     }
   }
+  // lampu berwarna (obor RGB): sampai RGB_N lampu terdekat ke kamera, 2 piksel per lampu:
+  //   piksel A = x,y (16 bit), piksel B = z (16 bit), indeks warna, penanda 0xC3
+  if (g_rgb_on && g_vpos_ok) {
+    int cnt = 0; static int rpos[TL_MAX][3]; static int rids[TL_MAX];
+    pthread_mutex_lock(&g_tl_mu);
+    cnt = g_tl_nfound; memcpy(rpos, g_tl_found, sizeof(rpos)); memcpy(rids, g_tl_foundid, sizeof(rids));
+    pthread_mutex_unlock(&g_tl_mu);
+    int pick[RGB_N]; float pd[RGB_N]; int npick = 0;
+    for (int i = 0; i < cnt; i++) {
+      if (rgb_color_of(rids[i]) < 0) continue;
+      float rx = rpos[i][0] + 0.5f - g_cam_abs[0], ry = rpos[i][1] + 0.65f - g_cam_abs[1], rz = rpos[i][2] + 0.5f - g_cam_abs[2];
+      if (fabsf(rx) > 31.0f || fabsf(ry) > 31.0f || fabsf(rz) > 31.0f) continue;
+      float dd = rx * rx + ry * ry + rz * rz;
+      int at;
+      if (npick < RGB_N) at = npick++;
+      else if (dd < pd[RGB_N - 1]) at = RGB_N - 1;
+      else continue;
+      pick[at] = i; pd[at] = dd;
+      while (at > 0 && pd[at - 1] > pd[at]) {   // urutkan: terdekat dulu
+        float tf = pd[at]; pd[at] = pd[at - 1]; pd[at - 1] = tf;
+        int ti = pick[at]; pick[at] = pick[at - 1]; pick[at - 1] = ti;
+        at--;
+      }
+    }
+    for (int j = 0; j < npick; j++) {
+      int i = pick[j]; unsigned char* q = d + (4 + 2 * j) * 4;
+      tl_put16(q + 0, (rpos[i][0] + 0.5f - g_cam_abs[0] + 32.0f) / 64.0f);
+      tl_put16(q + 2, (rpos[i][1] + 0.65f - g_cam_abs[1] + 32.0f) / 64.0f);
+      tl_put16(q + 4, (rpos[i][2] + 0.5f - g_cam_abs[2] + 32.0f) / 64.0f);
+      q[6] = (unsigned char)rgb_color_of(rids[i]); q[7] = 0xC3;
+    }
+  }
   if (!g_tl_bound) { f_geti(0x84E0, &g_tl_prev_act); }
   gx.ActiveTexture(0x84C3);
   if (!g_tl_bound) f_geti(0x8069, &g_tl_prev3);
   gx.BindTexture(0x0DE1, g_tl_dtex);
-  gx.TexImage2D(0x0DE1, 0, 0x1908, 4, 1, 0, 0x1908, 0x1401, d);
+  gx.TexImage2D(0x0DE1, 0, 0x1908, TL_TEXW, 1, 0, 0x1908, 0x1401, d);
   gx.ActiveTexture(0x84C4);
   if (!g_tl_bound) f_geti(0x8069, &g_tl_prev4);
   gx.BindTexture(0x0DE1, g_tl_tex);
@@ -2332,7 +2387,7 @@ static bool g_ssr_rain = false;
 static int g_ssr_state = 0;   // 0 belum, 1 siap, -1 gagal
 static unsigned g_ssr_dtex = 0, g_ssr_dfbo = 0, g_ssr_dcol = 0, g_ssr_ctex = 0, g_ssr_dprog = 0, g_ssr_prog = 0;
 static int g_ssr_dw = 0, g_ssr_dh = 0, g_ssr_cw = 0, g_ssr_ch = 0;
-static int g_sd_wv = -1, g_sd_proj = -1, g_sd_org = -1, g_sd_tex = -1;
+static int g_sd_wv = -1, g_sd_proj = -1, g_sd_org = -1, g_sd_tex = -1, g_sd_ir = -1, g_ss_msk = -1, g_ss_ik = -1;
 static int g_ss_dep = -1, g_ss_col = -1, g_ss_prj = -1, g_ss_pz = -1, g_ss_ra = -1, g_ss_rb = -1, g_ss_rc = -1, g_ss_sky = -1, g_ss_k = -1, g_ss_tx = -1;
 static unsigned g_ssr_frame = 0xFFFFFFFFu, g_ssr_n = 0, g_ssr_logs = 0, g_ssr_draws = 0;
 static double g_ssr_ms = 0;
@@ -2366,9 +2421,11 @@ static const char* SSR_DFS =
   "#endif\n"
   "varying vec2 vuv;\n"
   "uniform sampler2D TEX;\n"
+  "uniform vec4 IR;\n"    // kotak UV tile iron_block: R = 1 untuk piksel besi (topeng pantulan)
   "void main() {\n"
   "  if (texture2D(TEX, vuv).a < 0.5) discard;\n"
-  "  gl_FragColor = vec4(1.0);\n"
+  "  float m = step(IR.x, vuv.x) * step(vuv.x, IR.z) * step(IR.y, vuv.y) * step(vuv.y, IR.w);\n"
+  "  gl_FragColor = vec4(m, 0.0, 0.0, 1.0);\n"
   "}\n";
 static const char* SSR_VS =
   "attribute vec2 P;\n"
@@ -2394,6 +2451,8 @@ static const char* SSR_FS =
   "uniform vec3 SKY;\n"
   "uniform float K;\n"
   "uniform vec2 TX;\n"
+  "uniform sampler2D MSK;\n"   // topeng blok besi (R = 1)
+  "uniform float IK;\n"        // kekuatan pantulan besi (0 = mati)
   "vec3 viewPos(vec2 c) {\n"
   "  float d = texture2D(DEP, c).r;\n"
   "  float z = -PZ.y / ((d * 2.0 - 1.0) + PZ.x);\n"
@@ -2416,8 +2475,9 @@ static const char* SSR_FS =
   "  n = n / nl;\n"
   "  if (n.z < 0.0) n = -n;\n"
   "  float ny = dot(n, vec3(RA.y, RB.y, RC.y));\n"
-  "  float mask = smoothstep(0.80, 0.95, ny);\n"
-  "  if (mask <= 0.0) discard;\n"
+  "  float mask = smoothstep(0.80, 0.95, ny) * step(0.001, K);\n"
+  "  float im = step(0.5, texture2D(MSK, uv).r) * step(0.001, IK);\n"
+  "  if (mask <= 0.0 && im <= 0.0) discard;\n"
   "  vec3 v = normalize(p0);\n"
   "  vec3 r = reflect(v, n);\n"
   "  float ry = dot(r, vec3(RA.y, RB.y, RC.y));\n"
@@ -2440,10 +2500,14 @@ static const char* SSR_FS =
   "  float ef = smoothstep(0.0, 0.08, min(huv.x, 1.0 - huv.x)) * smoothstep(0.0, 0.08, min(huv.y, 1.0 - huv.y));\n"
   "  vec3 sceneC = texture2D(COL, huv).rgb;\n"
   "  vec3 skyC = SKY * smoothstep(-0.05, 0.25, ry);\n"
-  "  vec3 rc = mix(skyC, sceneC, hit * ef);\n"
+  "  vec3 selfC = texture2D(COL, uv).rgb;\n"
+  "  vec3 missC = mix(skyC, mix(selfC * 0.55, skyC, smoothstep(0.3, 0.8, ry)), im);\n"   // besi: sinar yang meleset memantulkan warnanya sendiri, bukan langit (di dalam ruangan)
+  "  vec3 rc = mix(missC, sceneC, hit * ef);\n"
   "  float fr = 0.04 + 0.96 * pow(1.0 - max(dot(n, -v), 0.0), 5.0);\n"
   "  float refl = (0.12 + 0.88 * fr) * K * mask;\n"
-  "  gl_FragColor = vec4(rc * refl * 0.7, mask * 0.22);\n"
+  "  float reflI = (0.60 + 0.40 * fr) * IK;\n"
+  "  float a = mix(mask * 0.22, min(0.55 * IK, 0.80), im);\n"
+  "  gl_FragColor = vec4(rc * mix(refl, reflI, im) * 0.7, a);\n"
   "}\n";
 
 static bool ssr_init() {
@@ -2457,7 +2521,7 @@ static bool ssr_init() {
   gx.LinkProgram(g_ssr_dprog);
   int linked = 0; gx.GetProgramiv(g_ssr_dprog, 0x8B82, &linked);
   if (!linked) { sh_log("ssr: link program kedalaman gagal\n"); return false; }
-  g_sd_wv = f_getuloc(g_ssr_dprog, "WV"); g_sd_proj = f_getuloc(g_ssr_dprog, "PROJ"); g_sd_org = f_getuloc(g_ssr_dprog, "ORG"); g_sd_tex = f_getuloc(g_ssr_dprog, "TEX");
+  g_sd_wv = f_getuloc(g_ssr_dprog, "WV"); g_sd_proj = f_getuloc(g_ssr_dprog, "PROJ"); g_sd_org = f_getuloc(g_ssr_dprog, "ORG"); g_sd_tex = f_getuloc(g_ssr_dprog, "TEX"); g_sd_ir = f_getuloc(g_ssr_dprog, "IR");
   unsigned vs2 = sh_compile(0x8B31, SSR_VS), fs2 = sh_compile(0x8B30, SSR_FS);
   if (!vs2 || !fs2) return false;
   g_ssr_prog = gx.CreateProgram();
@@ -2469,6 +2533,7 @@ static bool ssr_init() {
   g_ss_dep = f_getuloc(g_ssr_prog, "DEP"); g_ss_col = f_getuloc(g_ssr_prog, "COL"); g_ss_prj = f_getuloc(g_ssr_prog, "PRJ"); g_ss_pz = f_getuloc(g_ssr_prog, "PZ");
   g_ss_ra = f_getuloc(g_ssr_prog, "RA"); g_ss_rb = f_getuloc(g_ssr_prog, "RB"); g_ss_rc = f_getuloc(g_ssr_prog, "RC");
   g_ss_sky = f_getuloc(g_ssr_prog, "SKY"); g_ss_k = f_getuloc(g_ssr_prog, "K"); g_ss_tx = f_getuloc(g_ssr_prog, "TX");
+  g_ss_msk = f_getuloc(g_ssr_prog, "MSK"); g_ss_ik = f_getuloc(g_ssr_prog, "IK");
   g_ssr_state = 1;
   sh_log("ssr: program siap (scale=%.2f strength=%.2f always=%d)\n", g_ssr_scale, g_ssr_k, g_ssr_always);
   return true;
@@ -2527,11 +2592,12 @@ static bool ssr_resources(int w, int h) {
   if (gx_drawbuffers) { unsigned none = 0; gx_drawbuffers(1, &none); }
   if (gx_readbuffer) gx_readbuffer(0);
   unsigned status = gx.CheckFramebufferStatus(0x8D40);
-  if (status != 0x8CD5) {
+  {   // tekstur warna selalu dipasang: dipakai sebagai topeng blok besi (R = 1) untuk pantulan
     if (!g_ssr_dcol) gx.GenTextures(1, &g_ssr_dcol);
     gx.BindTexture(0x0DE1, g_ssr_dcol);
     gx.TexImage2D(0x0DE1, 0, 0x1908, dw, dh, 0, 0x1908, 0x1401, nullptr);
     gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
     gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_ssr_dcol, 0);
     if (gx_drawbuffers) { unsigned c0 = 0x8CE0; gx_drawbuffers(1, &c0); }
     status = gx.CheckFramebufferStatus(0x8D40);
@@ -2560,9 +2626,11 @@ static void ssr_depth_pass(const SavedState& st) {
   gx.Viewport(0, 0, g_ssr_dw, g_ssr_dh);
   gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x8037);
   gx.Enable(0x0B44); gx.CullFace(0x0405);
-  gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(1); gx.ColorMask(0, 0, 0, 0);
-  gx.ClearDepthf(1.0f); gx.Clear(0x100);
+  gx.Enable(0x0B71); gx.DepthFunc(0x0203); gx.DepthMask(1); gx.ColorMask(1, 1, 1, 1);
+  gx.ClearColor(0.0f, 0.0f, 0.0f, 0.0f); gx.ClearDepthf(1.0f); gx.Clear(0x4100);
   gx.UseProgram(g_ssr_dprog);
+  if (g_ir_uv_ok) gx.Uniform4f(g_sd_ir, g_ir_uv[0], g_ir_uv[1], g_ir_uv[2], g_ir_uv[3]);
+  else gx.Uniform4f(g_sd_ir, 2.0f, 2.0f, 3.0f, 3.0f);
   gx.UniformMatrix4fv(g_sd_wv, 1, 0, g_wv);
   gx.UniformMatrix4fv(g_sd_proj, 1, 0, g_proj);
   gx.Uniform1i(g_sd_tex, 0);
@@ -2591,8 +2659,10 @@ static void ssr_depth_pass(const SavedState& st) {
 }
 
 static void ssr_pass() {
-  if (!g_ssr_on || g_ssr_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0) return;
-  if (!g_ssr_always && !g_ssr_rain) return;
+  bool floorOn = g_ssr_on && (g_ssr_always || g_ssr_rain);   // lantai basah (hujan atau ssr_always=1)
+  bool ironOn = g_ir_on && g_ir_uv_ok;                       // blok besi sebagai cermin
+  if (g_ssr_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0) return;
+  if (!floorOn && !ironOn) return;
   int cur = g_dcur, n = g_dn[cur];
   if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
   int vp[4] = {0, 0, 0, 0};
@@ -2603,7 +2673,8 @@ static void ssr_pass() {
   double t0 = mono_sec();
   SavedState st;
   save_state(&st);
-  int prev6 = 0, prev7 = 0;
+  int prev5 = 0, prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C5); f_geti(0x8069, &prev5);
   gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
   gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
   // 1. kedalaman terrain dari sudut pandang kamera (dipakai bersama SSAO; hanya digambar sekali per frame)
@@ -2627,7 +2698,9 @@ static void ssr_pass() {
   gx.Uniform3f(g_ss_rb, g_wv[1], g_wv[5], g_wv[9]);
   gx.Uniform3f(g_ss_rc, g_wv[2], g_wv[6], g_wv[10]);
   gx.Uniform3f(g_ss_sky, g_w_fog[0] * 0.85f, g_w_fog[1] * 0.85f, g_w_fog[2] * 0.9f);
-  gx.Uniform1f(g_ss_k, g_ssr_k);
+  gx.Uniform1f(g_ss_k, floorOn ? g_ssr_k : 0.0f);
+  gx.Uniform1f(g_ss_ik, ironOn ? g_ir_k : 0.0f);
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, g_ssr_dcol); gx.Uniform1i(g_ss_msk, 5);   // topeng besi
   gx.Uniform2f(g_ss_tx, 1.0f / (float)g_ssr_dw, 1.0f / (float)g_ssr_dh);
   static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
   for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
@@ -2635,6 +2708,7 @@ static void ssr_pass() {
   gx.EnableVertexAttribArray(0);
   gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
   gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, (unsigned)prev5);
   gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
   gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
   restore_state(&st);
@@ -4746,6 +4820,20 @@ static const uintptr_t OFF_JSON_VALUE_DTOR = 0x119BF6D;     // Json::Value::~Val
 static const uintptr_t OFF_JSON_READER_CTOR = 0x119893D;    // Json::Reader::Reader()
 static const uintptr_t OFF_JSON_READER_PARSE = 0x1198BD9;   // Json::Reader::parse(char const*, char const*, Value&, bool)
 static const uintptr_t OFF_MBLOCKS = 0x1705814;             // Block::mBlocks[256]
+
+// Ambil kotak UV tekstur iron_block (blok id 42) dari BlockTessellator::_getTexture, sekali, supaya pass pantulan bisa mengenali piksel besi.
+static void iron_uv_probe(void* self) {
+  if (g_ir_uv_ok || g_ir_tries >= 40 || !fn_get_tex || !self || !g_base) return;
+  g_ir_tries++;
+  void* ib = ((void**)(g_base + OFF_MBLOCKS))[42];
+  if (!ib) return;
+  const float* t = fn_get_tex(self, ib, 1, 0);
+  if (!(t && t[0] >= 0.0f && t[1] >= 0.0f && t[2] <= 1.001f && t[3] <= 1.001f && t[2] > t[0] && t[3] > t[1])) return;
+  const float e = 0.00003f;   // toleransi pembulatan UV 16 bit
+  g_ir_uv[0] = t[0] - e; g_ir_uv[1] = t[1] - e; g_ir_uv[2] = t[2] + e; g_ir_uv[3] = t[3] + e;
+  g_ir_uv_ok = true;
+  sh_log("besi: UV iron_block = %.5f %.5f %.5f %.5f\n", t[0], t[1], t[2], t[3]);
+}
 static const uintptr_t OFF_BG_MBLOCKS = 0x16B350C;          // BlockGraphics::mBlocks[256]
 static const uintptr_t OFF_ITEM_MITEMS = 0x1703A00;         // Item::mItems[512]
 static const int ID_GLOWSTONE = 89;                         // gambar cadangan kalau pendaftaran gambar gagal
@@ -4754,6 +4842,9 @@ static const uintptr_t OFF_MLIGHTBLOCK = 0x1705C3C;         // Block::mLightBloc
 static const int MATERIAL_TYPE_METAL = 4;                   // urutan: air0 dirt1 wood2 stone3 metal4 (cocok dengan blok yang sudah ada)
 static const int CATEGORY_DECORATIONS = 2;                  // CreativeItemCategory: 1 blok, 2 dekorasi, 3 alat, 4 item
 
+// Gambar obor RGB: tekstur torch_* ada di terrain_texture.json (lihat paket tekstur obor RGB). Ikon inventory memakai torch_*_icon.
+#define LT_TORCH_ONE(name, tex) "\"" name "\":{\"textures\":\"" tex "\",\"carried_textures\":{\"up\":\"" tex "_icon\",\"down\":\"" tex "_icon\",\"side\":\"" tex "_icon\"}}"
+#define LT_TORCH_JSON LT_TORCH_ONE("red_torch", "torch_red") "," LT_TORCH_ONE("green_torch", "torch_green") "," LT_TORCH_ONE("blue_torch", "torch_blue") "," LT_TORCH_ONE("cyan_torch", "torch_cyan")
 // Gambar blok (format sama dengan blocks.json). registerBlock<BlockGraphics>(root, nama) mengambil root[nama] sendiri,
 // jadi JSON dibungkus dengan nama tiap blok di tingkat paling luar.
 // Versi bawaan (texture=0): memakai tekstur yang sudah ada di game.
@@ -4761,7 +4852,7 @@ static const char LT_GFX_JSON_BASIC[] =
   "{\"lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}},"
   "\"chain\":{\"textures\":\"iron_block\"},"
   "\"hanging_lantern\":{\"textures\":{\"up\":\"iron_block\",\"down\":\"iron_block\",\"side\":\"glowstone\"}},"
-  "\"campfire\":{\"textures\":\"glowstone\"}}";
+  "\"campfire\":{\"textures\":\"glowstone\"}," LT_TORCH_JSON "}";
 // Versi tekstur sendiri (texture=1): gambar harus sudah ada di APK (lihat lantern_texture_pack.zip).
 static const char LT_GFX_JSON_CUSTOM[] =
   "{\"lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_side\"},"
@@ -4771,17 +4862,18 @@ static const char LT_GFX_JSON_CUSTOM[] =
   "\"hanging_lantern\":{\"textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_hang_side\"},"
   "\"carried_textures\":{\"up\":\"lantern_top\",\"down\":\"lantern_top\",\"side\":\"lantern_icon\"}},"
   "\"campfire\":{\"textures\":{\"up\":\"campfire_log_top\",\"down\":\"campfire_log_top\",\"side\":\"campfire_log_side\"},"
-  "\"carried_textures\":{\"up\":\"campfire_log_top\",\"down\":\"campfire_log_top\",\"side\":\"campfire_icon\"}}}";
+  "\"carried_textures\":{\"up\":\"campfire_log_top\",\"down\":\"campfire_log_top\",\"side\":\"campfire_icon\"}}," LT_TORCH_JSON "}";
 static int g_lt_texture = 0;
-static const char* LT_NAMES[LT_COUNT] = {"lantern", "chain", "hanging_lantern", "campfire"};
-static const float LT_LIGHT[LT_COUNT] = {1.0f, 0.0f, 1.0f, 1.0f};
-static const int LT_MATERIAL[LT_COUNT] = {4, 4, 4, 2};            // 4 = metal, 2 = kayu (api unggun)
-static const float LT_HARDNESS[LT_COUNT] = {1.0f, 1.0f, 1.0f, 2.0f};
+static const char* LT_NAMES[LT_COUNT] = {"lantern", "chain", "hanging_lantern", "campfire", "red_torch", "green_torch", "blue_torch", "cyan_torch"};
+static const float LT_LIGHT[LT_COUNT] = {1.0f, 0.0f, 1.0f, 1.0f, 0.94f, 0.94f, 0.94f, 0.94f};
+static const int LT_MATERIAL[LT_COUNT] = {4, 4, 4, 2, 2, 2, 2, 2};            // 4 = metal, 2 = kayu (api unggun)
+static const float LT_HARDNESS[LT_COUNT] = {1.0f, 1.0f, 1.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 // Kotak seleksi (outline) tiap blok, satuan 1/16: xmin,ymin,zmin,xmax,ymax,zmax
 static const float LT_OUTLINE[LT_COUNT][6] = {
   // unggun: ymin=1 (bukan 0) sengaja. Game menyembunyikan sisi atas blok di bawah unggun kalau kotak bentuk unggun menempel dan menutupi
   // seluruh sisi itu (cek ymin<=0 dan x/z 0..1 di BlockOccluder::_shouldRenderFace), padahal model kayunya berlubang, jadi blok bawah tembus pandang.
   {5, 0, 5, 11, 10, 11}, {6, 0, 6, 10, 16, 10}, {5, 6, 5, 11, 16, 11}, {0, 1, 0, 16, 7, 16},
+  {6, 0, 6, 10, 10, 10}, {6, 0, 6, 10, 10, 10}, {6, 0, 6, 10, 10, 10}, {6, 0, 6, 10, 10, 10},
 };
 
 typedef void (*InitVoidFn)();
@@ -4803,7 +4895,7 @@ static InitVoidFn orig_bg_init_blocks = nullptr;
 static InitVoidFn orig_init_creative = nullptr;
 static int g_lt_item = 1, g_lt_graphics = 1, g_lt_creative = 1;
 static int g_fire_smoke = 1, g_fire_flame = 1;   // efek api unggun (smoke=0 mematikan semua, flame=0 hanya percikan api)
-static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212, 213};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
+static int g_lt_cfg_id[LT_COUNT] = {210, 211, 212, 213, 214, 215, 216, 217};   // slot ID (200..242 tidak dipakai blok bawaan 0.15.10)
 
 static void lantern_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lantern_log(const char* fmt, ...) {
@@ -4828,6 +4920,10 @@ static bool lantern_enabled() {
     else if (sscanf(line, " chain_id=%d", &v) == 1) g_lt_cfg_id[1] = v;
     else if (sscanf(line, " hang_id=%d", &v) == 1) g_lt_cfg_id[2] = v;
     else if (sscanf(line, " fire_id=%d", &v) == 1) g_lt_cfg_id[3] = v;
+    else if (sscanf(line, " red_id=%d", &v) == 1) g_lt_cfg_id[4] = v;
+    else if (sscanf(line, " green_id=%d", &v) == 1) g_lt_cfg_id[5] = v;
+    else if (sscanf(line, " blue_id=%d", &v) == 1) g_lt_cfg_id[6] = v;
+    else if (sscanf(line, " cyan_id=%d", &v) == 1) g_lt_cfg_id[7] = v;
     else if (sscanf(line, " smoke=%d", &v) == 1) g_fire_smoke = v;
     else if (sscanf(line, " flame=%d", &v) == 1) g_fire_flame = v;
     else if (sscanf(line, " texture=%d", &v) == 1) g_lt_texture = v;
@@ -5034,6 +5130,7 @@ static void campfire_effects(void* level, void* entity) {
 static const int TL_W = 25, TL_H = 15, TL_TOTAL = 25 * 25 * 15, TL_PER_TICK = 900;
 static int g_tl_cur = 0, g_tl_bx = 0, g_tl_by = 0, g_tl_bz = 0, g_tl_ntmp = 0;
 static int g_tl_tmp[TL_MAX][3];
+static int g_tl_tmpid[TL_MAX];
 static void torch_scan(void* entity) {
   if (!g_tl_on) return;
   uint8_t* e = (uint8_t*)entity;
@@ -5053,12 +5150,12 @@ static void torch_scan(void* entity) {
     alignas(8) uint8_t bid[8] = {0};
     get_id(bid, region, x, y, z);
     if (bid[0] != 0 && tl_is_light(bid[0]) && g_tl_ntmp < TL_MAX) {
-      g_tl_tmp[g_tl_ntmp][0] = x; g_tl_tmp[g_tl_ntmp][1] = y; g_tl_tmp[g_tl_ntmp][2] = z; g_tl_ntmp++;
+      g_tl_tmp[g_tl_ntmp][0] = x; g_tl_tmp[g_tl_ntmp][1] = y; g_tl_tmp[g_tl_ntmp][2] = z; g_tl_tmpid[g_tl_ntmp] = bid[0]; g_tl_ntmp++;
     }
   }
   if (g_tl_cur >= TL_TOTAL) {   // putaran selesai: serahkan hasilnya ke thread render
     pthread_mutex_lock(&g_tl_mu);
-    g_tl_nfound = g_tl_ntmp; memcpy(g_tl_found, g_tl_tmp, sizeof(g_tl_tmp));
+    g_tl_nfound = g_tl_ntmp; memcpy(g_tl_found, g_tl_tmp, sizeof(g_tl_tmp)); memcpy(g_tl_foundid, g_tl_tmpid, sizeof(g_tl_tmpid));
     pthread_mutex_unlock(&g_tl_mu);
     g_tl_cur = 0;
   }
@@ -5089,7 +5186,9 @@ static void hook_init_blocks() {
 }
 static void hook_bg_init_blocks() {
   orig_bg_init_blocks();          // gambar semua blok bawaan sudah terdaftar
-  if (g_lt_ids[0] >= 0 || g_lt_ids[1] >= 0 || g_lt_ids[2] >= 0 || g_lt_ids[3] >= 0) {
+  bool any_lt = false;
+  for (int k = 0; k < LT_COUNT; k++) if (g_lt_ids[k] >= 0) any_lt = true;
+  if (any_lt) {
     if (g_lt_graphics) register_lantern_graphics();
     ensure_lantern_graphics_slot();
   }
