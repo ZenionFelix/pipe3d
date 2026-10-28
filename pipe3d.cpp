@@ -1,6 +1,10 @@
 // Meja kerja 3D untuk Minecraft PE 0.15.10 (armeabi-v7a)
 // + AIR PANTULAN (v13): pantulan bidang air seperti water shader Java (lihat bagian "AIR: PANTULAN"; pengaturan: pipe3d_water.txt).
 // + GUNUNG TINGGI: hook Biome::setDepthAndScale menaikkan depth/scale biome gunung (config: pipe3d_biome.txt).
+// + DOF (depth of field) dan MOTION BLUR (v23): satu pass di akhir adegan 3D (sebelum GUI). DOF: fokus otomatis ke titik tengah layar (dihaluskan antar frame di GPU),
+//   blur jauh dan dekat dari peta kedalaman terrain. Motion blur: blur searah gerak tiap piksel dari selisih kamera (rotasi dan posisi) antar frame. Keduanya memakai ulang
+//   tekstur salinan layar milik SSR (tanpa memori tambahan). Pengaturan: pipe3d_fx.txt (dof=..., motionblur=...). Pengaman: pipe3d_fxguard.txt (lihat di bawah).
+// + PENGAMAN EFEK PASCA-PROSES (v23): kalau crash terjadi saat bloom/SSAO/SSGI/grading/DOF/motion blur aktif, level bayangan TIDAK diturunkan; efek tambahan dimatikan untuk 2 peluncuran berikutnya lalu dicoba lagi.
 // CATATAN v22: pengaman crash bisa pulih sendiri (2 peluncuran bersih berturut-turut = naik satu level; file status menyimpan good=N); hmap juga MATI secara bawaan.
 // CATATAN v21: bloom, SSAO, SSGI, dan tonemapping/grading MATI secara bawaan (nilai bawaan 0 di kode dan di pipe3d_fx.txt); nyalakan satu per satu dengan bloom=1, ssao=1, ssgi=1, grade=1.
 // + SSGI (v20): pantulan cahaya tidak langsung di ruang layar (warna dari permukaan terang menyebar ke sekitarnya), dibersihkan dengan blur sadar-kedalaman; pengaturan: pipe3d_fx.txt (ssgi=...).
@@ -610,6 +614,47 @@ static void guard_write(int lvl, int armed) {
   FILE* f = fopen(GUARD_FILE, "w");
   if (f) { fprintf(f, "lvl=%d\narmed=%d\ngood=%d\n", lvl, armed, g_guard_good); fclose(f); }
 }
+// ---- pengaman efek pasca-proses ----
+// Kalau game crash/ditutup dalam 90 frame terrain pertama SAAT efek pasca-proses (bloom, SSAO, SSGI, grading, DOF, motion blur) sudah aktif,
+// kesalahan ditimpakan ke efek itu, bukan ke bayangan: level bayangan dipertahankan dan efek tambahan dimatikan untuk 2 peluncuran berikutnya,
+// lalu dicoba lagi. File: pipe3d_fxguard.txt (hapus untuk mengatur ulang).
+static const char* FXG_FILE = "/sdcard/games/com.mojang/pipe3d_fxguard.txt";
+static int g_fxg_dis = 0, g_fxg_armed_prev = 0;
+static bool g_fxg_loaded = false, g_fxg_armed_now = false;
+static void fxg_write(int dis, int armed) {
+  FILE* f = fopen(FXG_FILE, "w");
+  if (f) { fprintf(f, "dis=%d\narmed=%d\n", dis, armed); fclose(f); }
+}
+static void fxg_load() {
+  if (g_fxg_loaded) return;
+  g_fxg_loaded = true;
+  int dis = 0, armed = 0;
+  FILE* f = fopen(FXG_FILE, "r");
+  if (f) {
+    char line[64]; int v;
+    while (fgets(line, sizeof(line), f)) {
+      if (sscanf(line, "dis=%d", &v) == 1) dis = v;
+      else if (sscanf(line, "armed=%d", &v) == 1) armed = v;
+    }
+    fclose(f);
+  }
+  g_fxg_armed_prev = armed;
+  if (dis > 0) { g_fxg_dis = 1; fxg_write(dis - 1, 0); sh_log("fxguard: efek pasca-proses dimatikan untuk peluncuran ini (sisa %d peluncuran lagi sesudah ini)\n", dis - 1); }
+}
+static bool fx_allowed() { return !g_fxg_dis; }
+static void fx_arm() {
+  if (g_fxg_armed_now || g_fxg_dis) return;
+  g_fxg_armed_now = true;
+  fxg_write(0, 1);
+  sh_log("fxguard: efek pasca-proses aktif, pengaman ditandai\n");
+}
+static void fx_ok() {
+  if (!g_fxg_armed_now) return;
+  g_fxg_armed_now = false;
+  fxg_write(0, 0);
+  sh_log("fxguard: efek pasca-proses lolos 90 frame tanpa crash\n");
+}
+
 static void level_init() {
   g_level_inited = true;
   cfg_load();
@@ -623,6 +668,12 @@ static void level_init() {
       else if (sscanf(line, "good=%d", &v) == 1) good = v;
     }
     fclose(f);
+  }
+  fxg_load();
+  if (have && armed && g_fxg_armed_prev && g_cfg_level < 0 && g_cfg_guard) {
+    // crash terjadi saat efek pasca-proses aktif: salahkan efek itu, jangan turunkan level bayangan
+    sh_log("pipe3d: peluncuran sebelumnya tidak lolos 90 frame saat efek pasca-proses aktif; level %d DIPERTAHANKAN dan efek tambahan dimatikan 2 peluncuran\n", lvl);
+    g_fxg_dis = 1; fxg_write(1, 0); armed = 0; good = 0;
   }
   if (g_cfg_level >= 0) { lvl = g_cfg_level; armed = 0; sh_log("pipe3d: level dipaksa lewat pengaturan = %d\n", lvl); }
   else if (!g_cfg_guard) { sh_log("pipe3d: pengaman crash dimatikan (guard=0); level selalu 4, level lama di file status (%d) diabaikan\n", have ? lvl : 4); lvl = 4; armed = 0; }
@@ -825,6 +876,11 @@ static int g_bl_on = 0, g_bl_when = 2;                   // bloom; when: 0 = ses
 static float g_bl_k = 0.7f, g_bl_thr = 0.80f, g_bl_sky = 0.15f;   // kekuatan, ambang, dan faktor bloom di langit/awan (inti matahari tetap penuh)             // kekuatan dan ambang kecerahan bloom
 static int g_gi_on = 0, g_gi_rays = 6;                    // SSGI: jumlah sinar per piksel (2 sampai 16)
 static float g_gi_k = 0.6f, g_gi_r = 10.0f, g_gi_scale = 0.5f;   // kekuatan, jangkauan (blok), skala resolusi terhadap layar
+static int g_dof_on = 1, g_dof_taps = 12;                // DOF: jumlah titik contoh per piksel (6 sampai 24)
+static float g_dof_k = 1.0f, g_dof_maxpx = 9.0f, g_dof_focus = 0.0f, g_dof_sky = 0.25f, g_dof_near = 0.35f, g_dof_far = 1.0f, g_dof_dz = 0.08f, g_dof_speed = 0.12f, g_dof_hand = 0.9f;
+static float g_dof_fmin = 2.5f, g_dof_fmax = 80.0f;      // batas jarak fokus otomatis (blok)
+static int g_mb_on = 1, g_mb_samples = 10;               // motion blur: jumlah titik contoh sepanjang arah gerak (4 sampai 20)
+static float g_mb_k = 0.5f, g_mb_max = 0.05f, g_mb_min = 0.0015f, g_mb_hand = 0.9f;
 static int g_ao_on = 0;                                   // SSAO (mati secara bawaan; ssao=1 di pipe3d_fx.txt untuk menyalakan)
 static float g_ao_k = 0.8f, g_ao_r = 0.8f, g_ao_bias = 0.12f;
 static int g_gr_on = 0, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
@@ -1340,6 +1396,7 @@ static void shadow_end_frame() {
     if (g_guard_armed && g_guard_frames >= 90) {
       if (g_guard_good < 100) g_guard_good++;
       guard_write(g_level, 0); g_guard_armed = false;
+      fx_ok();
       sh_log("pipe3d: level %d lolos 90 frame terrain tanpa crash (bersih berturut-turut: %d)\n", g_level, g_guard_good);
     }
   }
@@ -1847,6 +1904,25 @@ static void fx_cfg_load() {
     else if (sscanf(line, "ssr_always=%d", &iv) == 1) g_ssr_always = iv;
     else if (sscanf(line, "ssr_strength=%f", &fv) == 1) g_ssr_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
     else if (sscanf(line, "ssr_scale=%f", &fv) == 1) g_ssr_scale = (fv < 0.25f) ? 0.25f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "dof=%d", &iv) == 1) g_dof_on = iv;
+    else if (sscanf(line, "dof_strength=%f", &fv) == 1) g_dof_k = (fv < 0.0f) ? 0.0f : (fv > 4.0f ? 4.0f : fv);
+    else if (sscanf(line, "dof_max_blur=%f", &fv) == 1) g_dof_maxpx = (fv < 1.0f) ? 1.0f : (fv > 30.0f ? 30.0f : fv);
+    else if (sscanf(line, "dof_focus=%f", &fv) == 1) g_dof_focus = (fv < 0.0f) ? 0.0f : (fv > 250.0f ? 250.0f : fv);
+    else if (sscanf(line, "dof_focus_min=%f", &fv) == 1) g_dof_fmin = (fv < 0.5f) ? 0.5f : (fv > 50.0f ? 50.0f : fv);
+    else if (sscanf(line, "dof_focus_max=%f", &fv) == 1) g_dof_fmax = (fv < 5.0f) ? 5.0f : (fv > 250.0f ? 250.0f : fv);
+    else if (sscanf(line, "dof_sky=%f", &fv) == 1) g_dof_sky = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "dof_near=%f", &fv) == 1) g_dof_near = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "dof_far=%f", &fv) == 1) g_dof_far = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "dof_deadzone=%f", &fv) == 1) g_dof_dz = (fv < 0.0f) ? 0.0f : (fv > 0.5f ? 0.5f : fv);
+    else if (sscanf(line, "dof_speed=%f", &fv) == 1) g_dof_speed = (fv < 0.02f) ? 0.02f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "dof_hand=%f", &fv) == 1) g_dof_hand = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "dof_taps=%d", &iv) == 1) g_dof_taps = (iv < 6) ? 6 : (iv > 24 ? 24 : iv);
+    else if (sscanf(line, "motionblur=%d", &iv) == 1) g_mb_on = iv;
+    else if (sscanf(line, "mb_strength=%f", &fv) == 1) g_mb_k = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
+    else if (sscanf(line, "mb_max=%f", &fv) == 1) g_mb_max = (fv < 0.01f) ? 0.01f : (fv > 0.15f ? 0.15f : fv);
+    else if (sscanf(line, "mb_min=%f", &fv) == 1) g_mb_min = (fv < 0.0f) ? 0.0f : (fv > 0.02f ? 0.02f : fv);
+    else if (sscanf(line, "mb_hand=%f", &fv) == 1) g_mb_hand = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "mb_samples=%d", &iv) == 1) g_mb_samples = (iv < 4) ? 4 : (iv > 20 ? 20 : iv);
     else if (sscanf(line, "ssgi=%d", &iv) == 1) g_gi_on = iv;
     else if (sscanf(line, "ssgi_strength=%f", &fv) == 1) g_gi_k = (fv < 0.0f) ? 0.0f : (fv > 2.0f ? 2.0f : fv);
     else if (sscanf(line, "ssgi_rays=%d", &iv) == 1) g_gi_rays = (iv < 2) ? 2 : (iv > 16 ? 16 : iv);
@@ -2719,6 +2795,7 @@ static void bl_run(int pi, unsigned dst, int dw, int dh, unsigned src, int sw, i
 }
 
 static void bloom_pass() {
+  if (!fx_allowed()) return;
   if (!g_bl_on || g_bl_state < 0 || !g_gx_ok || g_cur_fbo != 0 || g_bl_frame == g_frames || g_tframe != g_frames) return;
   g_bl_frame = g_frames;
   int vp[4] = {0, 0, 0, 0};
@@ -2727,6 +2804,7 @@ static void bloom_pass() {
   if (g_bl_state == 0 && !bloom_init()) return;
   if (!bloom_resources(vp[2], vp[3])) return;
   double t0 = mono_sec();
+  fx_arm();
   SavedState st;
   save_state(&st);
   int prev6 = 0, prev7 = 0;
@@ -2899,6 +2977,7 @@ static bool ssao_init() {
 }
 
 static void ssao_pass() {
+  if (!fx_allowed()) return;
   if (!g_ao_on || g_ao_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0 || g_tframe != g_frames) return;
   int cur = g_dcur, n = g_dn[cur];
   if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f || g_atlas_tex <= 0) return;
@@ -2910,6 +2989,7 @@ static void ssao_pass() {
   if (g_ao_state == 0 && !ssao_init()) return;
   if (!ssr_resources(vp[2], vp[3])) { g_ao_state = -1; return; }
   double t0 = mono_sec();
+  fx_arm();
   SavedState st;
   save_state(&st);
   int prev6 = 0;
@@ -3165,6 +3245,7 @@ static void gi_begin(const GiProg& g, unsigned dst, int dw, int dh) {
 }
 
 static void ssgi_pass() {
+  if (!fx_allowed()) return;
   if (!g_gi_on || g_gi_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0 || g_tframe != g_frames) return;
   int cur = g_dcur, n = g_dn[cur];
   if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f || g_atlas_tex <= 0) return;
@@ -3176,6 +3257,7 @@ static void ssgi_pass() {
   if (g_gi_state == 0 && !ssgi_init()) return;
   if (!ssr_resources(vp[2], vp[3]) || !gi_resources(vp[2], vp[3])) { g_gi_state = -1; return; }
   double t0 = mono_sec();
+  fx_arm();
   SavedState st;
   save_state(&st);
   int prev6 = 0, prev7 = 0;
@@ -3275,6 +3357,330 @@ static void ssgi_pass() {
   }
 }
 
+// ===================== DOF + MOTION BLUR =====================
+// Satu pass di akhir adegan 3D (dipicu oleh awal GUI, sama dengan grading). Memakai:
+//  - peta kedalaman terrain setengah resolusi (milik SSR/SSAO, digambar sekali per frame),
+//  - tekstur salinan layar milik SSR (g_ssr_ctex): tidak ada tekstur layar penuh baru.
+// DOF: fokus otomatis ke titik tengah layar (median 3 titik, dihaluskan antar frame di GPU lewat dua tekstur 1x1 bergantian), lingkaran
+//      kabur dihitung dari jarak (jauh: (z-F)/z, dekat: (F-z)/F), disk 12 titik dengan pembobotan sadar-kedalaman supaya benda tajam di depan
+//      tidak meluber ke latar yang kabur. Langit dibatasi (dof_sky). Daerah tangan (kanan bawah) dilindungi (dof_hand).
+// Motion blur: kamera sekarang dan frame lalu (matriks WORLDVIEW + posisi VIEW_POS) dipakai untuk memproyeksikan ulang tiap piksel dari
+//      kedalamannya, selisihnya jadi arah blur; sampel terpusat di sepanjang arah itu. Langit ikut berputar dengan kamera tapi tidak bergeser
+//      saat kamera berpindah. Lompatan besar (teleportasi) tidak diblur.
+struct DmProg { unsigned id; int tex, dep, foc, prev, prj, pz, ts, a, b, m0, m1, m2, tt; };
+static DmProg g_dm_pfocus, g_dm_pdof, g_dm_pmb;
+static int g_dm_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_dm_fbo = 0, g_dm_ftex[2] = {0, 0};
+static int g_dm_fi = 0;
+static unsigned g_dm_frame = 0xFFFFFFFFu, g_dm_n = 0, g_dm_logs = 0;
+static double g_dm_ms = 0;
+static int g_dm_ok = 0, g_dm_tests = 0;
+static float g_mb_prevR[9], g_mb_prevC[3];
+static unsigned g_mb_prev_frame = 0xFFFFFFFFu;
+static char g_dm_src_dof[7000], g_dm_src_mb[3000];
+
+static const char* DM_COMMON =
+  "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+  "precision highp float;\n"
+  "#else\n"
+  "precision mediump float;\n"
+  "#endif\n";
+
+static const char* DM_FS_FOCUS = R"GLSL(
+varying vec2 uv;
+uniform sampler2D DEP;
+uniform sampler2D PREV;
+uniform vec2 PZ;
+uniform vec4 FP;
+float linD(float d) { return PZ.y / ((d * 2.0 - 1.0) + PZ.x); }
+float lin(vec2 c) { return linD(texture2D(DEP, c).r); }
+float med3(float x, float y, float z) { return max(min(x, y), min(max(x, y), z)); }
+vec2 enc(float v) { v = clamp(v / 256.0, 0.0, 0.9999); float hi = floor(v * 255.0) / 255.0; return vec2(hi, fract(v * 255.0)); }
+float dec(vec2 e) { return (e.x + e.y / 255.0) * 256.0; }
+void main() {
+  float a = lin(vec2(0.5, 0.5));
+  float b = 0.5 * (lin(vec2(0.47, 0.5)) + lin(vec2(0.53, 0.5)));
+  float c = 0.5 * (lin(vec2(0.5, 0.45)) + lin(vec2(0.5, 0.55)));
+  float target = (FP.y > 0.0) ? FP.y : clamp(med3(a, b, c), FP.z, FP.w);
+  float prev = dec(texture2D(PREV, vec2(0.5, 0.5)).rg);
+  float nf = (prev < 0.01) ? target : mix(prev, target, FP.x);
+  gl_FragColor = vec4(enc(nf), 0.0, 1.0);
+}
+)GLSL";
+
+static const char* DM_FS_DOF = R"GLSL(
+varying vec2 uv;
+uniform sampler2D TEX;
+uniform sampler2D DEP;
+uniform sampler2D FOC;
+uniform vec2 PZ;
+uniform vec2 TS;
+uniform vec4 DP;
+uniform vec4 DQ;
+float linD(float d) { return PZ.y / ((d * 2.0 - 1.0) + PZ.x); }
+float dec(vec2 e) { return (e.x + e.y / 255.0) * 256.0; }
+float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float handMask(vec2 u) { return smoothstep(0.56, 0.66, u.x) * (1.0 - smoothstep(0.26, 0.36, u.y)); }
+float cocOf(float z, float sky, float F) {
+  float c = (z > F) ? (z - F) / z * DQ.y : (F - z) / F * DQ.x;
+  c = clamp((c - DP.z) * DP.x, 0.0, 1.0);
+  return mix(c, min(c, DP.w), sky);
+}
+void main() {
+  vec3 c0 = texture2D(TEX, uv).rgb;
+  float d0 = texture2D(DEP, uv).r;
+  float F = dec(texture2D(FOC, vec2(0.5, 0.5)).rg);
+  float cc = cocOf(linD(d0), step(0.99995, d0), F) * (1.0 - handMask(uv) * DQ.z);
+  float R = cc * DP.y;
+  if (R < 0.6) { gl_FragColor = vec4(c0, 1.0); return; }
+  float rot = ign(gl_FragCoord.xy) * 6.2831853;
+  vec3 acc = c0;
+  float ws = 1.0;
+  for (int i = 0; i < DOF_TAPS; i++) {
+    float fi = float(i);
+    float r = sqrt((fi + 0.5) / float(DOF_TAPS));
+    float a = fi * 2.3999632 + rot;
+    vec2 su = uv + vec2(cos(a), sin(a)) * (r * R) * TS;
+    float ds = texture2D(DEP, su).r;
+    float cs = cocOf(linD(ds), step(0.99995, ds), F) * (1.0 - handMask(su) * DQ.z);
+    float w = clamp(cs * DP.y - r * R + 1.0, 0.0, 1.0);
+    acc += texture2D(TEX, su).rgb * w;
+    ws += w;
+  }
+  gl_FragColor = vec4(acc / ws, 1.0);
+}
+)GLSL";
+
+static const char* DM_FS_MB = R"GLSL(
+varying vec2 uv;
+uniform sampler2D TEX;
+uniform sampler2D DEP;
+uniform vec2 PRJ;
+uniform vec2 PZ;
+uniform vec3 M0;
+uniform vec3 M1;
+uniform vec3 M2;
+uniform vec3 TT;
+uniform vec4 MP;
+float handMask(vec2 u) { return smoothstep(0.56, 0.66, u.x) * (1.0 - smoothstep(0.26, 0.36, u.y)); }
+void main() {
+  float d = texture2D(DEP, uv).r;
+  float z = PZ.y / ((d * 2.0 - 1.0) + PZ.x);
+  vec2 ndc = uv * 2.0 - 1.0;
+  vec3 p = vec3(ndc.x * z / PRJ.x, ndc.y * z / PRJ.y, -z);
+  vec3 pp = M0 * p.x + M1 * p.y + M2 * p.z + TT;
+  vec2 puv = uv;
+  if (pp.z < -0.05) puv = vec2(pp.x * PRJ.x, pp.y * PRJ.y) / (-pp.z) * 0.5 + 0.5;
+  vec2 v = (uv - puv) * MP.x * (1.0 - handMask(uv) * MP.w);
+  float len = length(v);
+  if (len < MP.z) { gl_FragColor = vec4(texture2D(TEX, uv).rgb, 1.0); return; }
+  if (len > MP.y) v = v * (MP.y / len);
+  vec3 acc = vec3(0.0);
+  for (int i = 0; i < MB_SAMPLES; i++) {
+    float t = (float(i) + 0.5) / float(MB_SAMPLES) - 0.5;
+    acc += texture2D(TEX, uv + v * t).rgb;
+  }
+  gl_FragColor = vec4(acc / float(MB_SAMPLES), 1.0);
+}
+)GLSL";
+
+static bool dm_link(DmProg* g, const char* fs_src) {
+  unsigned vs = sh_compile(0x8B31, BL_VS), fs = sh_compile(0x8B30, fs_src);
+  if (!vs || !fs) return false;
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("dof/mb: link gagal: %s\n", buf); return false; }
+  g->id = p;
+  g->tex = f_getuloc(p, "TEX"); g->dep = f_getuloc(p, "DEP"); g->foc = f_getuloc(p, "FOC"); g->prev = f_getuloc(p, "PREV");
+  g->prj = f_getuloc(p, "PRJ"); g->pz = f_getuloc(p, "PZ"); g->ts = f_getuloc(p, "TS");
+  g->a = f_getuloc(p, "DP"); g->b = f_getuloc(p, "DQ");
+  g->m0 = f_getuloc(p, "M0"); g->m1 = f_getuloc(p, "M1"); g->m2 = f_getuloc(p, "M2"); g->tt = f_getuloc(p, "TT");
+  return true;
+}
+
+static bool dm_init() {
+  g_dm_state = -1;
+  fx_cfg_load();
+  if (!g_dof_on && !g_mb_on) { sh_log("dof/mb: dimatikan lewat pengaturan\n"); return false; }
+  cap_init();
+  if (!g_gx_ok) gx_init();
+  if (!g_gx_ok || !f_geti || !f_getuloc) { sh_log("dof/mb: fungsi GL tidak lengkap\n"); return false; }
+  clear_gl_errors();
+  snprintf(g_dm_src_dof, sizeof(g_dm_src_dof), "%s#define DOF_TAPS %d\n%s", DM_COMMON, g_dof_taps, DM_FS_DOF);
+  snprintf(g_dm_src_mb, sizeof(g_dm_src_mb), "%s#define MB_SAMPLES %d\n%s", DM_COMMON, g_mb_samples, DM_FS_MB);
+  char focus_src[2500];
+  snprintf(focus_src, sizeof(focus_src), "%s%s", DM_COMMON, DM_FS_FOCUS);
+  bool ok = true;
+  if (g_dof_on) ok = ok && dm_link(&g_dm_pfocus, focus_src) && dm_link(&g_dm_pdof, g_dm_src_dof);
+  if (g_mb_on) ok = ok && dm_link(&g_dm_pmb, g_dm_src_mb);
+  if (!ok) { sh_log("dof/mb: shader gagal dibuat, dimatikan\n"); return false; }
+  gx.GenFramebuffers(1, &g_dm_fbo);
+  // dua tekstur 1x1 untuk jarak fokus (bergantian membaca dan menulis)
+  int prev_act = 0x84C0, prev5 = 0;
+  f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C5); f_geti(0x8069, &prev5);
+  static const unsigned char zero4[4] = {0, 0, 0, 0};
+  gx.GenTextures(2, g_dm_ftex);
+  for (int i = 0; i < 2; i++) {
+    gx.BindTexture(0x0DE1, g_dm_ftex[i]);
+    gx.TexImage2D(0x0DE1, 0, 0x1908, 1, 1, 0, 0x1908, 0x1401, zero4);
+    gx.TexParameteri(0x0DE1, 0x2801, 0x2600); gx.TexParameteri(0x0DE1, 0x2800, 0x2600);
+    gx.TexParameteri(0x0DE1, 0x2802, 0x812F); gx.TexParameteri(0x0DE1, 0x2803, 0x812F);
+  }
+  gx.BindTexture(0x0DE1, (unsigned)prev5);
+  gx.ActiveTexture((unsigned)prev_act);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  if (err != 0) { sh_log("dof/mb: tekstur fokus gagal (err=0x%x), dimatikan\n", err); return false; }
+  g_dm_state = 1;
+  sh_log("dof/mb: siap (dof=%d taps=%d maks=%.1fpx kekuatan=%.2f | motionblur=%d sampel=%d kekuatan=%.2f)\n", g_dof_on, g_dof_taps, g_dof_maxpx, g_dof_k, g_mb_on, g_mb_samples, g_mb_k);
+  return true;
+}
+
+static void dm_pass() {
+  if (!fx_allowed() || (!g_dof_on && !g_mb_on) || g_dm_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0 || g_tframe != g_frames || g_dm_frame == g_frames) return;
+  g_dm_frame = g_frames;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n <= 0 || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f || g_atlas_tex <= 0) return;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_ssr_state == 0 && !ssr_init()) { sh_log("dof/mb: program kedalaman (milik SSR) gagal, dimatikan\n"); g_dm_state = -1; return; }
+  if (g_ssr_state < 0) { g_dm_state = -1; return; }
+  if (g_dm_state == 0 && !dm_init()) return;
+  if (!ssr_resources(vp[2], vp[3])) { g_dm_state = -1; return; }
+
+  // matriks kamera: rotasi (3x3 dari WORLDVIEW, kolom-utama) dan posisi kamera absolut
+  float Rc[9];
+  for (int c = 0; c < 3; c++) for (int r = 0; r < 3; r++) Rc[r * 3 + c] = g_wv[c * 4 + r];   // Rc[baris*3+kolom]
+  bool mbOk = g_mb_on && (g_frames - g_mb_prev_frame == 1);
+  float M[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, T[3] = {0, 0, 0};
+  if (mbOk) {
+    float dc[3] = {g_cam_abs[0] - g_mb_prevC[0], g_cam_abs[1] - g_mb_prevC[1], g_cam_abs[2] - g_mb_prevC[2]};
+    if (dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2] > 64.0f) mbOk = false;   // lompatan besar (teleportasi): jangan diblur
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {   // M = Rp * Rc^T
+      float s = 0.0f;
+      for (int k = 0; k < 3; k++) s += g_mb_prevR[i * 3 + k] * Rc[j * 3 + k];
+      M[i * 3 + j] = s;
+    }
+    for (int i = 0; i < 3; i++) T[i] = g_mb_prevR[i * 3 + 0] * dc[0] + g_mb_prevR[i * 3 + 1] * dc[1] + g_mb_prevR[i * 3 + 2] * dc[2];   // Rp * (c_sekarang - c_lalu)
+  }
+  memcpy(g_mb_prevR, Rc, sizeof(Rc));
+  memcpy(g_mb_prevC, g_cam_abs, sizeof(g_mb_prevC));
+  g_mb_prev_frame = g_frames;
+  bool doMB = mbOk;
+  bool doDOF = g_dof_on != 0;
+  if (!doMB && !doDOF) return;
+
+  fx_arm();
+  double t0 = mono_sec();
+  SavedState st;
+  save_state(&st);
+  int prev5 = 0, prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C5); f_geti(0x8069, &prev5);
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  // 1. salin layar ke tekstur milik SSR (framebuffer baca masih milik game)
+  gx.BindTexture(0x0DE1, g_ssr_ctex);
+  clear_gl_errors();
+  gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  unsigned cerr = gx.GetError();
+  int chk = -1;
+  if (cerr == 0 && g_dm_ok < 3 && g_dm_tests < 240) { g_dm_tests++; chk = copy_check(g_ssr_ctex, vp); gx.BindFramebuffer(0x8D40, (unsigned)st.fbo); }
+  if (cerr != 0 || chk == 0) {
+    sh_log("dof/mb: salinan layar tidak sah (err=0x%x cek=%d), dimatikan agar layar tidak hitam\n", cerr, chk);
+    g_dm_state = -1;
+    gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, (unsigned)prev5);
+    gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+    gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+    restore_state(&st);
+    clear_gl_errors();
+    return;
+  }
+  if (chk == 1) g_dm_ok++;
+  // 2. kedalaman terrain (dibagi dengan SSR/SSAO: hanya digambar sekali per frame)
+  if (g_dp_frame != g_frames) ssr_depth_pass(st);
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+  gx.DepthMask(0); gx.ColorMask(1, 1, 1, 0);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, g_ssr_dtex);   // DEP di unit 6
+  bool hand = (g_hand_frame == g_frames) || (g_hand_frame + 1 == g_frames);
+  float scale = (float)vp[3] / 1080.0f;
+  if (doDOF) {
+    // 3. jarak fokus (1x1): dihitung dari kedalaman tengah layar, dihaluskan terhadap nilai frame lalu
+    int rd = g_dm_fi, wr = 1 - g_dm_fi;
+    gx.BindFramebuffer(0x8D40, g_dm_fbo);
+    gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_dm_ftex[wr], 0);
+    gx.ColorMask(1, 1, 1, 1);
+    gx.Viewport(0, 0, 1, 1);
+    gx.UseProgram(g_dm_pfocus.id);
+    gx.Uniform1i(g_dm_pfocus.dep, 6);
+    gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, g_dm_ftex[rd]);
+    gx.Uniform1i(g_dm_pfocus.prev, 5);
+    gx.Uniform2f(g_dm_pfocus.pz, g_proj[10], g_proj[14]);
+    gx.Uniform4f(g_dm_pfocus.a, g_dof_speed, g_dof_focus, g_dof_fmin, g_dof_fmax);
+    gx.DrawArrays(4, 0, 3);
+    g_dm_fi = wr;
+    // 4. DOF: salinan layar -> layar
+    gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+    gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+    gx.ColorMask(1, 1, 1, 0);
+    gx.UseProgram(g_dm_pdof.id);
+    gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, g_dm_ftex[wr]);
+    gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_ssr_ctex);
+    gx.Uniform1i(g_dm_pdof.tex, 7); gx.Uniform1i(g_dm_pdof.dep, 6); gx.Uniform1i(g_dm_pdof.foc, 5);
+    gx.Uniform2f(g_dm_pdof.pz, g_proj[10], g_proj[14]);
+    gx.Uniform2f(g_dm_pdof.ts, 1.0f / (float)vp[2], 1.0f / (float)vp[3]);
+    gx.Uniform4f(g_dm_pdof.a, g_dof_k, g_dof_maxpx * scale, g_dof_dz, g_dof_sky);
+    gx.Uniform4f(g_dm_pdof.b, g_dof_near, g_dof_far, hand ? g_dof_hand : 0.0f, 0.0f);
+    gx.DrawArrays(4, 0, 3);
+    if (doMB) {   // hasil DOF disalin lagi supaya motion blur bekerja di atas gambar yang sudah berfokus
+      gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_ssr_ctex);
+      gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+    }
+  } else {
+    gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+    gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+    gx.ColorMask(1, 1, 1, 0);
+  }
+  if (doMB) {
+    // 5. motion blur: salinan layar -> layar
+    gx.UseProgram(g_dm_pmb.id);
+    gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_ssr_ctex);
+    gx.Uniform1i(g_dm_pmb.tex, 7); gx.Uniform1i(g_dm_pmb.dep, 6);
+    gx.Uniform2f(g_dm_pmb.prj, g_proj[0], g_proj[5]);
+    gx.Uniform2f(g_dm_pmb.pz, g_proj[10], g_proj[14]);
+    gx.Uniform3f(g_dm_pmb.m0, M[0], M[3], M[6]);   // kolom 0 dari M
+    gx.Uniform3f(g_dm_pmb.m1, M[1], M[4], M[7]);
+    gx.Uniform3f(g_dm_pmb.m2, M[2], M[5], M[8]);
+    gx.Uniform3f(g_dm_pmb.tt, T[0], T[1], T[2]);
+    gx.Uniform4f(g_dm_pmb.a, g_mb_k, g_mb_max, g_mb_min, hand ? g_mb_hand : 0.0f);
+    gx.DrawArrays(4, 0, 3);
+  }
+  gx.ActiveTexture(0x84C5); gx.BindTexture(0x0DE1, (unsigned)prev5);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  g_dm_n++; g_dm_ms += (mono_sec() - t0) * 1000.0;
+  if (g_dm_logs < 3) {
+    g_dm_logs++;
+    sh_log("dof/mb: pass frame %u err=0x%x dof=%d mb=%d tangan=%d\n", g_frames, err, (int)doDOF, (int)doMB, (int)hand);
+  } else if (g_frames % 900 == 0 && g_dm_logs < 12) {
+    g_dm_logs++;
+    sh_log("dof/mb: frame %u pass=%u ms/pass=%.2f\n", g_frames, g_dm_n, g_dm_n ? g_dm_ms / g_dm_n : 0.0);
+    g_dm_n = 0; g_dm_ms = 0;
+  }
+}
+
 // ===================== TONEMAPPING + COLOR GRADING =====================
 // Satu pass layar penuh di akhir adegan 3D: layar disalin ke tekstur, lalu digambar ulang dengan eksposur, kurva filmik (ACES, dicampur
 // sesuai grade_tonemap), saturasi, kontras, kehangatan warna, vignette, dan dither halus (mencegah garis pita di langit).
@@ -3344,6 +3750,7 @@ static bool grade_init() {
 }
 
 static void grade_pass() {
+  if (!fx_allowed()) return;
   if (!g_gr_on || g_gr_state < 0 || !g_gx_ok || g_cur_fbo != 0 || g_gr_frame == g_frames || g_tframe != g_frames) return;
   g_gr_frame = g_frames;
   int vp[4] = {0, 0, 0, 0};
@@ -3351,6 +3758,7 @@ static void grade_pass() {
   if (vp[2] < 64 || vp[3] < 64) return;
   if (g_gr_state == 0 && !grade_init()) return;
   double t0 = mono_sec();
+  fx_arm();
   SavedState st;
   save_state(&st);
   int prev7 = 0;
@@ -3411,6 +3819,7 @@ static void grade_pass() {
 
 // akhir adegan 3D: bloom (mode 2) lalu grading
 static void end_scene_pass() {
+  if (!g_ui_fail) dm_pass();   // DOF + motion blur lebih dulu, lalu bloom dan grading di atasnya
   if (g_bl_when == 2 && !g_ui_fail) bloom_pass();
   if (g_gr_when == 0 && !g_ui_fail) grade_pass();
 }
