@@ -876,11 +876,13 @@ static int g_bl_on = 0, g_bl_when = 2;                   // bloom; when: 0 = ses
 static float g_bl_k = 0.7f, g_bl_thr = 0.80f, g_bl_sky = 0.15f;   // kekuatan, ambang, dan faktor bloom di langit/awan (inti matahari tetap penuh)             // kekuatan dan ambang kecerahan bloom
 static int g_gi_on = 0, g_gi_rays = 6;                    // SSGI: jumlah sinar per piksel (2 sampai 16)
 static float g_gi_k = 0.6f, g_gi_r = 10.0f, g_gi_scale = 0.5f;   // kekuatan, jangkauan (blok), skala resolusi terhadap layar
-static int g_dof_on = 1, g_dof_taps = 12;                // DOF: jumlah titik contoh per piksel (6 sampai 24)
+static int g_dof_on = 0, g_dof_taps = 12;   // DOF MATI secara bawaan (dof=1 di pipe3d_fx.txt untuk menyalakan)                // DOF: jumlah titik contoh per piksel (6 sampai 24)
 static float g_dof_k = 1.0f, g_dof_maxpx = 9.0f, g_dof_focus = 0.0f, g_dof_sky = 0.25f, g_dof_near = 0.35f, g_dof_far = 1.0f, g_dof_dz = 0.08f, g_dof_speed = 0.12f, g_dof_hand = 0.9f;
 static float g_dof_fmin = 2.5f, g_dof_fmax = 80.0f;      // batas jarak fokus otomatis (blok)
-static int g_mb_on = 1, g_mb_samples = 10;               // motion blur: jumlah titik contoh sepanjang arah gerak (4 sampai 20)
+static int g_mb_on = 0, g_mb_samples = 10;               // motion blur: jumlah titik contoh sepanjang arah gerak (4 sampai 20)
 static float g_mb_k = 0.5f, g_mb_max = 0.05f, g_mb_min = 0.0015f, g_mb_hand = 0.9f;
+static int g_gd_on = 1, g_gd_samples = 24;                  // godrays (lihat bagian GODRAYS); godray=0 untuk mematikan
+static float g_gd_k = 1.0f, g_gd_len = 0.92f, g_gd_decay = 0.95f;   // kekuatan, panjang berkas (0..1 jarak ke matahari), peluruhan per langkah
 static int g_ao_on = 0;                                   // SSAO (mati secara bawaan; ssao=1 di pipe3d_fx.txt untuk menyalakan)
 static float g_ao_k = 0.8f, g_ao_r = 0.8f, g_ao_bias = 0.12f;
 static int g_gr_on = 0, g_gr_when = 0;                    // tonemapping + color grading; when: 0 = otomatis (sebelum GUI), 1 = paksa di akhir frame (GUI ikut terkena)
@@ -1945,6 +1947,11 @@ static void fx_cfg_load() {
     else if (sscanf(line, "bloom_sky=%f", &fv) == 1) g_bl_sky = (fv < 0.0f) ? 0.0f : (fv > 1.0f ? 1.0f : fv);
     else if (sscanf(line, "bloom_threshold=%f", &fv) == 1) g_bl_thr = (fv < 0.5f) ? 0.5f : (fv > 0.98f ? 0.98f : fv);
     else if (sscanf(line, "bloom_when=%d", &iv) == 1) g_bl_when = (iv < 0) ? 0 : (iv > 2 ? 2 : iv);
+    else if (sscanf(line, "godray=%d", &iv) == 1) g_gd_on = iv;
+    else if (sscanf(line, "godray_strength=%f", &fv) == 1) g_gd_k = (fv < 0.0f) ? 0.0f : (fv > 3.0f ? 3.0f : fv);
+    else if (sscanf(line, "godray_length=%f", &fv) == 1) g_gd_len = (fv < 0.3f) ? 0.3f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "godray_decay=%f", &fv) == 1) g_gd_decay = (fv < 0.85f) ? 0.85f : (fv > 1.0f ? 1.0f : fv);
+    else if (sscanf(line, "godray_samples=%d", &iv) == 1) g_gd_samples = (iv < 8) ? 8 : (iv > 40 ? 40 : iv);
     else if (sscanf(line, "hmap=%d", &iv) == 1) g_hm_on = iv;
     else if (sscanf(line, "hmap_contrast=%f", &fv) == 1) g_hm_contrast = (fv < 0.5f) ? 0.5f : (fv > 8.0f ? 8.0f : fv);
     else if (sscanf(line, "hmap_base=%f", &fv) == 1) g_hm_base = (fv < 0.4f) ? 0.4f : (fv > 1.0f ? 1.0f : fv);
@@ -3681,6 +3688,213 @@ static void dm_pass() {
   }
 }
 
+// ===================== GODRAYS (sinar matahari di ruang layar) =====================
+// Pass baru di akhir adegan 3D (sebelum bloom dan grading). Cara kerja:
+//  1. Posisi matahari di layar dihitung dari g_sun (arah dunia, dari kotak matahari) dan matriks kamera.
+//  2. Layar disalin ke tekstur milik SSR (g_ssr_ctex); peta kedalaman terrain (g_ssr_dtex) dipakai sebagai topeng langit.
+//  3. Pass kecil (1/4 resolusi): tiap piksel menelusuri garis ke arah matahari; langit terang (kedalaman 1.0) yang terlihat di sela daun,
+//     batang pohon, dan bukit menjadi sumber cahaya. Hasilnya berkas cahaya yang memancar dari matahari.
+//  4. Berkas ditambahkan ke layar (ONE, ONE: hanya menambah cahaya), berwarna emas, lebih kuat saat senja, dan memudar saat hujan,
+//     malam, atau kamera membelakangi matahari.
+// Pengaturan di pipe3d_fx.txt: godray=1, godray_strength=1.0, godray_length=0.92, godray_decay=0.95. Matikan dengan godray=0.
+static int g_gd_state = 0;   // 0 belum, 1 siap, -1 gagal
+static unsigned g_gd_fbo = 0, g_gd_tex = 0, g_gd_prog[2] = {0, 0};
+static int g_gd_w = 0, g_gd_h = 0, g_gd_checked = 0;
+static int g_gdu_tex[2] = {-1, -1}, g_gdu_dep = -1, g_gdu_su = -1, g_gdu_pa = -1;
+static unsigned g_gd_frame = 0xFFFFFFFFu, g_gd_logs = 0;
+
+static const char* GD_FS_MARCH = R"GLSL(
+varying vec2 uv;
+uniform sampler2D TEX;
+uniform sampler2D DEP;
+uniform vec4 SU;
+void main() {
+  vec2 d = (SU.xy - uv) * SU.z / float(GD_SAMPLES);
+  float jit = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+  vec2 p = uv + d * jit;
+  vec3 acc = vec3(0.0);
+  float w = 1.0;
+  for (int i = 0; i < GD_SAMPLES; i++) {
+    p += d;
+    float inside = step(0.0, min(p.x, p.y)) * step(max(p.x, p.y), 1.0);
+    vec3 c = texture2D(TEX, p).rgb;
+    float sky = step(0.99995, texture2D(DEP, p).r);
+    float l = max(c.r, max(c.g, c.b));
+    acc += c * (sky * smoothstep(0.55, 1.0, l) * inside * w);
+    w *= SU.w;
+  }
+  gl_FragColor = vec4(acc / float(GD_SAMPLES), 1.0);
+}
+)GLSL";
+static const char* GD_FS_COMP = R"GLSL(
+varying vec2 uv;
+uniform sampler2D TEX;
+uniform vec4 PA;
+void main() {
+  gl_FragColor = vec4(texture2D(TEX, uv).rgb * PA.rgb, 0.0);
+}
+)GLSL";
+
+static bool gd_link(int i, const char* fs_src) {
+  unsigned vs = sh_compile(0x8B31, BL_VS), fs = sh_compile(0x8B30, fs_src);
+  if (!vs || !fs) return false;
+  unsigned p = gx.CreateProgram();
+  gx.AttachShader(p, vs); gx.AttachShader(p, fs);
+  gx.BindAttribLocation(p, 0, "P");
+  gx.LinkProgram(p);
+  int linked = 0; gx.GetProgramiv(p, 0x8B82, &linked);
+  if (!linked) { char buf[512] = {0}; int n = 0; gx.GetProgramInfoLog(p, 511, &n, buf); sh_log("godray: link gagal (program %d): %s\n", i, buf); return false; }
+  g_gd_prog[i] = p;
+  g_gdu_tex[i] = f_getuloc(p, "TEX");
+  if (i == 0) { g_gdu_dep = f_getuloc(p, "DEP"); g_gdu_su = f_getuloc(p, "SU"); }
+  else g_gdu_pa = f_getuloc(p, "PA");
+  return true;
+}
+
+static bool gd_init() {
+  g_gd_state = -1;
+  fx_cfg_load();
+  if (!g_gd_on) { sh_log("godray: dimatikan lewat pengaturan (godray=0)\n"); return false; }
+  cap_init();
+  if (!g_gx_ok) gx_init();
+  if (!g_gx_ok || !f_geti || !f_getuloc) { sh_log("godray: fungsi GL tidak lengkap\n"); return false; }
+  clear_gl_errors();
+  char src[2500];
+  snprintf(src, sizeof(src), "%s#define GD_SAMPLES %d\n%s", DM_COMMON, g_gd_samples, GD_FS_MARCH);
+  char src2[1200];
+  snprintf(src2, sizeof(src2), "%s%s", DM_COMMON, GD_FS_COMP);
+  if (!gd_link(0, src) || !gd_link(1, src2)) { sh_log("godray: shader gagal dibuat, dimatikan\n"); return false; }
+  gx.GenFramebuffers(1, &g_gd_fbo);
+  g_gd_state = 1;
+  sh_log("godray: siap (kekuatan=%.2f panjang=%.2f peluruhan=%.2f sampel=%d)\n", g_gd_k, g_gd_len, g_gd_decay, g_gd_samples);
+  return true;
+}
+
+static bool gd_resources(int w, int h) {
+  if (g_gd_w == w && g_gd_h == h) return true;
+  int prev_act = 0x84C0, prev7 = 0;
+  f_geti(0x84E0, &prev_act);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  g_gd_w = w; g_gd_h = h;
+  int gw = w / 4 < 16 ? 16 : w / 4, gh = h / 4 < 16 ? 16 : h / 4;
+  clear_gl_errors();
+  bl_tex_alloc(&g_gd_tex, gw, gh);
+  gx.BindTexture(0x0DE1, (unsigned)prev7);
+  gx.ActiveTexture((unsigned)prev_act);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  sh_log("godray: tekstur dibuat %dx%d err=0x%x\n", gw, gh, err);
+  if (err != 0) { g_gd_state = -1; return false; }
+  return true;
+}
+
+static void gd_pass() {
+  if (!fx_allowed() || !g_gd_on || g_gd_state < 0 || !g_gx_ok || !g_view_ok || g_cur_fbo != 0 || g_tframe != g_frames || g_gd_frame == g_frames) return;
+  g_gd_frame = g_frames;
+  if (!sun_enabled() || fabsf(g_proj[0]) < 1e-5f || fabsf(g_proj[5]) < 1e-5f) return;
+  // posisi matahari di ruang kamera (dunia -> kamera), lalu di layar
+  float cx = g_wv[0] * g_sun[0] + g_wv[4] * g_sun[1] + g_wv[8] * g_sun[2];
+  float cy = g_wv[1] * g_sun[0] + g_wv[5] * g_sun[1] + g_wv[9] * g_sun[2];
+  float cz = g_wv[2] * g_sun[0] + g_wv[6] * g_sun[1] + g_wv[10] * g_sun[2];
+  float facing = -cz;                                  // > 0: matahari di depan kamera
+  if (facing < 0.05f) return;
+  float su = 0.5f + 0.5f * (cx / facing) * g_proj[0];
+  float sv = 0.5f + 0.5f * (cy / facing) * g_proj[5];
+  // kekuatan: siang/senja dari warna kabut (sama dengan sinar volumetrik), matahari di atas horizon, menghadap matahari, tanpa hujan
+  float lum = 0.299f * g_w_fog[0] + 0.587f * g_w_fog[1] + 0.114f * g_w_fog[2];
+  float t = (lum - 0.05f) / 0.45f; t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  float day = t * t * (3.0f - 2.0f * t);
+  float sunset = (g_w_fog[0] - g_w_fog[2]) * 3.5f; sunset = sunset < 0 ? 0 : (sunset > 1 ? 1 : sunset);
+  float up = (g_sun[1] - 0.02f) / 0.23f; up = up < 0 ? 0 : (up > 1 ? 1 : up); up = up * up * (3.0f - 2.0f * up);
+  float fd = (facing - 0.05f) / 0.45f; fd = fd < 0 ? 0 : (fd > 1 ? 1 : fd); fd = fd * fd * (3.0f - 2.0f * fd);
+  float k = g_gd_k * (0.8f + 0.7f * sunset) * day * up * fd * (g_ssr_rain ? 0.25f : 1.0f);
+  if (k < 0.01f) return;
+  int cur = g_dcur, n = g_dn[cur];
+  if (n <= 0 || g_atlas_tex <= 0) return;
+  int vp[4] = {0, 0, 0, 0};
+  f_geti(0x0BA2, vp);
+  if (vp[2] < 64 || vp[3] < 64) return;
+  if (g_ssr_state == 0 && !ssr_init()) { sh_log("godray: program kedalaman (milik SSR) gagal, dimatikan\n"); g_gd_state = -1; return; }
+  if (g_ssr_state < 0) { g_gd_state = -1; return; }
+  if (g_gd_state == 0 && !gd_init()) return;
+  if (!ssr_resources(vp[2], vp[3])) { g_gd_state = -1; return; }
+  if (!gd_resources(vp[2], vp[3])) return;
+  fx_arm();
+  SavedState st;
+  save_state(&st);
+  int prev6 = 0, prev7 = 0;
+  gx.ActiveTexture(0x84C6); f_geti(0x8069, &prev6);
+  gx.ActiveTexture(0x84C7); f_geti(0x8069, &prev7);
+  // 1. salin layar ke tekstur milik SSR (framebuffer baca masih milik game)
+  gx.BindTexture(0x0DE1, g_ssr_ctex);
+  clear_gl_errors();
+  gx.CopyTexSubImage2D(0x0DE1, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+  unsigned cerr = gx.GetError();
+  if (cerr != 0) {
+    sh_log("godray: salinan layar gagal (err=0x%x), dimatikan\n", cerr);
+    g_gd_state = -1;
+    gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+    gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+    restore_state(&st);
+    clear_gl_errors();
+    return;
+  }
+  // 2. kedalaman terrain (dibagi dengan SSR/SSAO/DOF: hanya digambar sekali per frame)
+  if (g_dp_frame != g_frames) ssr_depth_pass(st);
+  // 3. telusuri berkas cahaya di 1/4 resolusi
+  gx.BindFramebuffer(0x8D40, g_gd_fbo);
+  gx.FramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, g_gd_tex, 0);
+  if (!g_gd_checked) {
+    g_gd_checked = 1;
+    unsigned status = gx.CheckFramebufferStatus(0x8D40);
+    if (status != 0x8CD5) {
+      sh_log("godray: framebuffer tidak lengkap (0x%x), dimatikan\n", status);
+      g_gd_state = -1;
+      gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+      gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+      gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+      restore_state(&st);
+      clear_gl_errors();
+      return;
+    }
+  }
+  gx.Disable(0x0C11); gx.Disable(0x0B90); gx.Disable(0x0BE2); gx.Disable(0x0B44); gx.Disable(0x0B71); gx.Disable(0x8037);
+  gx.DepthMask(0); gx.ColorMask(1, 1, 1, 1);
+  static const float tri[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+  for (int i = 0; i < 8; i++) gx.DisableVertexAttribArray((unsigned)i);
+  gx.BindBuffer(0x8892, 0);
+  gx.EnableVertexAttribArray(0);
+  gx.VertexAttribPointer(0, 2, 0x1406, 0, 0, tri);
+  int gw = g_gd_w / 4 < 16 ? 16 : g_gd_w / 4, gh = g_gd_h / 4 < 16 ? 16 : g_gd_h / 4;
+  gx.Viewport(0, 0, gw, gh);
+  gx.UseProgram(g_gd_prog[0]);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, g_ssr_dtex);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_ssr_ctex);
+  gx.Uniform1i(g_gdu_tex[0], 7); gx.Uniform1i(g_gdu_dep, 6);
+  gx.Uniform4f(g_gdu_su, su, sv, g_gd_len, g_gd_decay);
+  gx.DrawArrays(4, 0, 3);
+  // 4. tambahkan ke layar (hanya menambah cahaya)
+  gx.BindFramebuffer(0x8D40, (unsigned)st.fbo);
+  gx.Viewport(st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+  gx.ColorMask(1, 1, 1, 0);
+  gx.Enable(0x0BE2); gx.BlendFuncSeparate(1, 1, 0, 1);
+  gx.UseProgram(g_gd_prog[1]);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, g_gd_tex);
+  gx.Uniform1i(g_gdu_tex[1], 7);
+  float tr = 1.00f, tg = 0.93f - 0.31f * sunset, tb = 0.78f - 0.48f * sunset;   // putih keemasan siang, oranye senja
+  gx.Uniform4f(g_gdu_pa, tr * k * 1.6f, tg * k * 1.6f, tb * k * 1.6f, 0.0f);
+  gx.DrawArrays(4, 0, 3);
+  gx.ActiveTexture(0x84C6); gx.BindTexture(0x0DE1, (unsigned)prev6);
+  gx.ActiveTexture(0x84C7); gx.BindTexture(0x0DE1, (unsigned)prev7);
+  restore_state(&st);
+  unsigned err = gx.GetError();
+  clear_gl_errors();
+  if (g_gd_logs < 3) {
+    g_gd_logs++;
+    sh_log("godray: pass frame %u err=0x%x matahari=(%.2f, %.2f) k=%.2f siang=%.2f senja=%.2f\n", g_frames, err, su, sv, k, day, sunset);
+  }
+}
+
 // ===================== TONEMAPPING + COLOR GRADING =====================
 // Satu pass layar penuh di akhir adegan 3D: layar disalin ke tekstur, lalu digambar ulang dengan eksposur, kurva filmik (ACES, dicampur
 // sesuai grade_tonemap), saturasi, kontras, kehangatan warna, vignette, dan dither halus (mencegah garis pita di langit).
@@ -3820,6 +4034,7 @@ static void grade_pass() {
 // akhir adegan 3D: bloom (mode 2) lalu grading
 static void end_scene_pass() {
   if (!g_ui_fail) dm_pass();   // DOF + motion blur lebih dulu, lalu bloom dan grading di atasnya
+  if (!g_ui_fail) gd_pass();   // godrays: ditambahkan sebelum bloom supaya bloom ikut menyebarkannya
   if (g_bl_when == 2 && !g_ui_fail) bloom_pass();
   if (g_gr_when == 0 && !g_ui_fail) grade_pass();
 }
